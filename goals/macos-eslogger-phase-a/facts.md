@@ -1,0 +1,24 @@
+# Facts
+
+- A scenario YAML system can declare `os: macos` and it passes validation.
+- Generating a macOS scenario produces one `eslogger_<hostname>.ndjson` file per macOS host.
+- Each eslogger NDJSON line includes schema_version, time, mach_time, seq_num/global_seq_num, event_type, and a full process object with audit token (pid, pidversion, euid/ruid, auid, session id), ppid, parent_audit_token, executable.path, tty, and start_time.
+- Each process object includes code-signing identity (signing_id, team_id, cdhash, is_platform_binary, codesigning_flags) sourced from config/activity/macos_signing.yaml.
+- Process exec events include full argv and cwd.
+- Process fork and exit events are emitted, giving every process a complete create-to-terminate lifecycle.
+- File create/open/write/rename/unlink activity on a macOS host renders as ES file events.
+- SSH login/logout on macOS renders as openssh_login/openssh_logout events; screen lock/unlock renders as lw_session events.
+- sudo/su privilege elevation renders as ES sudo/su events.
+- Creating a plist under ~/Library/LaunchAgents or LaunchDaemons automatically produces a btm_launch_item_add event via causal expansion, without the scenario author specifying it manually.
+- The eslogger emitter emits no network/TCP-connect events; network egress from macOS processes still appears in the existing Zeek conn/dns logs for the same host.
+- Storyline malware processes (AMOS, BeaverTail) default to unsigned/ad-hoc code-signing identity, while common system binaries carry realistic signing IDs.
+- A macOS host's baseline includes low-volume, jittered system-daemon noise (Spotlight, Time Machine, softwareupdated, cfprefsd, cloudd/bird, trustd) with no fixed-interval ticks.
+- macOS process ancestry roots at launchd (pid 1); interactive apps parent under Terminal/Dock/loginwindow; shell commands default to /usr/bin/zsh.
+- A demo scenario under scenarios/ generates data reproducing all three hunts (AMOS/Atomic Stealer, DPRK BeaverTail, CloudMensis-style persistence) end-to-end in one run.
+- `uv run pytest --no-cov` passes, including new unit tests (emitter field rendering, signing-yaml loader, BTM causal rule, determinism) and an integration test generating a macOS scenario in tmp_path.
+- `uv run ruff check .` and `uv run ruff format --check .` pass with no new warnings.
+- Running the demo scenario twice with the same seed produces byte-identical eslogger NDJSON output.
+- Docs and skills reflect macOS/eslogger support: scenario-reference.md, EVIDENCE_FORMATS.md, README.md, ARCHITECTURE.md, event-model-prd.md, commands/eforge/scenario.md, commands/eforge/validate.md, and COVERAGE-TEST-PROMPT.md all mention the new os_category, event types, and causal rule.
+- A worklog file exists under docs/worklog/ documenting the effort.
+- Work lands as conventional commits on the macos-eslogger branch with no version bump.
+- A draft CFP abstract/outline for the OBTS v9 talk exists, referencing the three hunts and citing the generated hunt-loop data as evidence.
