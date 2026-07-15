@@ -950,7 +950,15 @@ class TestFileSideEffectRealism:
 
         assert not missing, f"file side-effect actions with no event mapping: {sorted(missing)}"
         assert _FILE_ACTION_EVENT_TYPES["read"] == "file_read"
-        unrenderable = set(_FILE_ACTION_EVENT_TYPES.values()) - EcarEmitter._supported_types
+        # _FILE_ACTION_EVENT_TYPES intentionally carries a wider vocabulary (open/write/
+        # rename/unlink) than the EDR pools/command-effect data currently produces — those
+        # extra actions are plumbing reserved for a future non-eCAR consumer (e.g. the
+        # macOS eslogger emitter). Only actions the data layer actually emits today must be
+        # renderable by eCAR.
+        produced_event_types = {
+            _FILE_ACTION_EVENT_TYPES[action] for action in (config_actions | command_actions)
+        }
+        unrenderable = produced_event_types - EcarEmitter._supported_types
         assert not unrenderable, f"file-effect event types eCAR cannot render: {unrenderable}"
 
     def test_gzip_side_effect_uses_compressed_operand_path(self):

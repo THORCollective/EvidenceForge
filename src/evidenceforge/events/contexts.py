@@ -253,7 +253,7 @@ class FileContext:
     """File operation details."""
 
     path: str
-    action: str  # "create" | "modify" | "delete" | "read"
+    action: str  # "create" | "modify" | "delete" | "read" | "open" | "write" | "rename" | "unlink"
     pid: int = 0
 
 

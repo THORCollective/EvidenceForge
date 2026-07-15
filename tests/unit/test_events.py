@@ -134,6 +134,79 @@ class TestSecurityEvent:
         assert event.dst_host is host_b
 
 
+class TestFileContext:
+    """Tests for FileContext's widened action vocabulary (Task 6, macOS eslogger prep)."""
+
+    @pytest.mark.parametrize(
+        "action",
+        ["create", "modify", "delete", "read", "open", "write", "rename", "unlink"],
+    )
+    def test_action_values_round_trip(self, action):
+        """FileContext is a plain dataclass with no enum constraint on `action`.
+
+        Every action in the widened vocabulary (including the four added for
+        macOS ES file-event coverage: open/write/rename/unlink) must construct
+        and round-trip without validation errors.
+        """
+        ctx = FileContext(path="/tmp/example", action=action, pid=4242)
+        assert ctx.action == action
+        assert ctx.path == "/tmp/example"
+        assert ctx.pid == 4242
+
+    @pytest.mark.parametrize(
+        ("action", "expected_event_type"),
+        [
+            ("read", "file_read"),
+            ("create", "file_create"),
+            ("modify", "file_modify"),
+            ("delete", "file_delete"),
+            ("open", "file_open"),
+            ("write", "file_write"),
+            ("rename", "file_rename"),
+            ("unlink", "file_unlink"),
+        ],
+    )
+    def test_dispatch_maps_action_to_event_type(self, action, expected_event_type):
+        """A SecurityEvent carrying FileContext(action=...) dispatches under the
+        event_type produced by generator._FILE_ACTION_EVENT_TYPES[action], and a
+        matching emitter (selected purely by event_type via can_handle) receives it.
+
+        This proves the mapping is wired end-to-end through the real
+        EventDispatcher, not just present as a dict entry.
+        """
+        from evidenceforge.events.dispatcher import EventDispatcher
+        from evidenceforge.generation.activity.generator import _FILE_ACTION_EVENT_TYPES
+        from evidenceforge.generation.state_manager import StateManager
+
+        assert _FILE_ACTION_EVENT_TYPES[action] == expected_event_type
+
+        class _CollectorEmitter:
+            def __init__(self) -> None:
+                self.events: list[SecurityEvent] = []
+
+            def can_handle(self, event: SecurityEvent) -> bool:
+                return event.event_type == expected_event_type
+
+            def emit(self, event: SecurityEvent) -> None:
+                self.events.append(event)
+
+        collector = _CollectorEmitter()
+        dispatcher = EventDispatcher(state_manager=StateManager(), emitters={"test": collector})
+
+        event = SecurityEvent(
+            timestamp=datetime.now(UTC),
+            event_type=_FILE_ACTION_EVENT_TYPES[action],
+            file=FileContext(path="/tmp/dispatch-example", action=action, pid=999),
+        )
+        dispatcher.dispatch(event)
+
+        assert len(collector.events) == 1
+        dispatched = collector.events[0]
+        assert dispatched.event_type == expected_event_type
+        assert dispatched.file is not None
+        assert dispatched.file.action == action
+
+
 class TestHostContext:
     """Tests for HostContext dataclass."""
 

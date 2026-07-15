@@ -326,6 +326,10 @@ _FILE_ACTION_EVENT_TYPES = {
     "create": "file_create",
     "modify": "file_modify",
     "delete": "file_delete",
+    "open": "file_open",
+    "write": "file_write",
+    "rename": "file_rename",
+    "unlink": "file_unlink",
 }
 _SYSTEM_ACCOUNTS = {"SYSTEM", "NETWORK SERVICE", "LOCAL SERVICE"}
 _USER_MODEL_USERNAME_RE = re.compile(r"^[a-zA-Z0-9._$-]+$")
