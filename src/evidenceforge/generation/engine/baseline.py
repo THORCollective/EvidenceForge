@@ -5798,7 +5798,10 @@ class BaselineMixin:
     def _emit_unlock(self, user, system, unlock_t, logon_id, rng) -> None:
         """Emit an unlock event, optionally preceded by a failed password attempt."""
         self.state_manager.set_current_time(unlock_t)
-        if rng.random() < 0.15:
+        # The pre-unlock failed attempt is a Windows Type 7 4625; macOS screen
+        # unlock surfaces via the ES lw_session_unlock event, not a Windows
+        # failed-logon record.
+        if _get_os_category(system.os) == "windows" and rng.random() < 0.15:
             fail_t = unlock_t - timedelta(seconds=rng.randint(3, 15))
             self.state_manager.set_current_time(fail_t)
             self.activity_generator.generate_failed_logon(
@@ -5889,7 +5892,7 @@ class BaselineMixin:
             (s for s in self.scenario.environment.systems if s.hostname == session.system),
             None,
         )
-        if not system or _get_os_category(system.os) != "windows":
+        if not system or _get_os_category(system.os) not in ("windows", "macos"):
             return
 
         # Per-persona lock frequency

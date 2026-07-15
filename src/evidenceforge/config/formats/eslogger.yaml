@@ -183,6 +183,51 @@ fields:
     required: false
     description: "plist path for btm_launch_item_add events"
 
+  - name: event.lw_session_lock.username
+    type: string
+    required: false
+    description: "Locking user for lw_session_lock events"
+
+  - name: event.lw_session_lock.graphical_session_id
+    type: integer
+    required: false
+    description: "Graphical (audit) session id for lw_session lock/unlock events"
+
+  - name: event.lw_session_unlock.username
+    type: string
+    required: false
+    description: "Unlocking user for lw_session_unlock events"
+
+  - name: event.sudo.success
+    type: boolean
+    required: false
+    description: "Whether the sudo elevation succeeded"
+
+  - name: event.sudo.from_username
+    type: string
+    required: false
+    description: "Invoking user for sudo events"
+
+  - name: event.sudo.to_username
+    type: string
+    required: false
+    description: "Elevated target user for sudo events (root by default)"
+
+  - name: event.sudo.command
+    type: string
+    required: false
+    description: "Command run under sudo"
+
+  - name: event.su.from_username
+    type: string
+    required: false
+    description: "Invoking user for su events"
+
+  - name: event.su.to_username
+    type: string
+    required: false
+    description: "Elevated target user for su events (root by default)"
+
 output:
   format: json
   file_extension: ".ndjson"

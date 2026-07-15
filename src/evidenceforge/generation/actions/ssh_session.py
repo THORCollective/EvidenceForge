@@ -457,6 +457,66 @@ class SshSessionActionBundle:
                 session_floor_time=auth_state.login_time,
             )
         self.executor.dispatcher.dispatch(event)
+        if auth_state is not None and self.request.emit_session_close:
+            self._dispatch_macos_session_close(state, event, auth_state)
+
+    def _dispatch_macos_session_close(
+        self,
+        state: _SshTransportState,
+        event: SecurityEvent,
+        auth_state: _SshMacosAuthState,
+    ) -> None:
+        """Dispatch the macOS SSH session-close (logoff) evidence.
+
+        macOS SSH close surfaces via an ES ``openssh_logout`` event rendered by
+        the eslogger emitter, not Linux-style ``sshd`` / ``systemd-logind``
+        syslog. A generic ``logoff`` SecurityEvent is dispatched carrying the ES
+        audit-token session identity (the same ``AuthContext.session_id`` slot
+        the login used) but no ``SyslogContext``. The eslogger emitter routes it
+        to ``openssh_logout`` because the destination host is macOS.
+        """
+
+        request = self.request
+        close_time = self._macos_session_close_time(state, auth_state)
+        self.executor.dispatcher.dispatch(
+            SecurityEvent(
+                timestamp=close_time,
+                event_type="logoff",
+                dst_host=event.dst_host,
+                auth=AuthContext(
+                    username=request.user.username,
+                    source_ip=request.source_ip,
+                    source_port=state.source_port,
+                    logon_id=state.logon_id,
+                    session_id=auth_state.audit_session_id,
+                    logon_type=10,
+                ),
+                edr=EdrContext(object_id=state.session_obj_id),
+            )
+        )
+
+    def _macos_session_close_time(
+        self,
+        state: _SshTransportState,
+        auth_state: _SshMacosAuthState,
+    ) -> datetime:
+        """Return a plausible macOS SSH session close time after transport close.
+
+        Mirrors the general shape of the Linux ``_source_native_session_close_time``
+        helper (a small deterministic offset past the transport close) without the
+        Linux-specific PAM/logind lifecycle, since macOS emits no such syslog.
+        """
+
+        request = self.request
+        seed = _stable_seed(
+            "ssh_session_macos_close:"
+            f"{request.target_system.hostname}:{request.user.username}:{request.source_ip}:"
+            f"{state.source_port}:{auth_state.sshd_pid}:{state.close_time.isoformat()}"
+        )
+        return state.close_time + timedelta(
+            milliseconds=120 + (seed % 2380),
+            microseconds=211 + (seed % 613),
+        )
 
     def _source_os(self) -> str:
         """Return the source OS category used for source-port reservation."""

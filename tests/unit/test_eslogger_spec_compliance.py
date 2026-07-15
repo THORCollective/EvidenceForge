@@ -124,6 +124,46 @@ def _sample_events():
             file=FileContext("/Users/alice/Library/LaunchAgents/x.plist", "create", 1500),
             auth=AuthContext(username="alice"),
         ),
+        SecurityEvent(
+            timestamp=TS,
+            event_type="workstation_locked",
+            dst_host=mac,
+            auth=AuthContext(username="alice", session_id=132501),
+        ),
+        SecurityEvent(
+            timestamp=TS,
+            event_type="workstation_unlocked",
+            dst_host=mac,
+            auth=AuthContext(username="alice", session_id=132501),
+        ),
+        SecurityEvent(
+            timestamp=TS,
+            event_type="privilege_elevation",
+            src_host=mac,
+            process=ProcessContext(
+                pid=1600,
+                parent_pid=1500,
+                image="/usr/bin/sudo",
+                command_line="sudo /usr/bin/whoami",
+                username="alice",
+                start_time=TS,
+            ),
+            auth=AuthContext(username="root", subject_username="alice", elevated=True),
+        ),
+        SecurityEvent(
+            timestamp=TS,
+            event_type="privilege_elevation",
+            src_host=mac,
+            process=ProcessContext(
+                pid=1601,
+                parent_pid=1500,
+                image="/usr/bin/su",
+                command_line="su -",
+                username="alice",
+                start_time=TS,
+            ),
+            auth=AuthContext(username="root", subject_username="alice", elevated=True),
+        ),
     ]
 
 

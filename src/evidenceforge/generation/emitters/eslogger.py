@@ -91,6 +91,8 @@ _ES_EVENT_TYPE_CODES: dict[str, int] = {
     "openssh_logout": 107,
     "lw_session_lock": 108,
     "lw_session_unlock": 109,
+    "su": 130,
+    "sudo": 131,
 }
 
 # Canonical file event_type -> ES file event name.  macOS file activity uses the
@@ -104,9 +106,17 @@ _FILE_EVENT_NAMES: dict[str, str] = {
     "file_unlink": "unlink",
 }
 
+# Canonical screen lock/unlock event_type -> ES lw_session event name.  The
+# generic ``workstation_locked``/``workstation_unlocked`` canonical events (also
+# used by Windows 4800/4801) render on macOS as loginwindow lw_session events.
+_LW_SESSION_EVENT_NAMES: dict[str, str] = {
+    "workstation_locked": "lw_session_lock",
+    "workstation_unlocked": "lw_session_unlock",
+}
+
 # Event types whose eslogger record belongs to the destination host (the macOS
-# box being logged into), not the source host.
-_SESSION_EVENT_TYPES = {"ssh_session", "logoff"}
+# box being logged into / whose console is being locked), not the source host.
+_SESSION_EVENT_TYPES = {"ssh_session", "logoff", "workstation_locked", "workstation_unlocked"}
 
 
 class ESLoggerEmitter(HostMultiplexEmitter):
@@ -130,6 +140,9 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         "file_unlink",
         "ssh_session",
         "logoff",
+        "workstation_locked",
+        "workstation_unlocked",
+        "privilege_elevation",
         "btm_launch_item_add",
     }
 
@@ -178,6 +191,10 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             self._render_openssh_login(event)
         elif et == "logoff":
             self._render_openssh_logout(event)
+        elif et in _LW_SESSION_EVENT_NAMES:
+            self._render_lw_session(event)
+        elif et == "privilege_elevation":
+            self._render_privilege_elevation(event)
         elif et == "btm_launch_item_add":
             self._render_btm_launch_item_add(event)
         else:  # pragma: no cover - guarded by can_handle/_supported_types
@@ -390,6 +407,84 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             ),
         )
 
+    def _render_lw_session(self, event: SecurityEvent) -> None:
+        """Render an ES ``lw_session_lock``/``lw_session_unlock`` for a macOS console.
+
+        The generic ``workstation_locked``/``workstation_unlocked`` canonical
+        event is reported on macOS by ``loginwindow`` (the ES lw_session events),
+        carrying the locking user and the graphical (audit) session id.
+        """
+        host = event.dst_host
+        auth = event.auth
+        if host is None or auth is None:
+            return
+        event_name = _LW_SESSION_EVENT_NAMES[event.event_type]
+        graphical_session_id = auth.session_id or self._resolve_asid(
+            host.hostname, auth.username, auth.logon_id, 0, True
+        )
+        process_obj = self._loginwindow_process_object(host, graphical_session_id)
+        self._queue_record(
+            host,
+            self._envelope(
+                host=host,
+                event_name=event_name,
+                event_time=event.timestamp,
+                process_obj=process_obj,
+                event_payload={
+                    "username": auth.username,
+                    "graphical_session_id": graphical_session_id,
+                },
+            ),
+        )
+
+    def _render_privilege_elevation(self, event: SecurityEvent) -> None:
+        """Render an ES ``sudo``/``su`` for a macOS privilege-elevation event.
+
+        macOS ES (14+) reports a distinct NOTIFY_SUDO / NOTIFY_SU signal for a
+        privilege elevation, separate from the exec of the sudo/su binary. The
+        acting process image selects between the two: ``/usr/bin/su`` renders as
+        ``su``, everything else (``/usr/bin/sudo``) as ``sudo``.
+        """
+        host = event.src_host
+        proc = event.process
+        if host is None or proc is None:
+            return
+        tool = "su" if str(proc.image).rsplit("/", 1)[-1] == "su" else "sudo"
+        process_obj = self._build_process_object(
+            host,
+            pid=proc.pid,
+            ppid=proc.parent_pid,
+            image=proc.image,
+            username=proc.username,
+            logon_id=proc.logon_id,
+            start_time=proc.start_time or event.timestamp,
+        )
+        auth = event.auth
+        from_username = (auth.subject_username if auth is not None else "") or proc.username
+        to_username = (auth.username if auth is not None else "") or "root"
+        success = not (auth is not None and auth.result == "failure")
+        payload: dict[str, Any] = {
+            "success": success,
+            "from_uid": self._macos_ids(from_username)["uid"],
+            "from_username": from_username,
+            "to_uid": self._macos_ids(to_username)["uid"],
+            "to_username": to_username,
+        }
+        if tool == "sudo":
+            payload["command"] = proc.command_line or proc.image
+        else:
+            payload["shell"] = proc.command_line or "/bin/zsh"
+        self._queue_record(
+            host,
+            self._envelope(
+                host=host,
+                event_name=tool,
+                event_time=event.timestamp,
+                process_obj=process_obj,
+                event_payload=payload,
+            ),
+        )
+
     def _render_btm_launch_item_add(self, event: SecurityEvent) -> None:
         """Render an ES ``btm_launch_item_add`` for a LaunchAgents/Daemons plist."""
         host = event.src_host
@@ -540,41 +635,75 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             start_time=event.timestamp,
         )
 
-    def _sshd_process_object(self, host: HostContext, session_id: int) -> dict[str, Any]:
-        """Build the process object for the target-side sshd handling a login.
+    def _named_system_process_object(
+        self,
+        host: HostContext,
+        *,
+        image_suffix: str,
+        session_id: int,
+        fallback_image: str,
+        fallback_username: str = "root",
+    ) -> dict[str, Any]:
+        """Build a process object for a seeded system daemon reporting an event.
 
-        ES openssh_login/logout events are reported by the sshd process on the
-        macOS target.  Locate the seeded sshd in StateManager; fall back to a
-        minimal root sshd object if state is unavailable.
+        Some ES events are reported by a long-lived system process rather than
+        the acting user process (``sshd`` for openssh_login/logout,
+        ``loginwindow`` for lw_session).  Locate the seeded daemon in
+        StateManager by image suffix; fall back to a minimal object if state is
+        unavailable.
         """
         sm = getattr(self, "_state_manager", None)
-        sshd_rp = None
+        found_rp = None
         if sm is not None:
             running = getattr(getattr(sm, "state", None), "running_processes", {}) or {}
             candidates = [
                 rp
                 for (rp_host, _pid), rp in running.items()
-                if rp_host == host.hostname and str(rp.image).endswith("sshd")
+                if rp_host == host.hostname and str(rp.image).endswith(image_suffix)
             ]
             if candidates:
-                sshd_rp = min(candidates, key=lambda rp: rp.pid)
-        if sshd_rp is not None:
+                found_rp = min(candidates, key=lambda rp: rp.pid)
+        if found_rp is not None:
             return self._build_process_object(
                 host,
-                pid=sshd_rp.pid,
-                ppid=sshd_rp.parent_pid,
-                image=sshd_rp.image,
-                username=sshd_rp.username,
+                pid=found_rp.pid,
+                ppid=found_rp.parent_pid,
+                image=found_rp.image,
+                username=found_rp.username,
                 session_id=session_id,
-                start_time=sshd_rp.start_time,
+                start_time=found_rp.start_time,
             )
         return self._build_process_object(
             host,
             pid=0,
             ppid=1,
-            image="/usr/sbin/sshd",
-            username="root",
+            image=fallback_image,
+            username=fallback_username,
             session_id=session_id,
+        )
+
+    def _sshd_process_object(self, host: HostContext, session_id: int) -> dict[str, Any]:
+        """Build the process object for the target-side sshd handling a login.
+
+        ES openssh_login/logout events are reported by the sshd process on the
+        macOS target.
+        """
+        return self._named_system_process_object(
+            host,
+            image_suffix="sshd",
+            session_id=session_id,
+            fallback_image="/usr/sbin/sshd",
+        )
+
+    def _loginwindow_process_object(self, host: HostContext, session_id: int) -> dict[str, Any]:
+        """Build the process object for loginwindow, which reports lw_session events."""
+        return self._named_system_process_object(
+            host,
+            image_suffix="loginwindow",
+            session_id=session_id,
+            fallback_image=(
+                "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow"
+            ),
         )
 
     # ------------------------------------------------------------------

@@ -1530,6 +1530,11 @@ _WINDOWS_ELECTRON_CHILD_MARKERS = (
 _WINDOWS_INTERACTIVE_SESSION_LOGON_TYPES = frozenset({2, 10, 11})
 _WINDOWS_WORKSTATION_SESSION_LOGON_TYPES = frozenset({2, 11})
 _WINDOWS_REMOTE_SESSION_KINDS = frozenset({"network", "service", "rdp", "ssh"})
+# macOS local console (Aqua) logins are modeled as interactive Type 2 sessions
+# (WorldModel plan_session), the loginwindow-rooted durable desktop session that
+# owns screen lock/unlock. Remote session kinds (ssh) cannot own a local lock.
+_MACOS_WORKSTATION_SESSION_LOGON_TYPES = frozenset({2})
+_MACOS_REMOTE_SESSION_KINDS = frozenset({"network", "service", "rdp", "ssh"})
 _LINUX_LOCAL_SESSION_LOGON_TYPES = frozenset({2, 11})
 _LINUX_REMOTE_SESSION_KINDS = frozenset({"network", "service", "ssh"})
 _SSH_SYSLOG_MICRO_JITTER_BANDS = {
@@ -1547,6 +1552,27 @@ def _is_windows_workstation_session(session: ActiveSession) -> bool:
         session.logon_type in _WINDOWS_WORKSTATION_SESSION_LOGON_TYPES
         and session.session_kind not in _WINDOWS_REMOTE_SESSION_KINDS
     )
+
+
+def _is_macos_workstation_session(session: ActiveSession) -> bool:
+    """Return true when a macOS session can own local screen lock/unlock evidence."""
+    return (
+        session.logon_type in _MACOS_WORKSTATION_SESSION_LOGON_TYPES
+        and session.session_kind not in _MACOS_REMOTE_SESSION_KINDS
+    )
+
+
+def _is_lockable_workstation_session(session: ActiveSession, os_category: str) -> bool:
+    """Return true when a session can own local screen lock/unlock evidence.
+
+    Screen lock/unlock is a durable-desktop-session concept modeled for Windows
+    and macOS only (Linux interactive sessions are intentionally excluded).
+    """
+    if os_category == "windows":
+        return _is_windows_workstation_session(session)
+    if os_category == "macos":
+        return _is_macos_workstation_session(session)
+    return False
 
 
 def _ssh_syslog_time(
@@ -11326,6 +11352,10 @@ class ActivityGenerator:
         # Phase 3: Dispatch to matching emitters
         self.dispatcher.dispatch(event)
         self._record_process_source_create_time(system.hostname, pid, event)
+        # macOS sudo/su elevations emit a distinct ES NOTIFY_SUDO/NOTIFY_SU
+        # signal alongside the exec of the sudo/su binary (canonical layer, not
+        # emitter-synthesized).
+        self._maybe_emit_macos_privilege_elevation(system, time, event.process)
         self._emit_process_command_network_effects(
             user=user,
             system=system,
@@ -23319,6 +23349,72 @@ class ActivityGenerator:
             return target_host or "-"
         return netbios_domain
 
+    def _maybe_emit_macos_privilege_elevation(
+        self,
+        system: System,
+        time: datetime,
+        process: ProcessContext | None,
+    ) -> None:
+        """Emit a macOS sudo/su privilege-elevation ES signal for a sudo/su exec.
+
+        macOS ES (14+) reports a distinct NOTIFY_SUDO / NOTIFY_SU event for each
+        privilege elevation, separate from the exec of the ``sudo``/``su``
+        binary. When a macOS process create is for ``/usr/bin/sudo`` or
+        ``/usr/bin/su``, dispatch the canonical ``privilege_elevation`` event
+        alongside the process create so the eslogger emitter renders the ES
+        sudo/su signal. No-op on non-macOS hosts and non-sudo/su processes.
+        """
+        if process is None or _get_os_category(system.os) != "macos":
+            return
+        tool = str(process.image).rsplit("/", 1)[-1]
+        if tool not in ("sudo", "su"):
+            return
+        seed = _stable_seed(
+            f"macos_privilege_elevation:{system.hostname}:{process.pid}:{time.isoformat()}"
+        )
+        elevation_time = time + timedelta(
+            milliseconds=8 + (seed % 40),
+            microseconds=101 + (seed % 397),
+        )
+        self.generate_privilege_elevation(
+            system=system,
+            time=elevation_time,
+            process=process,
+            from_username=process.username,
+        )
+
+    def generate_privilege_elevation(
+        self,
+        *,
+        system: System,
+        time: datetime,
+        process: ProcessContext,
+        from_username: str,
+        to_username: str = "root",
+        success: bool = True,
+    ) -> None:
+        """Dispatch a macOS sudo/su privilege-elevation canonical event.
+
+        Renders (via the eslogger emitter) as an ES ``sudo`` or ``su`` event
+        depending on the acting process image. ``from_username`` is the invoking
+        user; ``to_username`` is the elevated target (root by default). The
+        acting ``process`` is the already-created ``sudo``/``su`` occurrence.
+        """
+        self.dispatcher.dispatch(
+            SecurityEvent(
+                timestamp=time,
+                event_type="privilege_elevation",
+                src_host=self._build_host_context(system),
+                process=process,
+                auth=AuthContext(
+                    username=to_username,
+                    subject_username=from_username,
+                    elevated=True,
+                    result="success" if success else "failure",
+                ),
+            )
+        )
+
     def generate_workstation_lock(
         self,
         user: User,
@@ -23347,7 +23443,7 @@ class ActivityGenerator:
             session is None
             or session.system != system.hostname
             or session.start_time > time
-            or not _is_windows_workstation_session(session)
+            or not _is_lockable_workstation_session(session, _get_os_category(system.os))
         ):
             return
         if not hasattr(self, "_last_workstation_lock_time"):
@@ -23411,7 +23507,7 @@ class ActivityGenerator:
             session is None
             or session.system != system.hostname
             or session.start_time > time
-            or not _is_windows_workstation_session(session)
+            or not _is_lockable_workstation_session(session, _get_os_category(system.os))
         ):
             return
         reauth_gap = self._workstation_unlock_reauth_gap(user, system, time, logon_id)
@@ -23437,14 +23533,18 @@ class ActivityGenerator:
             session.last_activity_time = unlock_time
         # Unlock is a re-authentication: Windows records the Type 7 4624 before
         # the workstation-unlocked audit event for the same terminal session.
-        self.generate_logon(
-            user=user,
-            system=system,
-            time=reauth_time,
-            logon_type=7,
-            source_ip="-",
-            logon_id=logon_id,
-        )
+        # macOS screen unlock produces no Windows-style Type 7 logon — the ES
+        # lw_session_unlock event alone represents the unlock — so this re-auth
+        # logon is Windows-only.
+        if _get_os_category(system.os) == "windows":
+            self.generate_logon(
+                user=user,
+                system=system,
+                time=reauth_time,
+                logon_type=7,
+                source_ip="-",
+                logon_id=logon_id,
+            )
         event = SecurityEvent(
             timestamp=unlock_time,
             event_type="workstation_unlocked",
