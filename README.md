@@ -19,7 +19,7 @@ Most synthetic log generators produce isolated, single-format data that experien
 
 - **Self-exciting temporal dynamics.** User activity follows a Hawkes process — events trigger bursts that taper off naturally, matching real human work patterns. System traffic uses periodic intervals with jitter. Day-of-week variation models Monday login storms, Friday early departures, and near-zero weekends. Most generators use uniform random timing that experienced analysts spot instantly.
 
-- **20+ correlated log formats.** Windows Security (30 event IDs), Sysmon, 13 Zeek log types, eCAR EDR/XDR, syslog, bash history, Snort IDS, web access, and proxy logs — all from the same event pipeline.
+- **20+ correlated log formats.** Windows Security (30 event IDs), Sysmon, 13 Zeek log types, eCAR EDR/XDR, macOS eslogger (Endpoint Security), syslog, bash history, Snort IDS, web access, and proxy logs — all from the same event pipeline.
 
 - **Network visibility modeling.** Define sensor placement (SPAN/TAP), monitored segments, and direction. EvidenceForge determines which connections each sensor can see and only emits network logs where they'd realistically appear.
 
@@ -123,7 +123,7 @@ Every generated scenario includes a `GROUND_TRUTH.md` file. Attack scenarios doc
 - **Cross-log consistency** — Shared LogonIDs, PIDs, timestamps, and Zeek UIDs across all formats
 - **Causal expansion engine** — Auto-generates prerequisite events (DNS, Kerberos, audit events) with composable rules
 - **Realistic baseline noise** — 26 lateral movement patterns, process→network correlation, network-level red herrings, and 18 Linux syslog categories create noise that analysts must work through
-- **OS-aware generation** — Windows systems produce Windows Event + Sysmon logs; Linux systems produce syslog + bash history
+- **OS-aware generation** — Windows systems produce Windows Event + Sysmon logs; Linux systems produce syslog + bash history; macOS systems produce eslogger (Endpoint Security) NDJSON
 - **Network visibility modeling** — Define sensor placement (SPAN/TAP), direction, and monitored segments
 - **Ground truth documentation** — Every run generates a GROUND_TRUTH.md; attack scenarios include narrative, timeline, and IOCs
 - **Parallel generation** — Threaded emitters write all formats simultaneously with temporal consistency
@@ -141,6 +141,7 @@ Every generated scenario includes a `GROUND_TRUTH.md` file. Attack scenarios doc
 | eCAR | Host | EDR/XDR telemetry in MITRE CAR-based format (PROCESS, FILE, FLOW, REGISTRY, MODULE, THREAD, USER_SESSION, SERVICE) |
 | Syslog | Host | Linux authentication and system logs (BSD format) |
 | Bash History | Host | Per-user timestamped command history |
+| macOS Endpoint Security (eslogger) | Host | `eslogger`-style ESF NDJSON: process exec/fork/exit with full argv and code-signing identity, file create/open/write/rename/unlink, openssh_login/logout, lw_session lock/unlock, sudo/su privilege elevation, btm_launch_item_add persistence |
 | Snort Alert | Network | IDS alert format (fast alert) |
 | Web Access | Network | Apache/Nginx combined log format |
 | HTTP Proxy | Host | Forward proxy access log (W3C Extended format, CONNECT entries, cache status, proxy action hints) |
@@ -199,6 +200,7 @@ See [Scenario Reference](docs/reference/scenario-reference.md) for complete sche
 | Scenario | Users | Duration | Description |
 |----------|-------|----------|-------------|
 | [branch-office-example](scenarios/branch-office-example/scenario.yaml) | 5 | 6 hours | Beginner branch office scenario with Windows, Zeek, eCAR, syslog, bash history, Snort, ASA, web, and proxy logs |
+| [macos-eslogger-demo](scenarios/macos-eslogger-demo/scenario.yaml) | 3 | 2 hours | Three-hunt macOS Endpoint Security demo (AMOS/Atomic Stealer, DPRK BeaverTail, CloudMensis-style persistence) with `eslogger` + Zeek egress correlation |
 | [minimal.yaml](tests/fixtures/scenarios/minimal.yaml) | 1 | 1 hour | Minimal baseline-only scenario |
 | [attack.yaml](tests/fixtures/scenarios/attack.yaml) | 2 | 4 hours | Lateral movement + exfiltration |
 | [retail-store-ftp-attack.yaml](tests/fixtures/scenarios/retail-store-ftp-attack.yaml) | 20+ | 24 hours | Retail store with FTP RCE attack, full network topology |

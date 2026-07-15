@@ -70,6 +70,15 @@ network identity.
 
 **Causal expansion redundancy warnings:** The validator detects when storyline events manually specify prerequisites that the causal expansion engine auto-generates (e.g., a DNS query alongside a TCP connection, or Kerberos events alongside a logon). These are warnings, not errors. The fix is to remove the redundant manual events UNLESS they are part of the attack narrative itself (e.g., DNS tunneling, golden ticket forging).
 
+**macOS/eslogger OS-gating warnings and errors:** A scenario declaring `os: macos`/`darwin`/`osx` systems interacts with output-format and event-type gating the same way Windows/Linux do:
+
+- **"Format 'eslogger' requires macos systems but none are defined"** (error) — `output.logs` requests `eslogger` but no system's `os` resolves to macOS. Add a macOS system or remove `eslogger` from the output formats.
+- **"System '{hostname}' is macos but no macos log formats in output"** (warning) — a macOS system exists but `output.logs` has no `eslogger` entry, so that host would produce no host-native telemetry. Add `- format: eslogger`.
+- **"Event type '{type}' is Linux-specific but system '{system}' is macos"** (warning) — a storyline event type considered Linux-only targets a macOS system. `ssh_session` is explicitly exempt (the SSH bundle supports macOS sources/destinations), so today this only fires for a future Linux-only event type not yet extended to macOS; retarget to a Linux host or use a different event type.
+- **"File action '{action}' is only rendered by the macOS eslogger emitter, but system '{system}' is {os}; no emitter will render this event"** (warning) — a `file` event uses an eslogger-only action (`open`/`write`/`rename`/`unlink`) on a non-macOS system, so no emitter would render it (a silent gap in the generated data, not a crash). Either retarget the event to a macOS system, or switch the action to `create`/`modify`/`delete`/`read`, which render on Windows/Linux too.
+
+These are advisory the same way other OS/format mismatches are (see above) — fix by aligning the event's target system OS with the event type/action, or by adding/removing the corresponding output format.
+
 **If validation passes with info-level notes:** Info-level issues (shown with ℹ) are informational observations, not problems. For example, consecutive storyline events that don't share an obvious pivot indicator. Mention them briefly but don't suggest fixes unless the user asks.
 
 **If validation fails:** Read the scenario file and the error output, then triage:

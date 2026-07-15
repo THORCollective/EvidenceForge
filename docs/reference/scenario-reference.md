@@ -223,6 +223,21 @@ systems:
     roles: [web_server]        # Optional: forward_proxy, web_server, dns_server, mail_server
 ```
 
+`os` also accepts Linux (e.g. `"Ubuntu 22.04"`, `"CentOS 8"`) and macOS
+(e.g. `"macOS 14.4"`) strings — OS category detection is pattern-based
+(`windows`/`linux`/`macos`/`darwin`/`osx` substrings), not an enum. A macOS
+system produces `eslogger` (Endpoint Security) NDJSON instead of
+Windows Event/Sysmon or Linux syslog/bash history:
+
+```yaml
+systems:
+  - hostname: MAC-DESIGN-01
+    ip: "10.0.1.20"
+    os: "macOS 14.4"
+    type: workstation
+    assigned_user: dana.reyes
+```
+
 `roles` and `services` materially affect realism. They feed the compiled world model that drives infrastructure discovery, proxy routing, legitimate lateral-movement patterns, and whether remote access should look like SSH, RDP, or generic network activity.
 
 ### Network Identities
@@ -1348,7 +1363,7 @@ output:
   compression: false           # Optional (default: false)
 ```
 
-Supported formats: `windows`, `zeek`, `ecar` (simulated EDR using the eCAR record format), `syslog`, `bash_history`, `snort_alert`, `cisco_asa`, `web_access`, `proxy_access`.
+Supported formats: `windows`, `zeek`, `ecar` (simulated EDR using the eCAR record format), `eslogger` (macOS Endpoint Security NDJSON), `syslog`, `bash_history`, `snort_alert`, `cisco_asa`, `web_access`, `proxy_access`.
 
 Output formats here are canonical and target-neutral. Choose target-specific
 file shapes, such as SOF-ELK® Snare Windows events or year-partitioned RFC3164

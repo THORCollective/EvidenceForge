@@ -326,6 +326,9 @@ environment:
       assigned_user: marcus.chen  # Optional
       services: []               # Optional, but valuable for server realism
       roles: []                  # Optional, but strongly recommended for servers/proxies
+      # os also accepts Linux (e.g. "Ubuntu 22.04") and macOS (e.g. "macOS 14.4")
+      # strings — a macOS system produces eslogger (Endpoint Security) NDJSON
+      # instead of Windows Event/Sysmon or Linux syslog/bash history.
 
   service_accounts: []             # Optional: custom service/system accounts valid as storyline actors
 
@@ -452,7 +455,7 @@ output:
   logs:
     - format: windows
     - format: zeek
-    # Available: windows, zeek, ecar, syslog, bash_history,
+    # Available: windows, zeek, ecar, eslogger, syslog, bash_history,
     #            snort_alert, cisco_asa, web_access, proxy_access
   destination: "scenarios/<slug>"
   compression: false
@@ -520,7 +523,9 @@ These are just examples — invent additional realistic variations appropriate t
 
 When building storyline events, each entry needs an `events` list with typed declarations. Be technically specific — the engine uses these fields directly.
 
-**Available event types:** `process`, `logon`, `failed_logon`, `logoff`, `connection`, `ssh_session`, `rdp_session`, `account_created`, `account_deleted`, `group_member_added`, `service_installed`, `scheduled_task_created`, `log_cleared`, `create_remote_thread`, `dhcp_lease`, `port_scan`, `beacon`, `dns_query`, `web_scan`, `credential_spray`, `dga_queries`, `dns_tunnel`, `explicit_credentials`, `workstation_lock`, `workstation_unlock`, `spillage`, `adversarial_payload`, `raw`
+**Available event types:** `process`, `logon`, `failed_logon`, `logoff`, `connection`, `ssh_session`, `rdp_session`, `account_created`, `account_deleted`, `group_member_added`, `service_installed`, `scheduled_task_created`, `log_cleared`, `create_remote_thread`, `file`, `dhcp_lease`, `port_scan`, `beacon`, `dns_query`, `web_scan`, `credential_spray`, `dga_queries`, `dns_tunnel`, `explicit_credentials`, `workstation_lock`, `workstation_unlock`, `spillage`, `adversarial_payload`, `raw`
+
+`file` renders as Sysmon Event 11/eCAR file events (`create`/`modify`/`delete`/`read`) on Windows/Linux, and as macOS eslogger file events (`create`/`open`/`write`/`rename`/`unlink`) on macOS — the eslogger-only actions (`open`/`write`/`rename`/`unlink`) render no evidence on non-macOS systems. A `create` under `~/Library/LaunchAgents`/`LaunchDaemons` on a macOS system also auto-generates a `btm_launch_item_add` eslogger event via causal expansion — do not declare that event manually.
 
 Correlated multi-event activities such as `ssh_session`, auth/session lifecycle
 (including workstation lock/unlock, service/machine/anonymous logons, and DC

@@ -229,7 +229,7 @@ Each `event_type` string maps to which contexts must/may be populated. "required
 | `logon` | required | required | - | - | - | - | - | - | User authentication (4624, syslog auth, eCAR) |
 | `logon_failed` | required | required | - | - | - | - | - | - | Failed authentication (4625) |
 | `logoff` | required | required | - | - | - | - | - | - | Session end (4634, syslog, eCAR) |
-| `process_create` | required | - | required | - | - | - | - | - | Process creation (4688, syslog, eCAR) |
+| `process_create` | required | - | required | - | - | - | - | - | Process creation (4688, syslog, eCAR, eslogger) |
 | `process_terminate` | required | - | required | - | - | - | - | - | Process termination (4689) |
 | `system_process_create` | required | - | required | - | - | - | - | - | OS boot process tree (svchost chains, systemd) |
 | `connection` | - | - | - | required | optional | - | - | optional | Network connection (Zeek conn, eCAR FLOW, Snort) |
@@ -248,6 +248,7 @@ Each `event_type` string maps to which contexts must/may be populated. "required
 - `connection` and `dns_query` have no `host` context because the current `generate_connection()` works purely with IP addresses, not host objects. This is preserved as-is (not new behavior).
 - `system_process_create` uses the same contexts as `process_create` but is a distinct type so emitters can apply different logic (e.g., no syslog emission for Windows boot processes).
 - `image_load` carries canonical DLL/module-load data shared by Sysmon Event 7 and eCAR MODULE/LOAD. `process` is optional (module loads can be attributed to a process or standalone). `module_load` remains accepted by eCAR as a legacy compatibility alias.
+- This catalog predates several later-added canonical event types (e.g. `ssh_session`, `file_create`/`file_open`/`file_write`/`file_rename`/`file_unlink`, `workstation_locked`/`workstation_unlocked`, `btm_launch_item_add`) and is not an exhaustive list of every `event_type` string in the engine — see `src/evidenceforge/events/base.py` and the emitters' `_supported_types` for the authoritative set. Notably, `privilege_elevation` (macOS/eslogger-only: sudo/su elevation rendered as ES `sudo`/`su`) uses `host` + `process` + optional `auth` contexts and is not listed as its own row here for the same reason.
 
 ## 4. Dispatcher Design
 

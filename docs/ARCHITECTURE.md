@@ -233,7 +233,7 @@ The `SecurityEvent` dataclass (`src/evidenceforge/events/base.py`) is the centra
 ```
 SecurityEvent
 ├── timestamp: datetime (UTC)
-├── event_type: str ("logon", "process_create", "connection", ...)
+├── event_type: str ("logon", "process_create", "connection", "privilege_elevation", ...)
 ├── src_host: HostContext (originating system — hostname, IP, OS, domain, FQDN)
 ├── dst_host: HostContext (target system — hostname, IP, OS, domain, FQDN)
 ├── auth: AuthContext (logon_id, logon_type, SID, failure codes)
@@ -265,6 +265,7 @@ All contexts are `@dataclass(slots=True)` for memory efficiency. They're defined
 - All fields are optional except `timestamp` and `event_type` — emitters check for the contexts they need
 - The syslog emitter renders from SyslogContext (app_name, message, pid, facility, severity). All syslog message construction is done by ActivityGenerator, not the emitter.
 - `RawLogEntry` exists solely for the user-facing `raw` event type in scenario YAML. All internal engine code uses canonical SecurityEvent dispatch exclusively
+- `privilege_elevation` is a macOS/eslogger-only canonical event type (sudo/su elevation, rendered as ES `sudo`/`su`). No other emitter renders it — Linux sudo/su elevation continues to render as syslog/bash-history evidence from `process_create`/`bash_command`, not this event type.
 
 ### Action Bundles
 
@@ -609,6 +610,7 @@ LogEmitter (ABC)
 │   ├── ZeekSslEmitter               # ssl.log
 │   └── ... (10 more Zeek types)
 ├── EcarEmitter                      # eCAR NDJSON (MITRE CAR model, objectID/actorID graph via EdrContext)
+├── ESLoggerEmitter                  # macOS Endpoint Security (eslogger) NDJSON — macOS-only, per-host FQDN routing
 ├── SyslogEmitter                    # Linux syslog (default RFC5424 or sof-elk RFC3164/year)
 ├── BashHistoryEmitter               # Per-user bash history
 ├── SnortEmitter                     # Snort IDS alerts
@@ -788,6 +790,7 @@ at slightly different times while keeping each sensor stream internally causal.
 | `KerberosBeforeLogon` | Kerberos-auth Windows logon (not on DC) | TGT (4768) + TGS (4769) | `auth.kerberos_before_logon` timing profile; elevated-session 4672 remains tied to the target-host 4624 |
 | `ProcessAccessAfterRemoteThread` | CreateRemoteThread targeting lsass | ProcessAccess (Sysmon 10) before the remote thread | `process.remote_thread_lsass_access` timing profile |
 | `SupplementaryAuditEvents` | Process creation with admin commands | 4720/4726/4728/4697/4698/1102 | `windows.audit_from_admin_command` timing profile |
+| `PlistCreateBeforeBtmLaunchItem` | macOS `file_create` under `LaunchAgents`/`LaunchDaemons` | `btm_launch_item_add` (eslogger) after the plist create | `macos.btm_after_plist_create` timing profile |
 
 **Adding a new rule:** Create a new `ExpansionRule` subclass in `rules.py`, implement `matches()` and `expand()`, and add it to `default_rules()` in `registry.py`. The engine auto-creates with defaults — no wiring needed in ActivityGenerator or GenerationEngine.
 
