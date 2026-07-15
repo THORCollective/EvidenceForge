@@ -902,6 +902,56 @@ class TestStorylineCommandNetworks:
         assert wfp.timestamp > visible_process_time
 
 
+class TestLastStorylineProcessOsRepairHeuristic:
+    """The OS-inference repair heuristic must not mislabel macOS image paths."""
+
+    def test_macos_valid_forward_slash_image_is_not_discarded(self):
+        """A real macOS app-bundle image path should survive the repair check."""
+        system = System(
+            hostname="MAC-01",
+            ip="10.10.10.5",
+            os="macOS 14.5",
+            type="workstation",
+        )
+        engine = object.__new__(StorylineMixin)
+        engine._last_storyline_process_by_system = {
+            system.hostname: (777, "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        }
+        engine.state_manager = SimpleNamespace(get_process=lambda _host, _pid: object())
+
+        pid, image = engine._last_storyline_process_for_system(system)
+
+        assert pid == 777
+        assert image == "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+    def test_macos_stale_windows_shaped_image_is_discarded(self):
+        """A stale Windows drive-letter path must never survive on a macOS system.
+
+        Regression guard: the repair heuristic used to only reject Windows-shaped
+        paths when os_category == "linux", silently letting them through for any
+        other non-Windows os_category (including macOS) since macOS was not an
+        explicit branch.
+        """
+        system = System(
+            hostname="MAC-01",
+            ip="10.10.10.5",
+            os="macOS 14.5",
+            type="workstation",
+        )
+        engine = object.__new__(StorylineMixin)
+        engine._last_storyline_process_by_system = {
+            system.hostname: (777, r"C:\Windows\explorer.exe"),
+        }
+        # A truthy get_process would previously let the stale Windows path
+        # through unchecked; assert here that the OS-mismatch guard alone
+        # is what discards it, before get_process is even relevant.
+        engine.state_manager = SimpleNamespace(get_process=lambda _host, _pid: object())
+
+        pid, image = engine._last_storyline_process_for_system(system)
+
+        assert (pid, image) == (-1, None)
+
+
 class _FakeActivityGenerator:
     def __init__(self) -> None:
         self.reserved_ports: list[int] = []

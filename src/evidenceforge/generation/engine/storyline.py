@@ -2432,7 +2432,11 @@ class StorylineMixin:
         os_category = _get_os_category(system.os)
         if os_category == "windows" and image.startswith("/"):
             return -1, None
-        if os_category == "linux" and re.match(r"^[A-Za-z]:\\", image):
+        # Any non-Windows OS (linux, macos, unknown) should never have a
+        # Windows-shaped drive-letter image path — check the authoritative
+        # os_category explicitly rather than inferring OS from the path
+        # separator, since macOS image paths are also forward-slash.
+        if os_category != "windows" and re.match(r"^[A-Za-z]:\\", image):
             return -1, None
         if self.state_manager.get_process(system.hostname, pid) is None:
             processes.pop(system.hostname, None)
