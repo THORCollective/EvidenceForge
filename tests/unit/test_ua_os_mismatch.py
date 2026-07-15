@@ -419,6 +419,65 @@ class TestProxyUriOsFiltering:
         )
         assert is_browser_like_proxy_domain("github.com", domain_tags=["git"]) is True
 
+    def test_macos_proxy_user_agent_pool_returns_mac_browser_string(self):
+        """pick_proxy_user_agent() should return a Safari/Chrome-on-macOS UA, not Windows."""
+        from evidenceforge.generation.activity.proxy_user_agents import pick_proxy_user_agent
+        from evidenceforge.models.scenario import System
+
+        source = System(
+            hostname="MAC-01",
+            ip="10.10.10.5",
+            os="macOS 14.5",
+            type="workstation",
+        )
+
+        ua = pick_proxy_user_agent(random.Random(42), source, hostname="example.com")
+
+        assert "Macintosh" in ua
+        assert "Windows NT" not in ua
+        assert "X11; Linux" not in ua
+
+    def test_proxy_user_agent_normalization_replaces_windows_browser_for_macos(self):
+        """A Windows-looking UA on a macOS source should be normalized to the macOS pool."""
+        from evidenceforge.generation.activity.proxy_user_agents import (
+            normalize_proxy_user_agent_for_os,
+        )
+
+        system = SimpleNamespace(os="macOS 14.5", type="workstation", roles=[])
+        ua = normalize_proxy_user_agent_for_os(
+            random.Random(42),
+            system,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            hostname="www.example.com",
+        )
+
+        assert "Windows NT" not in ua
+        assert "Macintosh" in ua
+
+    def test_browser_user_agent_for_process_uses_macos_pool(self):
+        """A Chrome process on a macOS host should resolve a Chrome-on-macOS UA."""
+        from evidenceforge.generation.activity.proxy_user_agents import (
+            browser_user_agent_for_process,
+        )
+        from evidenceforge.models.scenario import System
+
+        source = System(
+            hostname="MAC-01",
+            ip="10.10.10.5",
+            os="macOS 14.5",
+            type="workstation",
+        )
+
+        ua = browser_user_agent_for_process(
+            random.Random(42),
+            source,
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        )
+
+        assert ua
+        assert "Macintosh" in ua
+        assert "chrome/" in ua.lower()
+
     def test_proxy_user_agent_normalization_replaces_windows_browser_for_linux(self):
         from evidenceforge.generation.activity.proxy_user_agents import (
             normalize_proxy_user_agent_for_os,

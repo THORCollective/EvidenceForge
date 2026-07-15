@@ -3549,6 +3549,7 @@ class BaselineMixin:
             "user_agent_pool_by_os": {
                 "windows": "browser_windows",
                 "linux": "browser_linux",
+                "macos": "browser_macos",
             },
         }
         selected_profile = profile or default_profile

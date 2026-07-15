@@ -25442,6 +25442,7 @@ class ActivityGenerator:
                         "user_agent_pool_by_os": {
                             "windows": "browser_windows",
                             "linux": "browser_linux",
+                            "macos": "browser_macos",
                         },
                     },
                     source_os=_get_os_category(system.os),
@@ -25687,6 +25688,7 @@ class ActivityGenerator:
                         "user_agent_pool_by_os": {
                             "windows": "browser_windows",
                             "linux": "browser_linux",
+                            "macos": "browser_macos",
                         },
                     },
                     source_os=_get_os_category(system.os),

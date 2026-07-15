@@ -148,8 +148,11 @@ def _generic_agent_pool_for_source(source_system: "System", data: dict[str, Any]
         server_pool = _pool(data, "server", "generic")
         if server_pool:
             return server_pool
-    if _get_os_category(source_system.os) == "linux":
+    os_category = _get_os_category(source_system.os)
+    if os_category == "linux":
         return _pool(data, "workstation", "linux")
+    if os_category == "macos":
+        return _pool(data, "workstation", "macos")
     return _pool(data, "workstation", "windows")
 
 
@@ -211,6 +214,11 @@ def _ua_looks_linux(user_agent: str) -> bool:
     return "x11; linux" in ua or "ubuntu;" in ua or "linux x86_64" in ua
 
 
+def _ua_looks_macos(user_agent: str) -> bool:
+    ua = user_agent.lower()
+    return "macintosh" in ua or "mac os x" in ua
+
+
 def normalize_proxy_user_agent_for_os(
     rng: random.Random,
     source_system: "System | None",
@@ -258,13 +266,44 @@ def normalize_proxy_user_agent_for_os(
                 domain_tags=domain_tags,
             )
         )
+    if os_category == "macos" and (_ua_looks_windows(user_agent) or _ua_looks_linux(user_agent)):
+        macos_pool = _pool(data, "workstation", "macos")
+        return (
+            rng.choice(macos_pool)
+            if macos_pool
+            else pick_proxy_user_agent(
+                rng,
+                source_system,
+                hostname=hostname,
+                domain_tags=domain_tags,
+            )
+        )
+    if os_category in ("windows", "linux") and _ua_looks_macos(user_agent):
+        fallback_pool = _pool(data, "workstation", os_category)
+        return (
+            rng.choice(fallback_pool)
+            if fallback_pool
+            else pick_proxy_user_agent(
+                rng,
+                source_system,
+                hostname=hostname,
+                domain_tags=domain_tags,
+            )
+        )
     return user_agent
 
 
 def _browser_family_for_process(process_image: str) -> str:
     """Return the browser family implied by a process image, if any."""
     exe = process_image.rsplit("\\", 1)[-1].rsplit("/", 1)[-1].lower()
-    if exe in {"chrome.exe", "chrome", "google-chrome", "chromium", "chromium-browser"}:
+    if exe in {
+        "chrome.exe",
+        "chrome",
+        "google-chrome",
+        "chromium",
+        "chromium-browser",
+        "google chrome",
+    }:
         return "chrome"
     if exe in {"msedge.exe", "microsoft-edge", "edge"}:
         return "edge"
@@ -272,6 +311,8 @@ def _browser_family_for_process(process_image: str) -> str:
         return "firefox"
     if exe in {"opera.exe", "opera"}:
         return "opera"
+    if exe == "safari":
+        return "safari"
     return ""
 
 
@@ -286,6 +327,8 @@ def _user_agent_matches_browser_family(user_agent: str, family: str) -> bool:
         return "firefox/" in ua
     if family == "opera":
         return "opr/" in ua or "opera/" in ua
+    if family == "safari":
+        return "version/" in ua and "safari/" in ua and "chrome/" not in ua
     return False
 
 
@@ -304,7 +347,12 @@ def browser_user_agent_for_process(
 
     data = load_proxy_user_agents()
     os_category = _get_os_category(source_system.os) if source_system is not None else "windows"
-    pool_key = "linux" if os_category == "linux" else "windows"
+    if os_category == "linux":
+        pool_key = "linux"
+    elif os_category == "macos":
+        pool_key = "macos"
+    else:
+        pool_key = "windows"
     candidates = [
         user_agent
         for user_agent in _pool(data, "workstation", pool_key)
@@ -361,9 +409,13 @@ def pick_proxy_user_agent(
         server_pool = _pool(data, "server", "generic")
         return rng.choice(server_pool)
 
-    if _get_os_category(source_system.os) == "linux":
+    os_category = _get_os_category(source_system.os)
+    if os_category == "linux":
         linux_pool = _pool(data, "workstation", "linux")
         return rng.choice(linux_pool)
+    if os_category == "macos":
+        macos_pool = _pool(data, "workstation", "macos")
+        return rng.choice(macos_pool)
 
     windows_pool = _pool(data, "workstation", "windows")
     return rng.choice(windows_pool)
