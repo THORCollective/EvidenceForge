@@ -514,4 +514,15 @@ def _get_os_category(system: System) -> str:
     os_lower = system.os.lower()
     if "windows" in os_lower:
         return "windows"
-    return "linux"
+    elif (
+        "linux" in os_lower
+        or "ubuntu" in os_lower
+        or "centos" in os_lower
+        or "debian" in os_lower
+        or "rhel" in os_lower
+    ):
+        return "linux"
+    elif "macos" in os_lower or "mac os" in os_lower or "darwin" in os_lower or "osx" in os_lower:
+        return "macos"
+    else:
+        return "unknown"

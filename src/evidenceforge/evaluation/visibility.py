@@ -32,6 +32,7 @@ from evidenceforge.models.scenario import Scenario, System
 # OS detection patterns (mirrors generation/activity.py)
 _WINDOWS_PATTERNS = ["windows"]
 _LINUX_PATTERNS = ["linux", "ubuntu", "centos", "debian", "rhel"]
+_MACOS_PATTERNS = ["macos", "mac os", "darwin", "osx"]
 
 # Web server service patterns
 _WEB_SERVICE_PATTERNS = ["http", "iis", "nginx", "apache", "web"]
@@ -44,6 +45,8 @@ def _get_os_category(os_string: str) -> str:
         return "windows"
     if any(p in os_lower for p in _LINUX_PATTERNS):
         return "linux"
+    if any(p in os_lower for p in _MACOS_PATTERNS):
+        return "macos"
     return "unknown"
 
 

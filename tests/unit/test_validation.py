@@ -47,7 +47,7 @@ from evidenceforge.models import (
 )
 from evidenceforge.utils import load_yaml
 from evidenceforge.validation import ScenarioValidator
-from evidenceforge.validation.schema import BUILTIN_ACCOUNTS
+from evidenceforge.validation.schema import BUILTIN_ACCOUNTS, _get_os_category
 
 
 class TestScenarioValidator:
@@ -1262,6 +1262,30 @@ class TestScenarioValidator:
         assert len(BUILTIN_ACCOUNTS) > 0
         assert "SYSTEM" in BUILTIN_ACCOUNTS
         assert "root" in BUILTIN_ACCOUNTS
+
+
+class TestSchemaGetOsCategory:
+    """Tests for validation.schema._get_os_category."""
+
+    def test_windows(self):
+        assert _get_os_category("Windows 10") == "windows"
+        assert _get_os_category("Windows Server 2019") == "windows"
+
+    def test_linux(self):
+        assert _get_os_category("Linux Ubuntu 20.04") == "linux"
+        assert _get_os_category("CentOS 8") == "linux"
+        assert _get_os_category("Debian 11") == "linux"
+        assert _get_os_category("RHEL 9") == "linux"
+
+    def test_macos(self):
+        """macOS strings (macos/mac os/darwin/osx substrings) classify as 'macos'."""
+        assert _get_os_category("macOS 14.5") == "macos"
+        assert _get_os_category("Darwin") == "macos"
+        assert _get_os_category("macOS Sonoma") == "macos"
+        assert _get_os_category("OSX") == "macos"
+
+    def test_unknown_fallback(self):
+        assert _get_os_category("AmigaOS") == "unknown"
 
 
 class TestNetworkValidation:

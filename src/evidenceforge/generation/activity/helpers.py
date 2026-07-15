@@ -40,7 +40,7 @@ def _get_os_category(os_string: str) -> str:
         os_string: OS name/version (e.g., "Windows 10", "Linux Ubuntu 20.04")
 
     Returns:
-        OS category: "windows", "linux", or "unknown"
+        OS category: "windows", "linux", "macos", or "unknown"
     """
     os_lower = os_string.lower()
     if "windows" in os_lower:
@@ -53,6 +53,8 @@ def _get_os_category(os_string: str) -> str:
         or "rhel" in os_lower
     ):
         return "linux"
+    elif "macos" in os_lower or "mac os" in os_lower or "darwin" in os_lower or "osx" in os_lower:
+        return "macos"
     else:
         return "unknown"
 

@@ -407,6 +407,17 @@ class TestGetOsCategory:
         sys = System(hostname="SRV-01", ip="10.0.0.1", os="Windows Server 2019", type="server")
         assert _get_os_category(sys) == "windows"
 
+    def test_macos(self):
+        """macOS strings (macos/mac os/darwin/osx substrings) classify as 'macos'."""
+        for os_string in ("macOS 14.5", "Darwin", "macOS Sonoma", "OSX"):
+            sys = System(hostname="MAC-01", ip="10.0.0.1", os=os_string, type="workstation")
+            assert _get_os_category(sys) == "macos"
+
+    def test_unrecognized_os_returns_unknown_not_linux(self):
+        """Regression: an unrecognized OS must not silently fall through to 'linux'."""
+        sys = System(hostname="BSD-01", ip="10.0.0.1", os="FreeBSD 13", type="server")
+        assert _get_os_category(sys) == "unknown"
+
 
 class TestEncodedPowershell:
     """Fix 2: Encoded PowerShell commands should vary across invocations."""

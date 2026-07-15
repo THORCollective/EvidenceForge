@@ -80,6 +80,7 @@ BUILTIN_ACCOUNTS = {
 # OS detection patterns (mirrors evaluation/visibility.py)
 _WINDOWS_PATTERNS = ["windows"]
 _LINUX_PATTERNS = ["linux", "ubuntu", "centos", "debian", "rhel"]
+_MACOS_PATTERNS = ["macos", "mac os", "darwin", "osx"]
 
 # Formats that are bound to a specific OS
 _OS_BOUND_FORMATS: dict[str, str] = {
@@ -125,13 +126,15 @@ def _get_os_category(os_string: str) -> str:
         os_string: OS name/version string (e.g., "Windows 10", "Linux Ubuntu 20.04")
 
     Returns:
-        "windows", "linux", or "unknown"
+        "windows", "linux", "macos", or "unknown"
     """
     os_lower = os_string.lower()
     if any(p in os_lower for p in _WINDOWS_PATTERNS):
         return "windows"
     if any(p in os_lower for p in _LINUX_PATTERNS):
         return "linux"
+    if any(p in os_lower for p in _MACOS_PATTERNS):
+        return "macos"
     return "unknown"
 
 
