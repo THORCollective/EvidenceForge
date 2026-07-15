@@ -1442,6 +1442,7 @@ class ScenarioValidator:
         # Accept both group names (zeek, windows) and individual format names (zeek_conn)
         known_output_formats = set(FORMAT_GROUPS.keys()) | {
             "ecar",
+            "eslogger",
             "syslog",
             "bash_history",
             "snort_alert",
