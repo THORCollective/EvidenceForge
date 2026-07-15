@@ -8569,6 +8569,18 @@ class ActivityGenerator:
             self._tls_ocsp_response_sizes[response_profile_key] = ocsp_size
         source_system = getattr(self, "_ip_to_system", {}).get(net.src_ip)
         source_os = str(getattr(source_system, "os", "") or "")
+        # On macOS, system-wide certificate trust evaluation (including OCSP
+        # revocation checks) is centralized in trustd rather than performed by
+        # each requesting application — attribute the OCSP-fetch connection to
+        # trustd instead of the original TLS connection's initiating process
+        # when a seeded trustd PID is available for this host.
+        initiating_pid = net.initiating_pid
+        if source_system is not None and _get_os_category(source_system.os) == "macos":
+            trustd_pid = (
+                getattr(self, "_system_pids", {}).get(source_system.hostname, {}).get("trustd")
+            )
+            if trustd_pid:
+                initiating_pid = trustd_pid
         user_agent = pick_proxy_user_agent(
             random.Random(_stable_seed(f"ocsp_user_agent:{responder}:{net.src_ip}:{source_os}")),
             source_system,
@@ -8618,7 +8630,7 @@ class ActivityGenerator:
             orig_bytes=320,
             resp_bytes=ocsp_size,
             emit_dns=True,
-            pid=net.initiating_pid,
+            pid=initiating_pid,
             source_system=source_system,
             conn_state="SF",
             http=http_ctx,

@@ -142,6 +142,31 @@ _BASELINE_SERVER_ADMIN_PERSONA_ROLES = {
     "web_server",
 }
 
+# macOS baseline system-daemon noise (facts.md's "modest" tier): per-hour fire
+# probabilities for each named daemon. Kept deliberately low-volume — this is
+# ambient noise, not storyline/attack content.
+_MACOS_SPOTLIGHT_BURST_PROBABILITY = 0.18
+_MACOS_TIME_MACHINE_BACKUP_PROBABILITY = 0.45
+_MACOS_SOFTWAREUPDATED_CHECK_PROBABILITY = 0.06
+_MACOS_PREFS_CHURN_PROBABILITY = 0.22
+_MACOS_ICLOUD_DAEMON_PROBABILITY = 0.10
+_MACOS_TRUSTD_CHECK_PROBABILITY = 0.20
+_MACOS_PREFERENCE_PLIST_POOL = (
+    ".GlobalPreferences.plist",
+    "com.apple.finder.plist",
+    "com.apple.systempreferences.plist",
+    "com.apple.dock.plist",
+)
+# Local trust-store artifacts trustd consults/updates for cached OCSP and
+# certificate-validity decisions -- this is trustd's own eslogger-visible
+# footprint, distinct from (but conceptually paired with) the network-level
+# OCSP-fetch process attribution fix in ActivityGenerator._emit_ocsp_http_response.
+_MACOS_TRUSTD_PATH_POOL = (
+    "/Library/Keychains/SystemRootCertificates.keychain",
+    "/Library/Keychains/SystemCACertificates.keychain",
+    "/private/var/protected/trustd/private/thread-events.data",
+)
+
 
 def _ufw_block_syn_packet_len(src_ip: str) -> int:
     """Return a stable valid IP total length for a header-only blocked TCP SYN."""
@@ -2984,6 +3009,7 @@ class BaselineMixin:
         self._generate_stale_account_noise(current_hour)
         self._generate_baseline_failed_logons(current_hour)
         self._generate_lateral_movement_noise(current_hour)
+        self._generate_macos_daemon_noise(current_hour)
         self._generate_suspicious_noise(current_hour)
         self._generate_firewall_deny_baseline(current_hour)
 
@@ -4277,6 +4303,329 @@ class BaselineMixin:
         if not candidates:
             return None
         return max(candidates, key=lambda session: session.start_time)
+
+    def _generate_macos_daemon_noise(self, current_hour: datetime) -> None:
+        """Generate low-volume, jittered macOS system-daemon background noise.
+
+        Covers facts.md's macOS baseline daemon list: Spotlight
+        (mds/mdworker_shared), Time Machine (backupd), softwareupdated,
+        cfprefsd/cloudd/bird preference-cache/iCloud churn, and trustd
+        trust-store churn. Each daemon fires probabilistically per host per
+        hour with a per-host stable-seeded phase offset plus rng jitter, so
+        timing is never fixed-interval (AGENTS.md realism rule #5).
+        """
+        macos_systems = [
+            s for s in self.scenario.environment.systems if _get_os_category(s.os) == "macos"
+        ]
+        if not macos_systems:
+            return
+
+        rng = _get_rng()
+        for system in macos_systems:
+            sys_pids = self._system_pids.get(system.hostname, {})
+            self._maybe_emit_macos_spotlight_burst(current_hour, system, sys_pids, rng)
+            self._maybe_emit_macos_time_machine_backup(current_hour, system, sys_pids, rng)
+            self._maybe_emit_macos_softwareupdated_check(current_hour, system, sys_pids, rng)
+            self._maybe_emit_macos_prefs_churn(current_hour, system, sys_pids, rng)
+            self._maybe_emit_macos_icloud_churn(current_hour, system, sys_pids, rng)
+            self._maybe_emit_macos_trustd_check(current_hour, system, sys_pids, rng)
+
+    def _maybe_emit_macos_spotlight_burst(
+        self,
+        current_hour: datetime,
+        system: System,
+        sys_pids: dict[str, int],
+        rng: random.Random,
+    ) -> None:
+        """Occasionally spawn a short-lived mdworker_shared indexing burst under mds."""
+        mds_pid = sys_pids.get("mds")
+        if not mds_pid:
+            return
+        if rng.random() >= _MACOS_SPOTLIGHT_BURST_PROBABILITY:
+            return
+
+        hn = system.hostname
+        image = (
+            "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+            "Metadata.framework/Support/mdworker_shared"
+        )
+        phase = _stable_seed(f"macos_spotlight_phase:{hn}") % 3600
+        base_offset = max(0.0, min(3599.0, phase + rng.gauss(0, 180)))
+        num_workers = rng.randint(1, 3)
+        offset = base_offset
+        for _ in range(num_workers):
+            ts = current_hour + timedelta(seconds=offset)
+            self.state_manager.set_current_time(ts)
+            worker_pid = self.activity_generator.generate_system_process(
+                system=system,
+                time=ts,
+                process_name=image,
+                command_line=f"{image} -s mdworker -c MDSImporterWorker",
+                parent_pid=mds_pid,
+                username="_spotlight",
+            )
+            lifetime = rng.uniform(0.4, 6.0)
+            end_ts = ts + timedelta(seconds=lifetime)
+            self.state_manager.set_current_time(end_ts)
+            self.activity_generator.generate_system_process_termination(
+                system=system,
+                time=end_ts,
+                pid=worker_pid,
+                process_name=image,
+                parent_pid=mds_pid,
+                username="_spotlight",
+            )
+            offset += rng.uniform(5.0, 45.0)
+
+    def _maybe_emit_macos_time_machine_backup(
+        self,
+        current_hour: datetime,
+        system: System,
+        sys_pids: dict[str, int],
+        rng: random.Random,
+    ) -> None:
+        """Occasionally run a Time Machine backupd lifecycle (skipped some hours)."""
+        launchd_pid = sys_pids.get("launchd")
+        if not launchd_pid:
+            return
+        if rng.random() >= _MACOS_TIME_MACHINE_BACKUP_PROBABILITY:
+            return
+
+        hn = system.hostname
+        image = "/System/Library/PrivateFrameworks/Backup.framework/Resources/backupd"
+        phase = _stable_seed(f"macos_backupd_phase:{hn}") % 3600
+        offset = max(0.0, min(3599.0, phase + rng.gauss(0, 120)))
+        ts = current_hour + timedelta(seconds=offset)
+        self.state_manager.set_current_time(ts)
+        pid = self.activity_generator.generate_system_process(
+            system=system,
+            time=ts,
+            process_name=image,
+            command_line=f"{image} -launched -noconsole",
+            parent_pid=launchd_pid,
+            username="root",
+        )
+        lifetime = rng.uniform(20.0, 240.0)
+        end_ts = ts + timedelta(seconds=lifetime)
+        self.state_manager.set_current_time(end_ts)
+        self.activity_generator.generate_system_process_termination(
+            system=system,
+            time=end_ts,
+            pid=pid,
+            process_name=image,
+            parent_pid=launchd_pid,
+            username="root",
+        )
+
+    def _maybe_emit_macos_softwareupdated_check(
+        self,
+        current_hour: datetime,
+        system: System,
+        sys_pids: dict[str, int],
+        rng: random.Random,
+    ) -> None:
+        """Occasionally run a low-frequency background softwareupdated check."""
+        launchd_pid = sys_pids.get("launchd")
+        if not launchd_pid:
+            return
+        if rng.random() >= _MACOS_SOFTWAREUPDATED_CHECK_PROBABILITY:
+            return
+
+        hn = system.hostname
+        image = (
+            "/System/Library/PrivateFrameworks/SoftwareUpdate.framework/Resources/softwareupdated"
+        )
+        phase = _stable_seed(f"macos_softwareupdated_phase:{hn}") % 3600
+        offset = max(0.0, min(3599.0, phase + rng.gauss(0, 300)))
+        ts = current_hour + timedelta(seconds=offset)
+        self.state_manager.set_current_time(ts)
+        pid = self.activity_generator.generate_system_process(
+            system=system,
+            time=ts,
+            process_name=image,
+            command_line=f"{image} --background-check",
+            parent_pid=launchd_pid,
+            username="root",
+        )
+        lifetime = rng.uniform(5.0, 45.0)
+        end_ts = ts + timedelta(seconds=lifetime)
+        self.state_manager.set_current_time(end_ts)
+        self.activity_generator.generate_system_process_termination(
+            system=system,
+            time=end_ts,
+            pid=pid,
+            process_name=image,
+            parent_pid=launchd_pid,
+            username="root",
+        )
+
+    def _maybe_emit_macos_prefs_churn(
+        self,
+        current_hour: datetime,
+        system: System,
+        sys_pids: dict[str, int],
+        rng: random.Random,
+    ) -> None:
+        """Occasionally emit cfprefsd preference-cache file open/write churn.
+
+        cfprefsd is a persistent, boot-seeded daemon (Task 3) — this models
+        its ongoing preference-cache activity as file evidence attributed to
+        the existing PID rather than spawning a new process.
+        """
+        cfprefsd_pid = sys_pids.get("cfprefsd")
+        if not cfprefsd_pid:
+            return
+        if rng.random() >= _MACOS_PREFS_CHURN_PROBABILITY:
+            return
+
+        running_proc = self.state_manager.get_process(system.hostname, cfprefsd_pid)
+        if running_proc is None:
+            return
+
+        from evidenceforge.events.base import SecurityEvent
+        from evidenceforge.events.contexts import AuthContext, FileContext, ProcessContext
+
+        hn = system.hostname
+        host_ctx = self.activity_generator._build_host_context(system)
+        phase = _stable_seed(f"macos_cfprefsd_phase:{hn}") % 3600
+        offset = max(0.0, min(3599.0, phase + rng.gauss(0, 300)))
+        num_touches = rng.randint(1, 2)
+        for _ in range(num_touches):
+            ts = current_hour + timedelta(seconds=offset)
+            username = system.assigned_user or "root"
+            plist_name = rng.choice(_MACOS_PREFERENCE_PLIST_POOL)
+            plist_path = (
+                f"/Users/{system.assigned_user}/Library/Preferences/{plist_name}"
+                if system.assigned_user
+                else f"/Library/Preferences/{plist_name}"
+            )
+            action = rng.choice(("open", "write"))
+            self.state_manager.set_current_time(ts)
+            self.activity_generator.dispatcher.dispatch(
+                SecurityEvent(
+                    timestamp=ts,
+                    event_type="file_open" if action == "open" else "file_write",
+                    src_host=host_ctx,
+                    auth=AuthContext(username=username),
+                    process=ProcessContext(
+                        pid=running_proc.pid,
+                        parent_pid=running_proc.parent_pid,
+                        image=running_proc.image,
+                        command_line=running_proc.command_line,
+                        username=running_proc.username,
+                        logon_id=running_proc.logon_id,
+                        start_time=running_proc.start_time,
+                    ),
+                    file=FileContext(path=plist_path, action=action, pid=running_proc.pid),
+                )
+            )
+            offset = max(0.0, min(3599.0, offset + rng.uniform(60.0, 900.0)))
+
+    def _maybe_emit_macos_icloud_churn(
+        self,
+        current_hour: datetime,
+        system: System,
+        sys_pids: dict[str, int],
+        rng: random.Random,
+    ) -> None:
+        """Occasionally spawn brief cloudd/bird iCloud-sync check-ins.
+
+        Only applies to hosts with an assigned interactive user — iCloud
+        churn requires a signed-in user account. cloudd and bird are each
+        gated independently so they don't always co-occur (realism rule #5).
+        """
+        launchd_pid = sys_pids.get("launchd")
+        if not launchd_pid or not system.assigned_user:
+            return
+
+        hn = system.hostname
+        username = system.assigned_user
+        for image, phase_key in (
+            ("/usr/libexec/cloudd", "macos_cloudd_phase"),
+            ("/usr/libexec/bird", "macos_bird_phase"),
+        ):
+            if rng.random() >= _MACOS_ICLOUD_DAEMON_PROBABILITY:
+                continue
+            phase = _stable_seed(f"{phase_key}:{hn}") % 3600
+            offset = max(0.0, min(3599.0, phase + rng.gauss(0, 240)))
+            ts = current_hour + timedelta(seconds=offset)
+            self.state_manager.set_current_time(ts)
+            pid = self.activity_generator.generate_system_process(
+                system=system,
+                time=ts,
+                process_name=image,
+                command_line=image,
+                parent_pid=launchd_pid,
+                username=username,
+            )
+            lifetime = rng.uniform(2.0, 25.0)
+            end_ts = ts + timedelta(seconds=lifetime)
+            self.state_manager.set_current_time(end_ts)
+            self.activity_generator.generate_system_process_termination(
+                system=system,
+                time=end_ts,
+                pid=pid,
+                process_name=image,
+                parent_pid=launchd_pid,
+                username=username,
+            )
+
+    def _maybe_emit_macos_trustd_check(
+        self,
+        current_hour: datetime,
+        system: System,
+        sys_pids: dict[str, int],
+        rng: random.Random,
+    ) -> None:
+        """Occasionally emit trustd trust-store file open/read churn.
+
+        trustd is a persistent, boot-seeded daemon (Task 3) that owns macOS's
+        system-wide certificate trust evaluation, including the OCSP checks
+        correlated at the network layer (see
+        ``ActivityGenerator._emit_ocsp_http_response``'s trustd process
+        attribution). This models trustd's own local trust-cache footprint —
+        occasional reads/updates of its keychain/trust-store artifacts —
+        attributed to the existing PID rather than spawning a new process.
+        """
+        trustd_pid = sys_pids.get("trustd")
+        if not trustd_pid:
+            return
+        if rng.random() >= _MACOS_TRUSTD_CHECK_PROBABILITY:
+            return
+
+        running_proc = self.state_manager.get_process(system.hostname, trustd_pid)
+        if running_proc is None:
+            return
+
+        from evidenceforge.events.base import SecurityEvent
+        from evidenceforge.events.contexts import AuthContext, FileContext, ProcessContext
+
+        hn = system.hostname
+        host_ctx = self.activity_generator._build_host_context(system)
+        phase = _stable_seed(f"macos_trustd_phase:{hn}") % 3600
+        offset = max(0.0, min(3599.0, phase + rng.gauss(0, 300)))
+        trust_path = rng.choice(_MACOS_TRUSTD_PATH_POOL)
+        action = rng.choice(("open", "write"))
+        ts = current_hour + timedelta(seconds=offset)
+        self.state_manager.set_current_time(ts)
+        self.activity_generator.dispatcher.dispatch(
+            SecurityEvent(
+                timestamp=ts,
+                event_type="file_open" if action == "open" else "file_write",
+                src_host=host_ctx,
+                auth=AuthContext(username=running_proc.username or "_trustd"),
+                process=ProcessContext(
+                    pid=running_proc.pid,
+                    parent_pid=running_proc.parent_pid,
+                    image=running_proc.image,
+                    command_line=running_proc.command_line,
+                    username=running_proc.username,
+                    logon_id=running_proc.logon_id,
+                    start_time=running_proc.start_time,
+                ),
+                file=FileContext(path=trust_path, action=action, pid=running_proc.pid),
+            )
+        )
 
     def _generate_suspicious_noise(self, current_hour: datetime) -> None:
         """Generate suspicious-but-benign ambient noise events.
