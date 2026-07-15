@@ -367,6 +367,36 @@ binaries:
   # dropped under attacker-chosen paths) already falls back to the same
   # unsigned/ad-hoc `default` entry below, so most malware never needs an
   # explicit row here.
+  #
+  # IMPORTANT — AMOS/Atomic Stealer signing convention (read before building
+  # the Task 12 three-hunt demo scenario):
+  #
+  # `/usr/bin/osascript` (see the system-binaries section above) is a real,
+  # unmodified Apple platform binary and MUST stay `is_platform_binary: true`
+  # / Apple-signed. Real AMOS samples never re-sign or replace osascript —
+  # they invoke the genuine system binary (with a malicious AppleScript as
+  # its argv, e.g. a fake system-password prompt) exactly like thousands of
+  # benign AppleScript automations do. Flipping osascript's own table entry
+  # to unsigned would falsely mark every benign osascript invocation in the
+  # generated dataset as suspicious and destroy the hunt's precision as a
+  # differentiator (everything would look like "the signal").
+  #
+  # The actual unsigned/ad-hoc identity in a real AMOS chain belongs to the
+  # trojanized dropper app itself (commonly distributed as a fake "cracked"
+  # installer, e.g. pirated CleanMyMac X / Photoshop / similar), which then:
+  #   1. execs `/usr/bin/osascript` as a child to render the fake password
+  #      prompt (osascript keeps its own real signed identity here),
+  #   2. uses the harvested credential to read/exfiltrate
+  #      `~/Library/Keychains/login.keychain-db` and other secrets itself
+  #      (this file-open and any exfil activity is attributed to the
+  #      dropper's own unsigned process — NOT to osascript).
+  #
+  # Task 12's AMOS storyline scenario MUST model the malicious payload
+  # process using the binary_path below (or any other attacker-chosen path
+  # — an unlisted path already falls to the unsigned/ad-hoc `default` at
+  # the bottom of this file with zero YAML changes needed) as the process
+  # that spawns osascript, opens the keychain file, and makes the egress
+  # connection. It must NOT key unsigned identity off `osascript` itself.
   # ---------------------------------------------------------------------
   - binary_path: "/Applications/CleanMyMacX Helper.app/Contents/MacOS/CleanMyMacX Helper"
     category: "malware"

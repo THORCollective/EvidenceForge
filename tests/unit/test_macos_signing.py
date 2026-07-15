@@ -95,6 +95,36 @@ class TestGetSigningIdentity:
         assert identity["team_id"] is None
         assert identity["is_platform_binary"] is False
 
+    def test_osascript_remains_apple_signed_platform_binary(self):
+        """Regression test for a review finding: /usr/bin/osascript is a real,
+        unmodified Apple platform binary used by countless benign AppleScript
+        automations as well as by AMOS/Atomic Stealer's password-prompt step.
+        Real AMOS samples never re-sign or replace osascript itself — the
+        malicious intent lives in the argv passed to it, not in its binary
+        identity. It must stay signed/platform here so benign osascript
+        invocations don't falsely render as unsigned/suspicious.
+        """
+        identity = get_signing_identity("/usr/bin/osascript")
+        assert identity["is_platform_binary"] is True
+        assert identity["signing_id"] == "com.apple.osascript"
+        assert identity["team_id"] is None
+
+    def test_amos_dropper_payload_defaults_to_unsigned_ad_hoc(self):
+        """The AMOS/Atomic Stealer payload's own unsigned/ad-hoc identity
+        belongs to the trojanized dropper process (e.g. a fake cracked-app
+        installer), not to osascript. Task 12's AMOS storyline scenario must
+        model its malicious payload process at this binary_path (see the
+        AMOS convention comment in macos_signing.yaml) so it spawns osascript
+        as a signed child while the dropper itself resolves unsigned/ad-hoc.
+        """
+        identity = get_signing_identity(
+            "/Applications/CleanMyMacX Helper.app/Contents/MacOS/CleanMyMacX Helper"
+        )
+        assert identity["signing_id"] == ""
+        assert identity["team_id"] is None
+        assert identity["is_platform_binary"] is False
+        assert identity["codesigning_flags"] == ["CS_ADHOC"]
+
     def test_beavertail_node_payload_defaults_to_unsigned(self):
         """node/npm default to unsigned — matches real nvm/Homebrew installs
         and gives BeaverTail's node-based payload an unsigned identity by

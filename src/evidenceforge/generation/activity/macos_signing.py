@@ -6,6 +6,16 @@
 Loads known-binary code-signing identity mappings from macos_signing.yaml and
 provides get_signing_identity() for the eslogger emitter's process audit-token
 fields (signing_id, team_id, cdhash, is_platform_binary, codesigning_flags).
+
+AMOS/Atomic Stealer signing convention: `/usr/bin/osascript` is a real Apple
+platform binary and always resolves to a signed, `is_platform_binary=True`
+identity — real AMOS samples invoke the genuine osascript (malicious intent
+lives in its argv, not its binary identity), exactly like countless benign
+AppleScript automations. The unsigned/ad-hoc identity belongs to AMOS's
+trojanized dropper process (see the "malware" section and its AMOS convention
+comment in macos_signing.yaml), which spawns osascript as a child rather than
+being osascript itself. See that YAML comment before wiring up the Task 12
+three-hunt demo scenario.
 """
 
 import random
