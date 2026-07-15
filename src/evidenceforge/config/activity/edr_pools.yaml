@@ -26,12 +26,14 @@ group_policy_extension_guids:
 # deleting Security.evtx.
 file_side_effect_profiles:
   - name: chrome_cache
-    executables: ["chrome.exe", "chrome"]
+    executables: ["chrome.exe", "chrome", "Google Chrome"]
     actions: ["create", "modify"]
     paths_windows:
       - "C:\\Users\\{user}\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Cache\\Cache_Data\\f_{hex}"
     paths_linux:
       - "/home/{user}/.cache/google-chrome/Default/Cache/Cache_Data/f_{hex}"
+    paths_macos:
+      - "/Users/{user}/Library/Caches/Google/Chrome/Default/Cache/Cache_Data/f_{hex}"
 
   - name: edge_cache
     executables: ["msedge.exe"]
@@ -46,9 +48,11 @@ file_side_effect_profiles:
       - "C:\\Users\\{user}\\AppData\\Local\\Mozilla\\Firefox\\Profiles\\default-release\\cache2\\entries\\{hex}"
     paths_linux:
       - "/home/{user}/.cache/mozilla/firefox/default-release/cache2/entries/{hex}"
+    paths_macos:
+      - "/Users/{user}/Library/Caches/Firefox/Profiles/default-release/cache2/entries/{hex}"
 
   - name: shell_temp
-    executables: ["cmd.exe", "powershell.exe", "pwsh.exe", "bash", "sh"]
+    executables: ["cmd.exe", "powershell.exe", "pwsh.exe", "bash", "sh", "zsh"]
     actions: ["create", "modify"]
     paths_windows:
       - "C:\\Users\\{user}\\AppData\\Local\\Temp\\tmp{rand}.tmp"
@@ -56,6 +60,9 @@ file_side_effect_profiles:
     paths_linux:
       - "/home/{user}/.cache/{hex}.tmp"
       - "/home/{user}/.bash_history"
+    paths_macos:
+      - "/Users/{user}/Library/Caches/{hex}.tmp"
+      - "/Users/{user}/.zsh_history"
 
   - name: package_manager
     executables: ["apt", "apt-get", "dnf", "yum", "dpkg", "rpm"]
@@ -184,6 +191,8 @@ file_side_effect_profiles:
       - "C:\\Users\\{user}\\AppData\\Local\\Temp\\tmp{rand}.tmp"
     paths_linux:
       - "/tmp/.tmp-{rand}"
+    paths_macos:
+      - "/private/var/folders/{hex}/T/tmp{rand}"
 
 installed_software_products:
   - name: "Microsoft Update Health Tools"
@@ -259,6 +268,27 @@ file_paths_linux:
   - "/var/log/syslog"
   - "/var/log/auth.log"
   - "/var/log/journal/{hex}/system.journal"
+
+file_paths_macos:
+  # User files
+  - "/Users/{user}/Documents/report.pages"
+  - "/Users/{user}/Documents/notes.md"
+  - "/Users/{user}/Downloads/file.pdf"
+  - "/Users/{user}/Downloads/archive-{rand}.dmg"
+  - "/Users/{user}/.zshrc"
+  - "/Users/{user}/.ssh/known_hosts"
+  # Temp files
+  - "/private/var/folders/{hex}/T/tmp{rand}"
+  - "/private/tmp/tmp{rand}"
+  # Application caches / support
+  - "/Users/{user}/Library/Caches/com.apple.Safari/fsCachedData/{hex}"
+  - "/Users/{user}/Library/Caches/Google/Chrome/Default/Cache/Cache_Data/f_{hex}"
+  - "/Users/{user}/Library/Application Support/Code/User/globalStorage/state.vscdb"
+  - "/Users/{user}/Library/Preferences/com.apple.finder.plist"
+  # Logs and system
+  - "/var/log/system.log"
+  - "/var/log/install.log"
+  - "/Users/{user}/Library/Logs/DiagnosticReports/{hex}.crash"
 # Registry keys for EDR events. Format: [key, value_name, details].
 # TargetObject in Sysmon = key\value_name. Details = data written.
 runmru_commands:

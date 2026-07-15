@@ -60,6 +60,21 @@ class TestLoadEdrPools:
 
         assert not any(r"\winevt\Logs" in path for path in paths)
 
+    def test_macos_file_paths_pool_present_and_distinct(self):
+        """macOS processes should get macOS-native file paths, not Windows/Linux ones."""
+        pools = load_edr_pools()
+        assert "file_paths_macos" in pools
+        macos_paths = get_file_paths("macos")
+        assert len(macos_paths) > 0
+        assert all(path.startswith(("/Users/", "/private/", "/var/")) for path in macos_paths)
+        assert not any(path.startswith("/home/") for path in macos_paths)
+        assert not any(path.startswith("C:\\") for path in macos_paths)
+
+        # get_file_paths must genuinely 3-way dispatch, not silently fall
+        # through to the Linux pool for an unrecognized os_category branch.
+        assert get_file_paths("macos") != get_file_paths("linux")
+        assert get_file_paths("macos") != get_file_paths("windows")
+
     def test_read_only_recon_tool_has_no_file_side_effect(self):
         import random
 
@@ -155,6 +170,54 @@ class TestLoadEdrPools:
             user="systemd-timesync",
         )
         assert shell_effect is None
+
+    def test_macos_browser_side_effect_uses_macos_cache_path(self):
+        effect = select_file_side_effect(
+            process_name="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            command_line="Google Chrome",
+            os_category="macos",
+            rng=random.Random(5),
+            user="alice",
+        )
+
+        assert effect is not None
+        _action, path = effect
+        assert path.startswith("/Users/alice/Library/Caches/")
+        assert "google/chrome" in path.lower()
+
+    def test_macos_service_account_excluded_from_interactive_profile_side_effects(self):
+        assert is_service_account("macos", "_networkd")
+        assert not is_service_account("macos", "alice")
+
+        macos_templates = file_path_templates_for_user(
+            get_file_paths("macos"),
+            "macos",
+            "_networkd",
+        )
+        assert not any(path.startswith("/Users/{user}/") for path in macos_templates)
+
+        shell_effect = select_file_side_effect(
+            process_name="/bin/zsh",
+            command_line="zsh -lc true",
+            os_category="macos",
+            rng=random.Random(5),
+            user="_networkd",
+        )
+        assert shell_effect is None
+
+    def test_macos_default_shell_history_is_zsh_not_bash(self):
+        """macOS's default interactive shell is zsh; history paths should reflect that."""
+        effect = select_file_side_effect(
+            process_name="/bin/zsh",
+            command_line="zsh -lc true",
+            os_category="macos",
+            rng=random.Random(1),
+            user="alice",
+        )
+
+        assert effect is not None
+        _action, path = effect
+        assert path.endswith(".zsh_history") or "Library/Caches" in path
 
     def test_non_root_package_manager_cannot_write_root_owned_state(self):
         effect = select_file_side_effect(

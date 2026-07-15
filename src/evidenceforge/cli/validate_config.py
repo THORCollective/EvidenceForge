@@ -522,6 +522,7 @@ def validate_config() -> ValidationResult:
             "string_list_fields": {
                 "file_paths_windows",
                 "file_paths_linux",
+                "file_paths_macos",
                 "dll_pool",
                 "runmru_commands",
             },

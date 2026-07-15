@@ -65,6 +65,21 @@ _WINDOWS_SERVICE_USERS = {
     "NETWORK SERVICE",
     "SYSTEM",
 }
+_MACOS_SERVICE_USERS = {
+    "root",
+    "daemon",
+    "nobody",
+    "_locationd",
+    "_networkd",
+    "_mdnsresponder",
+    "_softwareupdate",
+    "_spotlight",
+    "_coreaudiod",
+    "_analyticsd",
+    "_timed",
+    "_usbmuxd",
+    "_windowserver",
+}
 _LINUX_SERVICE_USERS = {
     "_apt",
     "apache",
@@ -187,6 +202,7 @@ def _sanitize_edr_pools(defaults: dict[str, Any], merged: dict[str, Any]) -> dic
     validators: dict[str, Any] = {
         "file_paths_windows": _is_valid_string_list,
         "file_paths_linux": _is_valid_string_list,
+        "file_paths_macos": _is_valid_string_list,
         "dll_pool": _is_valid_string_list,
         "runmru_commands": _is_valid_string_list,
         "registry_keys_hkcu": _is_valid_registry_pool,
@@ -217,7 +233,12 @@ def _sanitize_edr_pools(defaults: dict[str, Any], merged: dict[str, Any]) -> dic
 def get_file_paths(os_category: str) -> list[str]:
     """Return file path pool for the given OS category."""
     pools = load_edr_pools()
-    key = "file_paths_windows" if os_category == "windows" else "file_paths_linux"
+    if os_category == "windows":
+        key = "file_paths_windows"
+    elif os_category == "macos":
+        key = "file_paths_macos"
+    else:
+        key = "file_paths_linux"
     return pools.get(key, [])
 
 
@@ -233,6 +254,8 @@ def is_service_account(os_category: str, user: str) -> bool:
         return True
     if os_category == "windows":
         return account.upper() in _WINDOWS_SERVICE_USERS or account.endswith("$")
+    if os_category == "macos":
+        return account.lower() in _MACOS_SERVICE_USERS or account.startswith("_")
     return account.lower() in _LINUX_SERVICE_USERS
 
 
@@ -250,6 +273,10 @@ def file_path_templates_for_user(
                 template
                 for template in compatible
                 if not template.lower().startswith(r"c:\users\{user}".lower())
+            ]
+        elif os_category == "macos":
+            filtered = [
+                template for template in compatible if not template.startswith("/Users/{user}/")
             ]
         else:
             filtered = [
@@ -275,6 +302,8 @@ def _uses_interactive_profile_template(template: str, os_category: str) -> bool:
     """Return True when a file template requires a normal user profile root."""
     if os_category == "windows":
         return template.lower().startswith(r"c:\users\{user}".lower())
+    if os_category == "macos":
+        return template.startswith("/Users/{user}/")
     return template.startswith("/home/{user}/")
 
 
@@ -662,7 +691,12 @@ def select_file_side_effect(
         if probability <= 0 or rng.random() > probability:
             return None
 
-        paths_key = "paths_windows" if os_category == "windows" else "paths_linux"
+        if os_category == "windows":
+            paths_key = "paths_windows"
+        elif os_category == "macos":
+            paths_key = "paths_macos"
+        else:
+            paths_key = "paths_linux"
         paths = profile.get(paths_key, [])
         actions = profile.get("actions", ["modify"])
         if not paths or not actions:
@@ -717,6 +751,8 @@ def select_file_side_effect(
                 )
         if os_category == "linux" and user == "root":
             path = path.replace("/home/root/", "/root/")
+        if os_category == "macos" and user == "root":
+            path = path.replace("/Users/root/", "/var/root/")
         return action, path
     return None
 
@@ -736,7 +772,7 @@ def select_ambient_file_churn_effect(
     host_os: str = "",
 ) -> tuple[str, str] | None:
     """Return an account-compatible ambient FILE churn action and path."""
-    if os_category == "linux" and is_service_account(os_category, user):
+    if os_category in ("linux", "macos") and is_service_account(os_category, user):
         return select_file_side_effect(process_name, command_line, os_category, rng, user=user)
 
     candidates = file_path_templates_for_user(path_templates, os_category, user)
@@ -761,6 +797,8 @@ def select_ambient_file_churn_effect(
     )
     if os_category == "linux" and user == "root":
         path = path.replace("/home/root/", "/root/")
+    if os_category == "macos" and user == "root":
+        path = path.replace("/Users/root/", "/var/root/")
     return action, path
 
 

@@ -1776,6 +1776,7 @@ class EdrFileSideEffectProfile(BaseModel, extra="forbid"):
     actions: list[Literal["create", "modify", "delete", "read"]]
     paths_windows: list[str] = Field(default_factory=list)
     paths_linux: list[str] = Field(default_factory=list)
+    paths_macos: list[str] = Field(default_factory=list)
     probability: float = 1.0
 
     @model_validator(mode="after")
@@ -1785,8 +1786,8 @@ class EdrFileSideEffectProfile(BaseModel, extra="forbid"):
             raise ValueError(
                 "profile must define executables, executable_contains, or command_contains"
             )
-        if not self.paths_windows and not self.paths_linux:
-            raise ValueError("profile must define paths_windows or paths_linux")
+        if not self.paths_windows and not self.paths_linux and not self.paths_macos:
+            raise ValueError("profile must define paths_windows, paths_linux, or paths_macos")
         if not 0 <= self.probability <= 1:
             raise ValueError("probability must be between 0 and 1")
         return self
