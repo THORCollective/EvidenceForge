@@ -61,6 +61,11 @@ def linux_system():
     return System(hostname="LNX-01", ip="10.0.10.2", os="Linux Ubuntu 22.04", type="server")
 
 
+@pytest.fixture
+def macos_system():
+    return System(hostname="MAC-01", ip="10.0.10.3", os="macOS 14", type="workstation")
+
+
 class TestSystemProcessProtection:
     """Verify seeded system processes are never terminated."""
 
@@ -92,6 +97,8 @@ class TestSystemProcessProtection:
         pids = {}
         if os_cat == "windows":
             engine._seed_windows_process_tree(system, pids)
+        elif os_cat == "macos":
+            engine._seed_macos_process_tree(system, pids)
         else:
             engine._seed_linux_process_tree(system, pids)
         engine._system_pids[system.hostname] = pids
@@ -315,6 +322,121 @@ class TestSystemProcessProtection:
             assert sys_key in state_manager.state.running_processes, (
                 f"System process '{role}' was incorrectly terminated"
             )
+
+    def test_all_seeded_macos_pids_survive_termination(
+        self, state_manager, mock_emitters, macos_system
+    ):
+        """After multiple hours, all seeded macOS PIDs must still exist."""
+        engine, pids = self._seed_and_get_pids(state_manager, mock_emitters, macos_system)
+
+        test_user = User(username="alice", full_name="Alice", email="a@t.com", enabled=True)
+        engine.scenario.environment.users = [test_user]
+
+        for hour in range(8):
+            current = datetime(2024, 3, 15, 9 + hour, 0, 0, tzinfo=UTC)
+            state_manager.set_current_time(current)
+            engine._terminate_stale_processes(current)
+
+        for role, pid in pids.items():
+            key = (macos_system.hostname, pid)
+            assert key in state_manager.state.running_processes, (
+                f"Seeded system process '{role}' (PID {pid}) was terminated"
+            )
+
+    def test_macos_seeded_launchd_uses_pid_one(self, state_manager, mock_emitters, macos_system):
+        """launchd should anchor the macOS process tree at PID 1."""
+        _engine, pids = self._seed_and_get_pids(state_manager, mock_emitters, macos_system)
+
+        launchd = state_manager.get_process(macos_system.hostname, pids["launchd"])
+        windowserver = state_manager.get_process(macos_system.hostname, pids["windowserver"])
+
+        assert pids["launchd"] == 1
+        assert launchd is not None
+        assert launchd.image == "/sbin/launchd"
+        assert launchd.parent_pid == 0
+        assert launchd.username == "root"
+        assert state_manager.get_process_object_id(macos_system.hostname, 1)
+        assert state_manager.get_pidversion(macos_system.hostname, 1) == 0
+        assert windowserver is not None
+        assert windowserver.parent_pid == 1
+
+    def test_macos_seeded_processes_use_macos_pid_range(
+        self, state_manager, mock_emitters, macos_system
+    ):
+        """Seeded macOS PIDs must fall in the distinct macOS PID namespace, not Linux's."""
+        _engine, pids = self._seed_and_get_pids(state_manager, mock_emitters, macos_system)
+
+        assert state_manager._pid_os[macos_system.hostname] == "macos"
+        for role, pid in pids.items():
+            if role == "launchd":
+                continue
+            assert 0 < pid < 100_000, f"macOS PID for '{role}' ({pid}) is out of range"
+
+    def test_macos_seeded_processes_ancestry_chain_reaches_launchd(
+        self, state_manager, mock_emitters, macos_system
+    ):
+        """Every seeded macOS process must walk parent_pid back to launchd (PID 1)."""
+        _engine, pids = self._seed_and_get_pids(state_manager, mock_emitters, macos_system)
+
+        def _walk_to_root(pid: int) -> int:
+            visited = {pid}
+            current = pid
+            for _ in range(len(pids) + 1):
+                proc = state_manager.get_process(macos_system.hostname, current)
+                assert proc is not None, f"PID {current} missing from state while walking ancestry"
+                if proc.parent_pid == 0:
+                    return current
+                assert proc.parent_pid not in visited, "Cycle detected walking ancestry chain"
+                visited.add(proc.parent_pid)
+                current = proc.parent_pid
+            raise AssertionError(f"Ancestry chain for PID {pid} did not terminate at PID 0's child")
+
+        for role, pid in pids.items():
+            root_pid = _walk_to_root(pid)
+            assert root_pid == 1, f"'{role}' (PID {pid}) does not trace back to launchd (PID 1)"
+
+        launchd = state_manager.get_process(macos_system.hostname, 1)
+        assert launchd is not None
+        assert launchd.image == "/sbin/launchd"
+
+    def test_macos_seeded_daemons_use_real_macos_paths(
+        self, state_manager, mock_emitters, macos_system
+    ):
+        """Seeded macOS daemons should use real, well-known macOS binary paths."""
+        _engine, pids = self._seed_and_get_pids(state_manager, mock_emitters, macos_system)
+
+        expected_images = {
+            "launchd": "/sbin/launchd",
+            "windowserver": (
+                "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer"
+            ),
+            "loginwindow": (
+                "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow"
+            ),
+            "cfprefsd": "/usr/sbin/cfprefsd",
+            "user_event_agent": "/usr/libexec/UserEventAgent",
+            "logd": "/usr/libexec/logd",
+            "syslogd": "/usr/sbin/syslogd",
+            "trustd": "/usr/libexec/trustd",
+            "opendirectoryd": "/usr/libexec/opendirectoryd",
+            "notifyd": "/usr/libexec/notifyd",
+            "mdnsresponder": "/usr/sbin/mDNSResponder",
+            "mds": "/usr/sbin/mds",
+            "sshd": "/usr/sbin/sshd",
+            "zsh": "/bin/zsh",
+        }
+        for role, expected_image in expected_images.items():
+            assert role in pids, f"Expected seeded role '{role}' missing from macOS process tree"
+            proc = state_manager.get_process(macos_system.hostname, pids[role])
+            assert proc is not None
+            assert proc.image == expected_image, (
+                f"'{role}' image {proc.image!r} does not match expected {expected_image!r}"
+            )
+        assert "mdworker" in pids  # nested under mds; path checked separately (long path)
+        mdworker = state_manager.get_process(macos_system.hostname, pids["mdworker"])
+        assert mdworker is not None
+        assert mdworker.image.endswith("mdworker_shared")
+        assert mdworker.parent_pid == pids["mds"]
 
 
 class TestProtectionListCompleteness:

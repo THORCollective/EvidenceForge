@@ -579,9 +579,15 @@ class EmitterSetupMixin:
 
             if os_cat == "windows":
                 self._seed_windows_process_tree(system, pids)
+            elif os_cat == "macos":
+                self._seed_macos_process_tree(system, pids)
             else:
                 self._seed_linux_process_tree(system, pids)
-                # Per-host persistent machine-ID (like /etc/machine-id)
+                # Per-host persistent machine-ID (like /etc/machine-id). This is
+                # specifically consumed by systemd-journald housekeeping syslog
+                # rendering (see _machine_ids usage in baseline.py), which has
+                # no macOS equivalent — macOS uses unified logging (logd), not
+                # journald, so this block intentionally stays Linux-only.
                 self._machine_ids[system.hostname] = _hl.md5(
                     f"machine_id_{system.hostname}".encode(), usedforsecurity=False
                 ).hexdigest()
@@ -934,6 +940,113 @@ class EmitterSetupMixin:
             )
 
         pids["bash"] = _c(pids["sshd"], "/bin/bash", "-bash", "root")
+        if boot_base is not None:
+            sm.set_current_time(boot_base)
+
+    def _seed_macos_process_tree(self, system: System, pids: dict[str, int]) -> None:
+        """Seed macOS system process tree in StateManager."""
+        sm = self.state_manager
+        hn = system.hostname
+        boot_base = sm.state.current_time
+        boot_rng = random.Random(_stable_seed(f"macos_boot_sequence:{hn}"))
+        boot_elapsed = 0.0
+
+        def _advance_boot_clock() -> None:
+            nonlocal boot_elapsed
+            if boot_base is None:
+                return
+            boot_elapsed += boot_rng.uniform(0.05, 1.9)
+            sm.set_current_time(boot_base + timedelta(seconds=boot_elapsed))
+
+        def _c(parent, image, cmd, user):
+            _advance_boot_clock()
+            return sm.create_process(hn, parent, image, cmd, user, "System", os_category="macos")
+
+        from evidenceforge.models.state import RunningProcess
+
+        # launchd is macOS's PID 1 — the sole process spawned directly by the
+        # kernel, and the ancestor of every other user-space process (both
+        # system daemons in the system domain and, later, per-user Aqua
+        # session jobs). Register it directly (bypassing create_process(), as
+        # the Linux/Windows trees do for their own PID-1/PID-4 roots) since
+        # its PID is fixed by convention, not allocated.
+        launchd_object_id = stable_uuid("macos-launchd", hn)
+        sm.state.running_processes[(hn, 1)] = RunningProcess(
+            pid=1,
+            parent_pid=0,
+            image="/sbin/launchd",
+            command_line="/sbin/launchd",
+            username="root",
+            system=hn,
+            start_time=sm.state.current_time,
+            integrity_level="System",
+            ecar_object_id=launchd_object_id,
+        )
+        sm._process_object_ids[(hn, 1)] = launchd_object_id
+        pids["launchd"] = 1
+
+        pids["windowserver"] = _c(
+            pids["launchd"],
+            "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon",
+            "_windowserver",
+        )
+        # macOS's session root — the analog of Windows' winlogon. Owns the
+        # login UI and (once a user authenticates) becomes the durable
+        # interactive-session anchor that WorldModel's
+        # _find_reusable_interactive_session() already treats as
+        # loginwindow-rooted.
+        pids["loginwindow"] = _c(
+            pids["launchd"],
+            "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow",
+            "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow",
+            "root",
+        )
+        pids["cfprefsd"] = _c(
+            pids["launchd"], "/usr/sbin/cfprefsd", "/usr/sbin/cfprefsd daemon", "root"
+        )
+        pids["user_event_agent"] = _c(
+            pids["launchd"],
+            "/usr/libexec/UserEventAgent",
+            "/usr/libexec/UserEventAgent (System)",
+            "root",
+        )
+        # Unified logging (logd) and its legacy BSD syslog compatibility shim
+        # (syslogd) both run persistently, mirroring the Linux tree's
+        # systemd-journald + rsyslogd pairing.
+        pids["logd"] = _c(pids["launchd"], "/usr/libexec/logd", "/usr/libexec/logd", "root")
+        pids["syslogd"] = _c(pids["launchd"], "/usr/sbin/syslogd", "/usr/sbin/syslogd", "root")
+        pids["trustd"] = _c(
+            pids["launchd"], "/usr/libexec/trustd", "/usr/libexec/trustd --agent", "_trustd"
+        )
+        pids["opendirectoryd"] = _c(
+            pids["launchd"], "/usr/libexec/opendirectoryd", "/usr/libexec/opendirectoryd", "root"
+        )
+        pids["notifyd"] = _c(
+            pids["launchd"], "/usr/libexec/notifyd", "/usr/libexec/notifyd", "root"
+        )
+        pids["mdnsresponder"] = _c(
+            pids["launchd"], "/usr/sbin/mDNSResponder", "/usr/sbin/mDNSResponder", "_mdnsresponder"
+        )
+
+        # Spotlight: mds is the metadata server; mdworker instances are its
+        # on-demand indexing workers.
+        pids["mds"] = _c(pids["launchd"], "/usr/sbin/mds", "/usr/sbin/mds", "root")
+        pids["mdworker"] = _c(
+            pids["mds"],
+            "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+            "Metadata.framework/Support/mdworker_shared",
+            "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+            "Metadata.framework/Support/mdworker_shared -s mdworker",
+            "_spotlight",
+        )
+
+        # Remote Login (sshd), matching WorldModel's macOS SSH support — a
+        # root shell parented under it stands in for an active console/SSH
+        # session, mirroring the Linux tree's sshd->bash pairing.
+        pids["sshd"] = _c(pids["launchd"], "/usr/sbin/sshd", "/usr/sbin/sshd -i", "root")
+        pids["zsh"] = _c(pids["sshd"], "/bin/zsh", "-zsh", "root")
+
         if boot_base is not None:
             sm.set_current_time(boot_base)
 
