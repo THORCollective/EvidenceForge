@@ -46,6 +46,11 @@ def linux_system():
 
 
 @pytest.fixture
+def macos_system():
+    return System(hostname="MAC-01", ip="10.0.10.3", os="macOS 14", type="workstation")
+
+
+@pytest.fixture
 def user():
     return User(
         username="test.user",
@@ -1787,4 +1792,155 @@ class TestLinuxParentSelection:
 
         assert parent_proc is not None
         assert parent_pid == pids["apache2"]
-        assert parent_proc.image == "/usr/sbin/apache2"
+
+
+class TestMacosParentResolutionDispatch:
+    """_resolve_parent()/_ensure_parent_chain() must dispatch macOS to its own
+    reverse index (Task 4b) instead of silently reusing the Linux index."""
+
+    def test_macos_and_linux_reverse_indices_disagree_for_zsh(self):
+        """Sanity check the test fixture assumption: macOS and Linux reverse
+        indices must actually disagree for `zsh`, otherwise a dispatch bug
+        here would be undetectable."""
+        from evidenceforge.generation.activity.spawn_rules import (
+            get_reverse_index_linux,
+            get_reverse_index_macos,
+        )
+
+        linux_parents = get_reverse_index_linux().get("zsh", [])
+        macos_parents = get_reverse_index_macos().get("zsh", [])
+        assert "terminal" not in linux_parents, (
+            "fixture assumption broke: Linux reverse index should not allow "
+            "Terminal as a zsh parent"
+        )
+        assert "terminal" in macos_parents, (
+            "fixture assumption broke: macOS reverse index should allow Terminal as a zsh parent"
+        )
+
+    def test_resolve_parent_uses_macos_reverse_index_not_linux(
+        self, state_manager, mock_emitters, macos_system, user
+    ):
+        """A macOS `zsh` process must resolve its parent from the macOS
+        reverse index (which allows Terminal), not the Linux one (which only
+        allows sshd for zsh).
+
+        Deliberately seeds only launchd + Terminal (no sshd/bash) so the
+        *only* way to find a live, valid parent for `zsh` is via the macOS
+        reverse index. If the dispatch regresses to the Linux index, no
+        alive parent would match and this would instead fall through to
+        auto-created-chain logic — resolving to something other than the
+        live Terminal PID.
+        """
+        ag = ActivityGenerator(state_manager, mock_emitters)
+
+        launchd_pid = state_manager.create_process(
+            macos_system.hostname,
+            0,
+            "/sbin/launchd",
+            "/sbin/launchd",
+            "root",
+            "System",
+            os_category="macos",
+        )
+        terminal_pid = state_manager.create_process(
+            macos_system.hostname,
+            launchd_pid,
+            "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
+            "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
+            user.username,
+            "System",
+        )
+        ag._system_pids = {
+            macos_system.hostname: {"launchd": launchd_pid, "terminal": terminal_pid}
+        }
+
+        parent_pid = ag._resolve_parent(
+            macos_system,
+            user,
+            datetime(2024, 3, 18, 12, 0, 1, tzinfo=UTC),
+            "",
+            "zsh",
+        )
+
+        assert parent_pid == terminal_pid, (
+            "macOS zsh process should resolve its parent to the live Terminal "
+            "process via the macOS reverse index, not fall through to "
+            f"Linux-shaped resolution; got pid {parent_pid}"
+        )
+
+    def test_ensure_parent_chain_depth_limit_falls_back_to_launchd_not_systemd(
+        self, state_manager, mock_emitters, macos_system, user
+    ):
+        """Hitting _ensure_parent_chain's depth-limit safety fallback on a
+        macOS system must resolve to the launchd-rooted process, not the
+        Linux-shaped fallback (bash/sshd, or fabricating a fresh systemd
+        process via _linux_anchor_pid).
+        """
+        ag = ActivityGenerator(state_manager, mock_emitters)
+
+        launchd_pid = state_manager.create_process(
+            macos_system.hostname,
+            0,
+            "/sbin/launchd",
+            "/sbin/launchd",
+            "root",
+            "System",
+            os_category="macos",
+        )
+        # Deliberately do not seed "bash" or "sshd" — those are the keys the
+        # pre-fix Linux-shaped fallback tried first, and their absence means
+        # the buggy fallback would have called _linux_anchor_pid(), which
+        # fabricates a brand-new "/usr/lib/systemd/systemd" process — a
+        # Linux-shaped artifact that should never appear on a macOS host.
+        ag._system_pids = {macos_system.hostname: {"launchd": launchd_pid}}
+
+        parent_pid = ag._ensure_parent_chain(
+            macos_system,
+            user,
+            datetime(2024, 3, 18, 12, 0, 1, tzinfo=UTC),
+            "",
+            "some_unknown_macos_binary",
+            "macos",
+            depth=4,
+        )
+
+        assert parent_pid == launchd_pid, (
+            "macOS depth-limit fallback should resolve to the launchd-rooted "
+            f"process, got pid {parent_pid}"
+        )
+        procs = state_manager.get_processes_on_system(macos_system.hostname)
+        images = {proc.image for proc in procs}
+        assert not any("systemd" in image.lower() for image in images), (
+            "macOS depth-limit fallback must not fabricate a Linux-shaped "
+            f"systemd process; found images: {images}"
+        )
+
+    def test_ensure_parent_chain_no_possible_parents_falls_back_to_launchd(
+        self, state_manager, mock_emitters, macos_system, user
+    ):
+        """When a macOS child exe has no spawn-rule entries at all, the
+        no-possible-parents fallback must also stay launchd-rooted."""
+        ag = ActivityGenerator(state_manager, mock_emitters)
+
+        launchd_pid = state_manager.create_process(
+            macos_system.hostname,
+            0,
+            "/sbin/launchd",
+            "/sbin/launchd",
+            "root",
+            "System",
+            os_category="macos",
+        )
+        ag._system_pids = {macos_system.hostname: {"launchd": launchd_pid}}
+
+        parent_pid = ag._ensure_parent_chain(
+            macos_system,
+            user,
+            datetime(2024, 3, 18, 12, 0, 1, tzinfo=UTC),
+            "",
+            "totally_unknown_binary_not_in_any_rules",
+            "macos",
+            depth=0,
+        )
+
+        assert parent_pid == launchd_pid

@@ -27384,6 +27384,7 @@ class ActivityGenerator:
         """
         from evidenceforge.generation.activity.spawn_rules import (
             get_reverse_index_linux,
+            get_reverse_index_macos,
             get_reverse_index_windows,
         )
 
@@ -27528,6 +27529,8 @@ class ActivityGenerator:
         # Look up valid parents from spawn rules
         if os_cat == "windows":
             reverse = get_reverse_index_windows()
+        elif os_cat == "macos":
+            reverse = get_reverse_index_macos()
         else:
             reverse = get_reverse_index_linux()
 
@@ -27999,6 +28002,7 @@ class ActivityGenerator:
         from evidenceforge.generation.activity.spawn_rules import (
             get_parent_config,
             get_reverse_index_linux,
+            get_reverse_index_macos,
             get_reverse_index_windows,
         )
 
@@ -28007,6 +28011,8 @@ class ActivityGenerator:
 
         if os_cat == "windows":
             reverse = get_reverse_index_windows()
+        elif os_cat == "macos":
+            reverse = get_reverse_index_macos()
         else:
             reverse = get_reverse_index_linux()
 
@@ -28019,6 +28025,11 @@ class ActivityGenerator:
                 if session_explorer is not None:
                     return session_explorer
                 return sys_pids.get("services", sys_pids.get("wininit", 4))
+            if os_cat == "macos":
+                # launchd is macOS's PID-1 root — its PID is fixed by kernel
+                # convention (see emitter_setup._seed_macos_process_tree), so
+                # it is always a safe anchor even if untracked in sys_pids.
+                return sys_pids.get("launchd", 1)
             return (
                 sys_pids.get("bash") or sys_pids.get("sshd") or self._linux_anchor_pid(system, time)
             )
@@ -28033,6 +28044,8 @@ class ActivityGenerator:
                 if session_explorer is not None:
                     return session_explorer
                 return sys_pids.get("services", sys_pids.get("wininit", 4))
+            if os_cat == "macos":
+                return sys_pids.get("launchd", 1)
             return (
                 sys_pids.get("bash") or sys_pids.get("sshd") or self._linux_anchor_pid(system, time)
             )
