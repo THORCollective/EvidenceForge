@@ -1937,7 +1937,11 @@ def validate_config() -> ValidationResult:
     # --- Checks 18-20: Process Chain ---
     # Collect all exe basenames from spawn rules
     spawn_children: set[str] = set()
-    for os_rules in [spawn_data.get("windows", {}), spawn_data.get("linux", {})]:
+    for os_rules in [
+        spawn_data.get("windows", {}),
+        spawn_data.get("linux", {}),
+        spawn_data.get("macos", {}),
+    ]:
         for _parent, parent_data in os_rules.items():
             if isinstance(parent_data, dict):
                 for child in parent_data.get("children", []):
@@ -1990,7 +1994,11 @@ def validate_config() -> ValidationResult:
 
     # Check 19: Missing spawn rules (apps not in any spawn rule, case-insensitive)
     spawn_all_entries: set[str] = set()
-    for os_rules in [spawn_data.get("windows", {}), spawn_data.get("linux", {})]:
+    for os_rules in [
+        spawn_data.get("windows", {}),
+        spawn_data.get("linux", {}),
+        spawn_data.get("macos", {}),
+    ]:
         spawn_all_entries.update(os_rules.keys())
         for parent_data in os_rules.values():
             if isinstance(parent_data, dict):

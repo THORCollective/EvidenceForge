@@ -18,6 +18,7 @@ _RULES_PATH = get_activity_directory() / "spawn_rules.yaml"
 _CACHED_RULES: dict[str, Any] | None = None
 _CACHED_REVERSE_WIN: dict[str, list[str]] | None = None
 _CACHED_REVERSE_LINUX: dict[str, list[str]] | None = None
+_CACHED_REVERSE_MACOS: dict[str, list[str]] | None = None
 
 
 def _merge_spawn_rules(default: dict, overlay: dict) -> dict:
@@ -80,6 +81,16 @@ def get_reverse_index_linux() -> dict[str, list[str]]:
     return _CACHED_REVERSE_LINUX
 
 
+def get_reverse_index_macos() -> dict[str, list[str]]:
+    """Get or build the macOS reverse index. Cached."""
+    global _CACHED_REVERSE_MACOS
+    if _CACHED_REVERSE_MACOS is not None:
+        return _CACHED_REVERSE_MACOS
+    rules = load_spawn_rules()
+    _CACHED_REVERSE_MACOS = build_reverse_index(rules.get("macos", {}))
+    return _CACHED_REVERSE_MACOS
+
+
 def get_parent_config(os_type: str, parent_exe: str) -> dict[str, Any]:
     """Get the spawn rule config for a specific parent process.
 
@@ -87,7 +98,12 @@ def get_parent_config(os_type: str, parent_exe: str) -> dict[str, Any]:
     Returns empty dict if parent not in rules.
     """
     rules = load_spawn_rules()
-    os_key = "windows" if os_type == "windows" else "linux"
+    if os_type == "windows":
+        os_key = "windows"
+    elif os_type == "macos":
+        os_key = "macos"
+    else:
+        os_key = "linux"
     os_rules = rules.get(os_key, {})
     # Case-insensitive lookup
     for name, config in os_rules.items():

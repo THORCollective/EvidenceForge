@@ -462,3 +462,181 @@ linux:
     lifetime: long
     children:
       - runc
+
+macos:
+  launchd:
+    command_templates:
+      - "/sbin/launchd"
+    lifetime: long
+    spawn_delay: [0.01, 0.5]
+    children:
+      - loginwindow
+      - sshd
+      - syslogd
+      - UserEventAgent
+      - cfprefsd
+      - mds
+      - mdworker
+      - WindowServer
+      - opendirectoryd
+      - coreaudiod
+      - bluetoothd
+      - locationd
+      - launchservicesd
+
+  loginwindow:
+    command_templates:
+      - "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow"
+    lifetime: long
+    children:
+      - Dock
+      - SystemUIServer
+      - Finder
+      - Terminal
+
+  Dock:
+    command_templates:
+      - "/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock"
+    lifetime: long
+    children:
+      - Safari
+      - Google Chrome
+      - Terminal
+      - Electron
+
+  Safari:
+    command_templates:
+      - "/Applications/Safari.app/Contents/MacOS/Safari"
+    lifetime: long
+    children:
+      - Safari
+
+  Google Chrome:
+    command_templates:
+      - "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    lifetime: long
+    children:
+      - Google Chrome
+
+  Terminal:
+    command_templates:
+      - "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
+    lifetime: long
+    children:
+      - zsh
+      - bash
+
+  sshd:
+    command_templates:
+      - "/usr/sbin/sshd -i"
+    lifetime: short
+    children:
+      - zsh
+      - bash
+      - sftp-server
+
+  zsh:
+    command_templates:
+      - "-zsh"
+      - "/bin/zsh"
+    lifetime: long
+    children:
+      - vim
+      - nano
+      - code
+      - git
+      - make
+      - npm
+      - node
+      - python3
+      - pip3
+      - docker
+      - kubectl
+      - curl
+      - ssh
+      - scp
+      - rsync
+      - osascript
+      - security
+      - codesign
+      - plutil
+      - defaults
+      - launchctl
+      - sw_vers
+      - log
+      - ls
+      - cat
+      - grep
+      - find
+      - ps
+      - top
+      - df
+      - id
+      - whoami
+      - hostname
+      - w
+      - uptime
+      - chmod
+      - chown
+      - ln
+      - mv
+      - cp
+      - rm
+      - mkdir
+      - sed
+      - awk
+      - sort
+      - wc
+      - tar
+      - unzip
+      - sudo
+      - zsh
+      - bash
+      - sh
+
+  bash:
+    command_templates:
+      - "-bash"
+      - "/bin/bash"
+    lifetime: long
+    children:
+      - vim
+      - nano
+      - code
+      - git
+      - make
+      - npm
+      - node
+      - python3
+      - pip3
+      - docker
+      - kubectl
+      - curl
+      - ssh
+      - scp
+      - rsync
+      - osascript
+      - security
+      - codesign
+      - plutil
+      - defaults
+      - launchctl
+      - ls
+      - cat
+      - grep
+      - find
+      - ps
+      - top
+      - whoami
+      - id
+      - hostname
+      - chmod
+      - chown
+      - mv
+      - cp
+      - rm
+      - mkdir
+      - sudo
+      - bash
+      - zsh
+      - sh

@@ -622,3 +622,37 @@ system_binaries:
     - {exe: "python3",                   path: "/usr/bin/python3"}
     - {exe: "pip",                       path: "/usr/bin/pip"}
     - {exe: "pip3",                      path: "/usr/bin/pip3"}
+
+  macos:
+    # --- Core OS boot / session processes ---
+    - {exe: "launchd",                   path: "/sbin/launchd"}
+    - {exe: "loginwindow",               path: "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow"}
+    - {exe: "Dock",                      path: "/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock"}
+    - {exe: "SystemUIServer",            path: "/System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer"}
+    - {exe: "Finder",                    path: "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"}
+    - {exe: "Terminal",                  path: "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"}
+    - {exe: "WindowServer",              path: "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer"}
+
+    # --- System daemons ---
+    - {exe: "syslogd",                   path: "/usr/sbin/syslogd"}
+    - {exe: "UserEventAgent",            path: "/usr/libexec/UserEventAgent"}
+    - {exe: "cfprefsd",                  path: "/usr/sbin/cfprefsd"}
+    - {exe: "mds",                       path: "/System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Support/mds"}
+    - {exe: "mdworker",                  path: "/System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Support/mdworker"}
+    - {exe: "opendirectoryd",            path: "/usr/libexec/opendirectoryd"}
+    - {exe: "coreaudiod",                path: "/usr/sbin/coreaudiod"}
+    - {exe: "bluetoothd",                path: "/usr/sbin/bluetoothd"}
+    - {exe: "locationd",                 path: "/usr/libexec/locationd"}
+    - {exe: "launchservicesd",           path: "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/launchservicesd"}
+    - {exe: "sshd",                      path: "/usr/sbin/sshd"}
+
+    # --- CLI / admin tools ---
+    - {exe: "osascript",                 path: "/usr/bin/osascript"}
+    - {exe: "security",                  path: "/usr/bin/security"}
+    - {exe: "codesign",                  path: "/usr/bin/codesign"}
+    - {exe: "plutil",                    path: "/usr/bin/plutil"}
+    - {exe: "defaults",                  path: "/usr/bin/defaults"}
+    - {exe: "launchctl",                 path: "/bin/launchctl"}
+    - {exe: "sw_vers",                   path: "/usr/bin/sw_vers"}
+    - {exe: "log",                       path: "/usr/bin/log"}
+    - {exe: "sudo",                      path: "/usr/bin/sudo"}

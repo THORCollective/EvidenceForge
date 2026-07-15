@@ -120,6 +120,39 @@ class TestSpawnRulesYaml:
             )
             assert len(parent_config["command_templates"]) > 0
 
+    def test_macos_section_present_with_launchd_root(self):
+        """macOS spawn rules should exist and be rooted at launchd, like linux/systemd."""
+        from evidenceforge.generation.activity.spawn_rules import load_spawn_rules
+
+        rules = load_spawn_rules()
+        assert "macos" in rules
+        assert "launchd" in rules["macos"]
+        launchd_config = rules["macos"]["launchd"]
+        assert "command_templates" in launchd_config
+        assert len(launchd_config["command_templates"]) > 0
+        assert "loginwindow" in launchd_config["children"]
+
+    def test_macos_reverse_index_populated(self):
+        """get_reverse_index_macos() should map macOS children to real parents."""
+        from evidenceforge.generation.activity.spawn_rules import get_reverse_index_macos
+
+        reverse_macos = get_reverse_index_macos()
+        assert "git" in reverse_macos, "git should be a known macOS shell child"
+        assert len(reverse_macos["git"]) > 0
+        assert "terminal" in reverse_macos["zsh"], "zsh should be spawned by Terminal"
+
+    def test_get_parent_config_three_way_dispatch(self):
+        """get_parent_config() should resolve macos configs distinctly from windows/linux."""
+        from evidenceforge.generation.activity.spawn_rules import get_parent_config
+
+        macos_config = get_parent_config("macos", "zsh")
+        assert macos_config, "macos zsh parent config should not be empty"
+        assert "command_templates" in macos_config
+        assert len(macos_config["command_templates"]) > 0
+
+        # A macOS-only parent name should not resolve under the linux dispatch.
+        assert get_parent_config("linux", "launchd") == {}
+
 
 class TestWindowsProcessTreeRealism:
     """Windows process trees should use spawn rules for parent selection."""
