@@ -211,6 +211,31 @@ def test_timing_profiles_load_default_relationship():
     assert endpoint_timing.host_drift_max_ppm == 8
 
 
+def test_endpoint_clock_timing_macos_uses_dedicated_profile():
+    """macOS should get its own endpoint_clock profile, not silently collapse to Linux."""
+    macos_timing = endpoint_clock_timing("enterprise_standard", "macos")
+    linux_timing = endpoint_clock_timing("enterprise_standard", "linux")
+
+    # macOS mirrors the Linux profile's bounds today (both are non-Windows Unix
+    # hosts), but resolution must come from a real "macos" YAML key rather than
+    # an implicit windows/else-linux 2-way dispatch.
+    assert macos_timing.host_offset_min_ms == linux_timing.host_offset_min_ms
+    assert macos_timing.host_offset_max_ms == linux_timing.host_offset_max_ms
+    assert macos_timing.host_drift_min_ppm == linux_timing.host_drift_min_ppm
+    assert macos_timing.host_drift_max_ppm == linux_timing.host_drift_max_ppm
+
+    from evidenceforge.generation.activity.timing_profiles import load_timing_profiles
+
+    macos_profile = (
+        load_timing_profiles()
+        .get("endpoint_clock", {})
+        .get("profiles", {})
+        .get("enterprise_standard", {})
+        .get("macos")
+    )
+    assert macos_profile is not None, "expected an explicit macos endpoint_clock profile in YAML"
+
+
 def test_timing_profiles_overlay_overrides_relationship(tmp_path, monkeypatch):
     overlay = tmp_path / ".eforge" / "config" / "activity"
     overlay.mkdir(parents=True)
