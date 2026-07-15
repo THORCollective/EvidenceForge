@@ -788,6 +788,19 @@ class LogoffEventSpec(_EventSpecBase):
     type: Literal["logoff"] = "logoff"
 
 
+class FileEventSpec(_EventSpecBase):
+    """File operation event (generates ES file events on macOS; may drive causal expansion, e.g. BTM)."""
+
+    type: Literal["file"] = "file"
+    path: str
+    action: Literal["create", "modify", "delete", "read", "open", "write", "rename", "unlink"] = (
+        "create"
+    )
+    pid: int | None = (
+        None  # Optional explicit actor PID override; default resolves from session/process context
+    )
+
+
 class ConnectionEventSpec(_EventSpecBase):
     """Network connection event (generates Zeek conn, eCAR FLOW, optionally web_access/zeek_http)."""
 
@@ -1616,6 +1629,7 @@ EventSpec = Annotated[
     | LogonEventSpec
     | FailedLogonEventSpec
     | LogoffEventSpec
+    | FileEventSpec
     | ConnectionEventSpec
     | SshSessionEventSpec
     | RdpSessionEventSpec

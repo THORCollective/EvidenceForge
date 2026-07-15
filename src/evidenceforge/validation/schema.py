@@ -119,6 +119,13 @@ _LINUX_EVENT_TYPES = {"ssh_session"}
 # type is meaningful on macOS, so each type needs its own per-OS decision.
 _MACOS_EVENT_TYPES = {"ssh_session"}
 
+# `file` storyline event actions rendered ONLY by the macOS eslogger emitter
+# (see generation/emitters/eslogger.py's supported action set). "create" is
+# excluded here because Sysmon/eCAR also render file_create on Windows/Linux;
+# these four actions have no non-macOS emitter, so placing them on a
+# non-macOS system would silently produce no rendered evidence.
+_MACOS_ONLY_FILE_ACTIONS = {"open", "write", "rename", "unlink"}
+
 # Process command patterns indicating wrong OS
 _WINDOWS_COMMAND_INDICATORS = {"powershell.exe", "cmd.exe", "reg.exe", "net.exe"}
 _LINUX_PATH_PREFIXES = ("/usr/", "/bin/", "/etc/", "/opt/", "/var/")
@@ -1928,6 +1935,30 @@ class ScenarioValidator:
                             suggestion=(
                                 "Change the target system to a Linux host "
                                 "or use a different event type"
+                            ),
+                        )
+                    )
+
+                # `file` events with an eslogger-only action (open/write/rename/
+                # unlink) render on macOS only; on any other OS no emitter
+                # handles them and the event would silently produce no evidence.
+                if (
+                    event_type == "file"
+                    and os_cat != "macos"
+                    and getattr(spec, "action", None) in _MACOS_ONLY_FILE_ACTIONS
+                ):
+                    self.issues.append(
+                        ValidationIssue(
+                            severity="warning",
+                            field_path=(f"storyline.{idx}.events.{spec_idx}.action"),
+                            message=(
+                                f"[{event.id}] File action '{spec.action}' is only rendered by "
+                                f"the macOS eslogger emitter, but system '{event.system}' is "
+                                f"{os_cat}; no emitter will render this event"
+                            ),
+                            suggestion=(
+                                "Change the target system to a macOS host or use action "
+                                "'create'/'modify'/'delete'/'read', which render on other OSes"
                             ),
                         )
                     )

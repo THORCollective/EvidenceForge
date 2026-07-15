@@ -2583,6 +2583,111 @@ class TestStorylineOsPlausibility:
         warnings = [i for i in issues if "Linux-specific" in i.message]
         assert len(warnings) >= 1
 
+    def test_file_eslogger_only_action_on_windows_warning(self):
+        """A `file` event with an eslogger-only action on Windows should warn."""
+        scenario = Scenario(
+            version="1.0",
+            name="test",
+            description="Test",
+            environment=Environment(
+                description="Test env",
+                users=[User(username="jdoe", full_name="J", email="j@test.com")],
+                systems=[
+                    System(hostname="WS-01", ip="10.0.0.1", os="Windows 10", type="workstation"),
+                ],
+            ),
+            storyline=[
+                StorylineEvent(
+                    id="evt-val-file-open-windows",
+                    time="2024-01-15T10:00:00Z",
+                    actor="jdoe",
+                    system="WS-01",
+                    activity="open a file",
+                    events=[{"type": "file", "path": "C:\\notes.txt", "action": "open"}],
+                ),
+            ],
+            time_window=TimeWindow(start=datetime(2024, 1, 15, 10, 0, 0), duration="1h"),
+            baseline_activity=BaselineActivity(
+                description="Test", intensity="medium", variation="low"
+            ),
+            output=OutputSpec(logs=[{"format": "windows"}], destination="./output"),
+        )
+        validator = ScenarioValidator(scenario)
+        issues = validator.validate()
+
+        warnings = [i for i in issues if "only rendered by the macOS eslogger" in i.message]
+        assert len(warnings) >= 1
+
+    def test_file_create_action_on_windows_no_warning(self):
+        """`action: create` renders on Windows via Sysmon/eCAR, so no warning."""
+        scenario = Scenario(
+            version="1.0",
+            name="test",
+            description="Test",
+            environment=Environment(
+                description="Test env",
+                users=[User(username="jdoe", full_name="J", email="j@test.com")],
+                systems=[
+                    System(hostname="WS-01", ip="10.0.0.1", os="Windows 10", type="workstation"),
+                ],
+            ),
+            storyline=[
+                StorylineEvent(
+                    id="evt-val-file-create-windows",
+                    time="2024-01-15T10:00:00Z",
+                    actor="jdoe",
+                    system="WS-01",
+                    activity="create a file",
+                    events=[{"type": "file", "path": "C:\\notes.txt", "action": "create"}],
+                ),
+            ],
+            time_window=TimeWindow(start=datetime(2024, 1, 15, 10, 0, 0), duration="1h"),
+            baseline_activity=BaselineActivity(
+                description="Test", intensity="medium", variation="low"
+            ),
+            output=OutputSpec(logs=[{"format": "windows"}], destination="./output"),
+        )
+        validator = ScenarioValidator(scenario)
+        issues = validator.validate()
+
+        warnings = [i for i in issues if "only rendered by the macOS eslogger" in i.message]
+        assert warnings == []
+
+    def test_file_open_action_on_macos_no_warning(self):
+        """`action: open` on a macOS system is exactly what eslogger renders."""
+        scenario = Scenario(
+            version="1.0",
+            name="test",
+            description="Test",
+            environment=Environment(
+                description="Test env",
+                users=[User(username="jdoe", full_name="J", email="j@test.com")],
+                systems=[
+                    System(hostname="MAC-01", ip="10.0.0.1", os="macOS 14", type="workstation"),
+                ],
+            ),
+            storyline=[
+                StorylineEvent(
+                    id="evt-val-file-open-macos",
+                    time="2024-01-15T10:00:00Z",
+                    actor="jdoe",
+                    system="MAC-01",
+                    activity="open a file",
+                    events=[{"type": "file", "path": "/Users/jdoe/notes.txt", "action": "open"}],
+                ),
+            ],
+            time_window=TimeWindow(start=datetime(2024, 1, 15, 10, 0, 0), duration="1h"),
+            baseline_activity=BaselineActivity(
+                description="Test", intensity="medium", variation="low"
+            ),
+            output=OutputSpec(logs=[{"format": "eslogger"}], destination="./output"),
+        )
+        validator = ScenarioValidator(scenario)
+        issues = validator.validate()
+
+        warnings = [i for i in issues if "only rendered by the macOS eslogger" in i.message]
+        assert warnings == []
+
     def test_powershell_on_linux_warning(self):
         """Process with powershell.exe on Linux should warn."""
         scenario = Scenario(

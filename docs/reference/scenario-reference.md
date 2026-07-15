@@ -796,6 +796,7 @@ minutes or hours. `explicit_offsets` accepts one offset per child event, such as
 | `logon` | 4624, target-host 4672 for elevated sessions, eCAR LOGIN | | `logon_type` (default 3), `source_ip` |
 | `failed_logon` | 4625, eCAR LOGIN failure | | `source_ip`, `logon_type` (default 3) |
 | `logoff` | 4634, eCAR LOGOUT | | |
+| `file` | Sysmon 11/eCAR file events (create/modify/delete/read), macOS eslogger (create/open/write/rename/unlink); `create` under LaunchAgents/LaunchDaemons also drives the BTM causal rule | `path` | `action` (create/modify/delete/read/open/write/rename/unlink, default create), `pid` (explicit actor PID override; default resolves from the most recent storyline process on that system) |
 | `connection` | Zeek conn, eCAR FLOW, + web_access/zeek_http when `service: http` | `dst_ip` | `dst_port` (default 443), `hostname` (domain for DNS/SSL SNI), `service`, `source_ip`, `method`, `uri`, `status_code`, `user_agent` |
 | `ssh_session` | canonical SSH connection (Zeek conn) + syslog sshd + EDR/eCAR | | `source_ip` |
 | `rdp_session` | Zeek conn + 4624 type 10 + eCAR | | `source_ip` |
