@@ -40,6 +40,10 @@ class TestCatalogLoading:
                     assert image.startswith("/"), (
                         f"{app['id']} linux image_path '{image}' is not fully qualified"
                     )
+                elif os_cat == "macos":
+                    assert image.startswith("/"), (
+                        f"{app['id']} macos image_path '{image}' is not fully qualified"
+                    )
 
     def test_all_windows_entries_have_pe_metadata(self):
         """P0-3: Every Windows user-installed app should have PE metadata."""
@@ -169,6 +173,43 @@ class TestPersonaFiltering:
         assert not is_system_type_allowed("dsquery.exe", "windows", "workstation")
         assert not is_system_type_allowed("dsquery.exe", "windows", "server")
         assert is_system_type_allowed("dsquery.exe", "windows", "domain_controller")
+
+
+class TestMacosCatalogSupport:
+    """macOS platform entries should be recognized like windows/linux (Task 4, item 3)."""
+
+    def test_developer_gets_macos_browser_and_devtools(self):
+        apps = get_apps_for_persona("developer", "macos", "user_app")
+        app_ids = {a["id"] for a in apps}
+        assert "chrome" in app_ids or "safari" in app_ids
+        assert "git" in app_ids
+
+    def test_has_catalog_entry_recognizes_macos_apps(self):
+        from evidenceforge.generation.activity.application_catalog import has_catalog_entry
+
+        assert has_catalog_entry("git", "macos")
+        assert has_catalog_entry("Google Chrome", "macos")
+
+    def test_is_persona_allowed_and_system_type_allowed_for_macos(self):
+        from evidenceforge.generation.activity.application_catalog import is_persona_allowed
+
+        assert is_persona_allowed("git", "macos", "developer")
+        assert is_system_type_allowed("git", "macos", "workstation")
+
+    def test_resolve_image_path_returns_macos_catalog_path(self):
+        from evidenceforge.generation.activity.application_catalog import resolve_image_path
+
+        path = resolve_image_path("git", os_category="macos")
+        assert path == "/usr/bin/git"
+
+    def test_resolve_image_path_unix_fallback_for_unknown_macos_exe(self):
+        """An unrecognized macOS exe must never fall back to a Windows System32 path."""
+        from evidenceforge.generation.activity.application_catalog import resolve_image_path
+
+        path = resolve_image_path("some_unknown_tool", os_category="macos")
+        assert path == "/usr/bin/some_unknown_tool"
+        assert "System32" not in path
+        assert "C:\\" not in path
 
 
 class TestPeMetadataLookup:

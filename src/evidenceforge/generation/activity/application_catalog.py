@@ -69,7 +69,7 @@ def get_apps_for_persona(
     Args:
         persona: Persona name (e.g., "developer", "hr"). Falls back to
             "default" if the persona doesn't appear in any app's list.
-        os_category: "windows" or "linux".
+        os_category: "windows", "linux", or "macos".
         category: Category tag to filter on (e.g., "user_app", "code", "build", "query").
         system_type: Optional system type filter ("workstation", "server",
             "domain_controller"). Apps with a system_types field are only
@@ -276,7 +276,7 @@ def resolve_image_path(exe_basename: str, os_category: str = "windows", username
 
     Args:
         exe_basename: Bare executable name (e.g., "chrome.exe", "git")
-        os_category: "windows" or "linux"
+        os_category: "windows", "linux", or "macos"
         username: Optional username for profile-scoped apps (Teams, OneDrive).
             If empty and the path contains {username}, the bare basename is
             returned unchanged to avoid fabricating paths.
@@ -316,8 +316,8 @@ def resolve_image_path(exe_basename: str, os_category: str = "windows", username
     if sys_path:
         return sys_path
 
-    # 4. Last resort — assume System32 (Windows) or /usr/bin (Linux)
-    if os_category == "linux":
+    # 4. Last resort — assume System32 (Windows) or /usr/bin (Linux/macOS)
+    if os_category in ("linux", "macos"):
         return f"/usr/bin/{exe_basename}"
     return rf"C:\Windows\System32\{exe_basename}"
 
@@ -329,9 +329,9 @@ def _build_path_index() -> dict[str, dict[str, str]]:
     like 'git' and 'git.exe' both resolve to the catalog path.
     """
     data = load_catalog()
-    index: dict[str, dict[str, str]] = {"windows": {}, "linux": {}}
+    index: dict[str, dict[str, str]] = {"windows": {}, "linux": {}, "macos": {}}
     for app in data["applications"]:
-        for os_cat in ("windows", "linux"):
+        for os_cat in ("windows", "linux", "macos"):
             platform = app.get("platforms", {}).get(os_cat)
             if not platform:
                 continue
@@ -383,7 +383,7 @@ def get_child_processes(os_category: str, parent_exe: str) -> list[dict[str, str
     otherwise they inherit the parent's image path from the catalog.
 
     Args:
-        os_category: "windows" or "linux"
+        os_category: "windows", "linux", or "macos"
         parent_exe: Parent executable basename (e.g., "chrome.exe")
 
     Returns:
