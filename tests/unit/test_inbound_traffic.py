@@ -55,6 +55,26 @@ class TestTrafficProfileSchema:
                 f"Persona '{persona_name}' still has 'connections' key; should be 'outbound'"
             )
 
+    def test_os_matching_is_string_equality_not_binary_branch(self):
+        """traffic_profiles.py's os filter must stay OS-agnostic (Task 4, item 9).
+
+        get_role_connections/_os_matches compares the YAML 'os' tag against
+        os_category with plain string equality — no windows/linux-only code
+        branch — so adding new OS-tagged entries (e.g. macos) needs only YAML
+        data, not a Python change.
+        """
+        from evidenceforge.generation.activity.traffic_profiles import _os_matches
+
+        assert _os_matches({"os": "macos"}, "macos") is True
+        assert _os_matches({"os": "macos"}, "linux") is False
+        assert _os_matches({}, "macos") is True  # untagged entries apply to any OS
+
+    def test_server_admin_profile_has_macos_entries(self):
+        """The _server_admin persona overlay should have a macOS admin block."""
+        conns = get_persona_connections("_server_admin", "macos")
+        assert len(conns) > 0
+        assert any(conn.get("service") == "ssh" for conn in conns)
+
     def test_no_old_dest_role_field(self):
         """Connection entries should use 'role', not 'dest_role'."""
         data = load_traffic_profiles()

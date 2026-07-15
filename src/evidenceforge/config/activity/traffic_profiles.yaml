@@ -17,7 +17,7 @@
 #   proto:     tcp | udp (default: tcp)
 #   service:   Zeek service label (optional)
 #   weight:    relative frequency weight (higher = more connections)
-#   os:        restrict to hosts with this OS: windows | linux (optional)
+#   os:        restrict to hosts with this OS: windows | linux | macos (optional)
 #   emit_dns:  emit a preceding DNS lookup (default: false)
 #   dns_tags:  list of dns_registry tags for _external resolution (optional)
 #              Falls back to ["background", <source_os>] if omitted.
@@ -233,6 +233,9 @@ persona_traffic:
       # Linux server admin
       - {role: _any_server, port: 22, service: ssh, weight: 15, os: linux, description: "SSH to other servers"}
       - {role: _external, port: 443, service: ssl, weight: 10, os: linux, emit_dns: true, dns_tags: [background, linux], description: "apt/yum repos, package updates"}
+      # macOS server admin
+      - {role: _any_server, port: 22, service: ssh, weight: 15, os: macos, description: "SSH to other servers"}
+      - {role: _external, port: 443, service: ssl, weight: 10, os: macos, emit_dns: true, dns_tags: [background], description: "Homebrew/software update checks"}
       # Cross-platform
       - {role: log_server, port: 443, service: ssl, weight: 15, description: "Check centralized logs/SIEM"}
       - {role: _external, port: 443, service: ssl, weight: 10, emit_dns: true, dns_tags: [background], description: "Monitoring dashboards/patch checks"}
