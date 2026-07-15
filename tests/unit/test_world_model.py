@@ -1165,3 +1165,129 @@ def test_align_rdp_source_after_future_session_preserves_naive_time_awareness(
     )
 
     assert aligned.tzinfo is None
+
+
+def _make_macos_scenario() -> Scenario:
+    """Minimal scenario with a macOS workstation for macOS-specific coverage."""
+    return Scenario(
+        name="macos-world-model-test",
+        description="macOS world model coverage scenario",
+        environment=Environment(
+            description="macOS environment",
+            users=[
+                User(
+                    username="bob.mac",
+                    full_name="Bob Mac",
+                    email="bob@corp.local",
+                    persona="developer",
+                    primary_system="MAC-01",
+                ),
+            ],
+            systems=[
+                System(
+                    hostname="MAC-01",
+                    ip="10.10.10.60",
+                    os="macOS 14.5",
+                    type="workstation",
+                    assigned_user="bob.mac",
+                ),
+            ],
+        ),
+        time_window=TimeWindow(start=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC), duration="2h"),
+        baseline_activity=BaselineActivity(description="Normal", intensity="low", variation="low"),
+        output=OutputSpec(logs=[{"format": "zeek"}], destination="./out"),
+    )
+
+
+def test_compile_host_macos_supports_ssh_and_has_service_defaults() -> None:
+    """macOS hosts should support SSH (sshd ships on macOS) with non-empty service defaults."""
+    scenario = _make_macos_scenario()
+    world_model = WorldModel(scenario, "corp.local")
+
+    host = world_model.hosts["MAC-01"]
+    assert host.os_category == "macos"
+    assert host.supports_ssh is True
+    assert host.supports_rdp is False
+
+    services = world_model.service_defaults_by_host["MAC-01"]
+    assert services
+    assert "dns-client" in services
+    assert "ntp-client" in services
+    # macOS doesn't run a generic Linux-style syslog daemon.
+    assert "syslog" not in services
+
+
+def test_world_planner_reuses_durable_macos_interactive_session() -> None:
+    """Later macOS workstation activity should not bootstrap another interactive session."""
+    scenario = _make_macos_scenario()
+    world_model = WorldModel(scenario, "corp.local")
+    state_manager = StateManager()
+    zeek = Mock()
+    zeek.can_handle.return_value = True
+    mock_emitters = {"zeek_conn": zeek}
+    dispatcher = EventDispatcher(state_manager=state_manager, emitters=mock_emitters)
+    activity_generator = ActivityGenerator(state_manager, mock_emitters, dispatcher=dispatcher)
+    activity_generator._ad_domain = world_model.ad_domain
+    activity_generator._ip_to_system = dict(world_model.systems_by_ip)
+    activity_generator._all_system_ips = [s.ip for s in scenario.environment.systems]
+    planner = WorldPlanner(world_model, state_manager, activity_generator)
+
+    user = scenario.environment.users[0]
+    target_system = scenario.environment.systems[0]
+    start_time = datetime(2024, 1, 15, 10, 5, 0, tzinfo=UTC)
+
+    first = planner.bootstrap_user_session(
+        user=user,
+        target_system=target_system,
+        time=start_time,
+        rng=random.Random(17),
+        session_kind="interactive",
+        allow_existing=False,
+    )
+
+    second = planner.bootstrap_user_session(
+        user=user,
+        target_system=target_system,
+        time=start_time + timedelta(minutes=55),
+        rng=random.Random(23),
+        session_kind="interactive",
+    )
+
+    assert second.session.logon_id == first.session.logon_id
+    assert state_manager.get_sessions_for_user(user.username) == [first.session]
+    assert first.session.last_activity_time == start_time + timedelta(minutes=55)
+
+
+def test_bootstrap_macos_interactive_session_gets_linux_shaped_logon_jitter() -> None:
+    """macOS interactive logons should use the same timing bucket as Linux, not Windows."""
+    scenario = _make_macos_scenario()
+    world_model = WorldModel(scenario, "corp.local")
+    state_manager = StateManager()
+    zeek = Mock()
+    zeek.can_handle.return_value = True
+    mock_emitters = {"zeek_conn": zeek}
+    dispatcher = EventDispatcher(state_manager=state_manager, emitters=mock_emitters)
+    activity_generator = ActivityGenerator(state_manager, mock_emitters, dispatcher=dispatcher)
+    activity_generator._ad_domain = world_model.ad_domain
+    activity_generator._ip_to_system = dict(world_model.systems_by_ip)
+    activity_generator._all_system_ips = [s.ip for s in scenario.environment.systems]
+    planner = WorldPlanner(world_model, state_manager, activity_generator)
+
+    user = scenario.environment.users[0]
+    target_system = scenario.environment.systems[0]
+    activity_time = datetime(2024, 1, 15, 10, 5, 0, tzinfo=UTC)
+
+    result = planner.bootstrap_user_session(
+        user=user,
+        target_system=target_system,
+        time=activity_time,
+        rng=random.Random(11),
+        session_kind="interactive",
+        allow_existing=False,
+    )
+
+    logon_gap = (activity_time - result.session.start_time).total_seconds()
+    # Linux/macOS interactive bootstrap widens the pre-activity logon gap to
+    # 7-15s (vs. 0.5-5s for the bare Windows default) to leave room for
+    # source-native session-bootstrap sequencing.
+    assert 7.0 <= logon_gap <= 15.0

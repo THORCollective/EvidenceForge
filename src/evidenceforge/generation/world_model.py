@@ -317,7 +317,7 @@ class WorldModel:
             if any(hint in hostname_lower for hint in hints):
                 roles.add(role_name)
 
-        supports_ssh = os_category == "linux"
+        supports_ssh = os_category in ("linux", "macos")
         supports_rdp = os_category == "windows" and system.type in ("server", "domain_controller")
 
         return HostWorld(
@@ -352,6 +352,11 @@ class WorldModel:
             if host.is_server:
                 services.append("smb-server")
             return services
+        if host.os_category == "macos":
+            # macOS has no generic Linux-style syslog daemon; it relies on
+            # DNS/NTP clients plus its own unified logging (log(1)/OSLog) and
+            # directory-services client for domain-joined lookups.
+            return ["dns-client", "ntp-client", "unified-logging", "opendirectoryd"]
         return ["dns-client", "ntp-client", "syslog"]
 
     def _build_proxy_routes(self) -> dict[str, list[System]]:
@@ -833,15 +838,22 @@ class WorldPlanner:
             required_until=required_until,
         ).session
 
-    def _find_windows_interactive_session(
+    def _find_reusable_interactive_session(
         self,
         username: str,
         target_system: System,
         at_time: datetime,
     ) -> ActiveSession | None:
-        """Return a durable same-user Windows interactive session, if one exists."""
+        """Return a durable same-user interactive session, if one exists.
+
+        Windows and macOS both model a single long-lived desktop logon
+        (winlogon-rooted / loginwindow-rooted, respectively) that persists
+        across many activities rather than being re-established each time.
+        Linux is intentionally excluded — its interactive sessions are not
+        modeled with the same durable-desktop-session semantics here.
+        """
         host = self.world_model.hosts.get(target_system.hostname)
-        if host is None or host.os_category != "windows":
+        if host is None or host.os_category not in ("windows", "macos"):
             return None
 
         cutoff = at_time.replace(tzinfo=UTC) if at_time.tzinfo is None else at_time.astimezone(UTC)
@@ -871,7 +883,7 @@ class WorldPlanner:
         required_until: datetime | None = None,
     ) -> SessionBootstrapResult:
         if allow_existing and session_kind in (None, "interactive"):
-            existing_interactive = self._find_windows_interactive_session(
+            existing_interactive = self._find_reusable_interactive_session(
                 user.username,
                 target_system,
                 time,
@@ -943,7 +955,10 @@ class WorldPlanner:
             # process evidence. Give that source-native sequence room before
             # the first user-visible command tied to the session.
             logon_time = time - timedelta(seconds=rng.uniform(6.0, 12.0))
-        elif plan.session_kind == "interactive" and _get_os_category(target_system.os) == "linux":
+        elif plan.session_kind == "interactive" and _get_os_category(target_system.os) in (
+            "linux",
+            "macos",
+        ):
             logon_time = time - timedelta(seconds=rng.uniform(7.0, 15.0))
         else:
             logon_time = time - timedelta(seconds=rng.uniform(0.5, 5.0))
