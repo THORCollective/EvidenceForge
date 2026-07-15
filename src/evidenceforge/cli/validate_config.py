@@ -390,7 +390,7 @@ def validate_config() -> ValidationResult:
             "dict_fields": {"role_traffic", "persona_traffic"},
         },
         "activity/spawn_rules.yaml": {
-            "dict_fields": {"windows", "linux"},
+            "dict_fields": {"windows", "linux", "macos"},
         },
         "activity/proxy_uri_templates.yaml": {
             "dict_fields": {"domains", "tags", "generic", "search_terms"},
@@ -1340,7 +1340,7 @@ def validate_config() -> ValidationResult:
                         )
                     )
                     continue
-                for os_name in ("windows", "linux"):
+                for os_name in ("windows", "linux", "macos"):
                     os_profile = profile_data.get(os_name)
                     if not isinstance(os_profile, dict):
                         result.issues.append(
@@ -2689,7 +2689,11 @@ def validate_config() -> ValidationResult:
 
     # spawn_rules.yaml: spawn rule entries
     all_spawn_entries = []
-    for os_rules in [spawn_data.get("windows", {}), spawn_data.get("linux", {})]:
+    for os_rules in [
+        spawn_data.get("windows", {}),
+        spawn_data.get("linux", {}),
+        spawn_data.get("macos", {}),
+    ]:
         for _parent, parent_data in os_rules.items():
             if isinstance(parent_data, dict):
                 all_spawn_entries.append(parent_data)

@@ -2775,3 +2775,112 @@ class TestValidateConfig:
             and "kube-probe only with a Kubernetes-scoped source_role_any" in issue.message
             for issue in result.issues
         )
+
+    def test_validate_config_accepts_macos_spawn_rules_overlay(self, monkeypatch, tmp_path):
+        from evidenceforge.config import overlay
+
+        overlay_dir = tmp_path / ".eforge" / "config"
+        (overlay_dir / "activity").mkdir(parents=True)
+        (overlay_dir / "activity" / "spawn_rules.yaml").write_text(
+            "macos:\n  launchd:\n    children: [Finder]\n"
+        )
+
+        monkeypatch.setattr(overlay, "get_overlay_directory", lambda: overlay_dir)
+
+        result = validate_config()
+
+        assert not any(
+            issue.file == "overlay/activity/spawn_rules.yaml"
+            and "Unexpected top-level key" in issue.message
+            for issue in result.issues
+        )
+
+    def test_validate_config_rejects_invalid_macos_endpoint_clock_profile(self, monkeypatch):
+        from evidenceforge.generation.activity import timing_profiles
+
+        def load_invalid_timing_profiles():
+            return {
+                "relationships": {
+                    "network.dns_before_tcp": {
+                        "class": "causal_prerequisite",
+                        "position": "before",
+                        "min_ms": 20,
+                        "max_ms": 1500,
+                    }
+                },
+                "endpoint_clock": {
+                    "profiles": {
+                        "complete": {
+                            "windows": {
+                                "host_offset_ms": {"min": 0, "max": 0},
+                                "host_drift_ppm": {"min": 0, "max": 0},
+                            },
+                            "linux": {
+                                "host_offset_ms": {"min": 0, "max": 0},
+                                "host_drift_ppm": {"min": 0, "max": 0},
+                            },
+                            "macos": {
+                                "host_offset_ms": {"min": 10, "max": 0},
+                                "host_drift_ppm": {"min": 0, "max": 0},
+                            },
+                        }
+                    }
+                },
+                "windows_event_time": {
+                    "collision_spacing": {
+                        "near_zero_until": 25,
+                        "near_gap_min_us": 50,
+                        "near_gap_max_us": 500,
+                        "large_gap_min_ms": 1000,
+                        "large_gap_max_ms": 4000,
+                    }
+                },
+                "network_sensor_observation": {
+                    "default_profile": "well_synced",
+                    "profiles": {
+                        "well_synced": {
+                            "clock_skew_us": {"min": -4000, "max": 4000},
+                            "path_delay_us": {"min": 250, "max": 8000},
+                        }
+                    },
+                },
+            }
+
+        monkeypatch.setattr(timing_profiles, "load_timing_profiles", load_invalid_timing_profiles)
+
+        result = validate_config()
+
+        assert any(
+            issue.severity == "ERROR"
+            and issue.file == "timing_profiles.yaml"
+            and "endpoint_clock.profiles.complete.macos.host_offset_ms.max must be >= min"
+            in issue.message
+            for issue in result.issues
+        )
+
+    def test_validate_config_rejects_invalid_macos_spawn_rule_entry(self, monkeypatch):
+        from evidenceforge.generation.activity import spawn_rules
+
+        real_loader = spawn_rules.load_spawn_rules
+
+        def load_invalid_spawn_rules():
+            data = real_loader()
+            return {
+                **data,
+                "macos": {
+                    **data.get("macos", {}),
+                    "bad_macos_parent": {
+                        "children": ["Finder"],
+                        # Missing required "lifetime" and "command_templates" fields.
+                    },
+                },
+            }
+
+        monkeypatch.setattr(spawn_rules, "load_spawn_rules", load_invalid_spawn_rules)
+
+        result = validate_config()
+
+        assert any(
+            issue.severity == "ERROR" and issue.file == "spawn_rules.yaml"
+            for issue in result.issues
+        )
