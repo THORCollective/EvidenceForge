@@ -77,6 +77,10 @@ scenarios/llm-injection-demo/*
 !scenarios/llm-injection-demo/scenario.yaml
 !scenarios/llm-injection-demo/scenario-clean.yaml
 !scenarios/llm-injection-demo/README.md
+!scenarios/macos-eslogger-demo/
+scenarios/macos-eslogger-demo/*
+!scenarios/macos-eslogger-demo/scenario.yaml
+!scenarios/macos-eslogger-demo/README.md
 
 
 # Scan / analysis tool output

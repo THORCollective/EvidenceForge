@@ -1,0 +1,223 @@
+version: "1.0"
+name: macos-eslogger-demo
+description: |
+  Three macOS threat-hunt beats rendered as authentic Endpoint Security (ESF)
+  telemetry via the `eslogger` emitter, with Zeek network telemetry for
+  cross-source egress correlation. This is the reference hunt-loop artifact for
+  the OBTS macOS Endpoint Security talk.
+
+  Three real-world-modeled hunts run on three macOS workstations:
+    1. AMOS / Atomic Stealer  — a trojanized "CleanMyMac X" installer payload
+       (unsigned/ad-hoc) execs signed /usr/bin/osascript to show a fake password
+       prompt, reads ~/Library/Keychains/login.keychain-db, and exfiltrates over
+       TLS. The dropper's unsigned code-signing identity + keychain access +
+       egress are the signal; osascript stays legitimately Apple-signed.
+    2. DPRK BeaverTail        — `npm install` of a malicious package whose
+       postinstall script launches `node`, which beacons to attacker
+       infrastructure (correlated in Zeek conn/dns).
+    3. CloudMensis persistence — an unsigned helper drops a LaunchAgent plist
+       under ~/Library/LaunchAgents; the BTM (Background Task Management)
+       launch-item-add event is produced automatically by the causal engine.
+
+  See README.md for the per-hunt evidence and self-verification recipe.
+
+environment:
+  description: "Small design/engineering shop: three macOS workstations behind a monitored egress"
+  domain: "clearwater-studio.test"
+
+  users:
+    - username: dana.reyes
+      full_name: "Dana Reyes"
+      email: "dana.reyes@clearwater-studio.test"
+      persona: marketing
+      primary_system: MAC-DESIGN-01
+      enabled: true
+    - username: sam.okafor
+      full_name: "Sam Okafor"
+      email: "sam.okafor@clearwater-studio.test"
+      persona: developer
+      primary_system: MAC-DEV-01
+      enabled: true
+    - username: riley.chen
+      full_name: "Riley Chen"
+      email: "riley.chen@clearwater-studio.test"
+      persona: sysadmin
+      primary_system: MAC-IT-01
+      enabled: true
+
+  systems:
+    - hostname: MAC-DESIGN-01
+      ip: "10.20.10.31"
+      os: "macOS 14.5"
+      type: workstation
+      assigned_user: dana.reyes
+    - hostname: MAC-DEV-01
+      ip: "10.20.10.32"
+      os: "macOS 14.5"
+      type: workstation
+      assigned_user: sam.okafor
+      services: ["ssh"]
+    - hostname: MAC-IT-01
+      ip: "10.20.10.33"
+      os: "macOS 14.5"
+      type: workstation
+      assigned_user: riley.chen
+      services: ["ssh"]
+
+  # A core SPAN sensor so Zeek records the macOS hosts' egress. The eslogger
+  # emitter deliberately renders no network events (ESF has no TCP-connect
+  # event), so BeaverTail's `node` beacon and AMOS's exfil POST are hunted by
+  # correlating ES `exec` with the Zeek conn/dns rows for the same host.
+  network:
+    segments:
+      - name: mac-workstations
+        cidr: "10.20.10.0/24"
+        description: "macOS workstation segment"
+        exposure: both
+        external_ratio: 0.5
+        systems: [MAC-DESIGN-01, MAC-DEV-01, MAC-IT-01]
+    sensors:
+      - type: network
+        name: core-span
+        hostname: ZEEK-CORE
+        monitoring_segments: [mac-workstations]
+        direction: bidirectional
+        placement: span
+        log_formats: [zeek]
+        description: "Core switch SPAN for macOS egress visibility"
+
+time_window:
+  start: "2024-06-11T14:00:00Z"
+  duration: "2h"
+
+baseline_activity:
+  description: "Modest business-day macOS activity (app launches, zsh, browsing) so the hunts have realistic noise to stand out from"
+  intensity: low
+  variation: low
+
+output:
+  logs:
+    - format: eslogger
+    - format: zeek
+  destination: "./output"
+  compression: false
+
+storyline:
+  # --- Hunt 1: AMOS / Atomic Stealer -------------------------------------------
+  # The trojanized "CleanMyMac X" installer payload is the unsigned/ad-hoc
+  # dropper process (per the macos_signing.yaml AMOS convention). It owns the
+  # keychain read and the TLS exfil; it execs the genuine, Apple-signed
+  # /usr/bin/osascript only to render the fake system-password prompt.
+  #
+  # Emission order puts the credential-theft + exfil (attributed to the dropper,
+  # the last-recorded storyline process) immediately after the dropper exec, so
+  # both carry the dropper's unsigned identity — not osascript's. The osascript
+  # password prompt is a signed child that fires last.
+  - id: amos-infection
+    time: "+22m"
+    actor: dana.reyes
+    system: MAC-DESIGN-01
+    activity: "AMOS/Atomic Stealer: fake CleanMyMac X installer harvests the login keychain and exfiltrates over TLS, prompting for the user password via osascript"
+    events:
+      - type: process
+        technique: "T1204.002 - User Execution: Malicious File"
+        description: "Trojanized, unnotarized CleanMyMac X installer payload (unsigned/ad-hoc) launches"
+        process_name: "/Applications/CleanMyMacX Helper.app/Contents/MacOS/CleanMyMacX Helper"
+        command_line: "/Applications/CleanMyMacX\\ Helper.app/Contents/MacOS/CleanMyMacX\\ Helper"
+        process_ref: amos_dropper
+      - type: file
+        technique: "T1555.001 - Credentials from Password Stores: Keychain"
+        description: "Dropper opens the user login keychain to harvest stored secrets"
+        path: "/Users/dana.reyes/Library/Keychains/login.keychain-db"
+        action: open
+      - type: connection
+        technique: "T1041 - Exfiltration Over C2 Channel"
+        description: "Dropper exfiltrates the harvested keychain + browser data over TLS to the stealer panel"
+        dst_ip: "193.42.33.14"
+        dst_port: 443
+        hostname: "gateway.macos-analytics.top"
+        service: ssl
+        orig_bytes: 2450000
+        resp_bytes: 640
+      - type: process
+        technique: "T1059.002 - Command and Scripting Interpreter: AppleScript"
+        description: "Dropper execs the genuine Apple-signed osascript to render a fake system-password dialog"
+        process_name: "/usr/bin/osascript"
+        command_line: "osascript -e \"display dialog \\\"macOS needs your password to update system settings.\\\" default answer \\\"\\\" with hidden answer with icon caution\""
+        parent_ref: amos_dropper
+
+  # --- Hunt 2: DPRK BeaverTail --------------------------------------------------
+  # A developer runs `npm install` of an attacker-controlled package; its
+  # postinstall script spawns `node`, which beacons to attacker infrastructure.
+  - id: beavertail-npm-postinstall
+    time: "+51m"
+    actor: sam.okafor
+    system: MAC-DEV-01
+    activity: "DPRK BeaverTail: npm install of a malicious package runs a postinstall script that launches node, which beacons to attacker infrastructure"
+    events:
+      - type: process
+        technique: "T1195.001 - Supply Chain Compromise: Compromise Software Dependencies and Development Tools"
+        description: "Developer installs a trojanized npm package; npm runs its postinstall lifecycle script"
+        process_name: "/usr/local/bin/npm"
+        command_line: "npm install @clearwater-ui/react-icons-pro"
+        process_ref: npm_install
+      - type: process
+        technique: "T1059.007 - Command and Scripting Interpreter: JavaScript"
+        description: "Malicious postinstall spawns node to run the BeaverTail stage-1 loader"
+        process_name: "/usr/local/bin/node"
+        command_line: "node /Users/sam.okafor/dev/webapp/node_modules/@clearwater-ui/react-icons-pro/scripts/postinstall.js"
+        parent_ref: npm_install
+      - type: connection
+        technique: "T1071.001 - Application Layer Protocol: Web Protocols"
+        description: "node stage-1 loader beacons to attacker infrastructure to pull the stage-2 payload"
+        dst_ip: "45.128.199.72"
+        dst_port: 443
+        hostname: "api.ipcheck-beaver.cc"
+        service: ssl
+        orig_bytes: 1800
+        resp_bytes: 96000
+
+  # --- Hunt 3: CloudMensis-style persistence -----------------------------------
+  # An unsigned helper drops a LaunchAgent plist. Do NOT declare the BTM event
+  # here: the causal engine emits btm_launch_item_add automatically because the
+  # file `create` lands under LaunchAgents.
+  - id: cloudmensis-persistence
+    time: "+86m"
+    actor: riley.chen
+    system: MAC-IT-01
+    activity: "CloudMensis-style persistence: an unsigned helper writes a masquerading LaunchAgent plist (BTM launch-item-add follows automatically)"
+    events:
+      - type: process
+        technique: "T1543.001 - Create or Modify System Process: Launch Agent"
+        description: "Unsigned persistence helper stages itself under /Users/Shared"
+        process_name: "/Users/Shared/.cloudsync/cloudsyncd"
+        command_line: "/Users/Shared/.cloudsync/cloudsyncd --install"
+        process_ref: cloudmensis_helper
+      - type: file
+        technique: "T1543.001 - Create or Modify System Process: Launch Agent"
+        description: "Helper drops a LaunchAgent plist masquerading as an Apple iCloud sync daemon (drives the BTM causal rule)"
+        path: "/Users/riley.chen/Library/LaunchAgents/com.apple.cloudsyncd.plist"
+        action: create
+
+  # --- Supporting: legitimate admin SSH (exercises openssh_login + openssh_logout) --
+  # A complete SSH session lifecycle: login on the macOS destination (rendered as
+  # an ES `openssh_login`) followed by an explicit logoff (rendered as
+  # `openssh_logout`) so the pair is observable end-to-end.
+  - id: it-admin-ssh-login
+    time: "+95m"
+    actor: riley.chen
+    system: MAC-DEV-01
+    activity: "IT admin SSHes to the developer workstation for routine maintenance"
+    events:
+      - type: ssh_session
+        technique: "T1021.004 - Remote Services: SSH"
+        description: "Benign remote admin session (baseline-style operational activity)"
+        source_ip: "10.20.10.33"
+  - id: it-admin-ssh-logoff
+    time: "+104m"
+    actor: riley.chen
+    system: MAC-DEV-01
+    activity: "IT admin closes the SSH maintenance session"
+    events:
+      - type: logoff
+        description: "SSH session close (renders as ES openssh_logout on the macOS host)"
