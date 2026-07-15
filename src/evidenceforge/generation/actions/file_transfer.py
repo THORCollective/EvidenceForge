@@ -809,6 +809,18 @@ class StagedArchiveSmbReadActionBundle:
                 storyline_origin=True,
             )
         )
+        # macOS BTM: a plist staged under LaunchAgents/LaunchDaemons registers a
+        # launch item via causal expansion. Cheap no-op for every other path.
+        btm_hook = getattr(self._executor.activity_generator, "_maybe_expand_file_create", None)
+        if callable(btm_hook):
+            btm_hook(
+                file_path=source_path,
+                time=file_time,
+                system=self._request.source_system,
+                actor=self._request.actor,
+                pid=self._request.source_pid,
+                process_image=self._request.source_process,
+            )
         return file_time
 
     def _terminate_source_process(
@@ -1110,6 +1122,18 @@ class ScpReceiverFileActionBundle:
                 storyline_origin=True,
             )
         )
+        # macOS BTM: a plist scp'd into LaunchAgents/LaunchDaemons on the
+        # receiver registers a launch item. Cheap no-op for every other path.
+        btm_hook = getattr(self._executor.activity_generator, "_maybe_expand_file_create", None)
+        if callable(btm_hook):
+            btm_hook(
+                file_path=self._request.target_path,
+                time=file_time,
+                system=self._request.target_system,
+                actor=self._request.actor,
+                pid=sshd_pid,
+                process_image="/usr/sbin/sshd",
+            )
 
     def _emit_source_file_read(self) -> None:
         """Emit sender-side file-read evidence owned by the SCP client process."""

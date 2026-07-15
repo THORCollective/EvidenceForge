@@ -21,6 +21,13 @@ relationships:
     position: before
     min_ms: 40
     max_ms: 350
+  macos.btm_after_plist_create:
+    # BTM (btmd) observes a launch-item plist registration shortly after the
+    # file lands on disk. Consequent of a LaunchAgents/LaunchDaemons file_create.
+    class: source_latency
+    position: after
+    min_ms: 50
+    max_ms: 1200
   process.remote_thread_lsass_access:
     class: source_latency
     position: before

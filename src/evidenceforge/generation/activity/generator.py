@@ -8843,6 +8843,7 @@ class ActivityGenerator:
             command_line=kwargs.get("command_line"),
             process_name=kwargs.get("process_name"),
             os_category=kwargs.get("os_category"),
+            file_path=kwargs.get("file_path"),
             hostname=kwargs.get("hostname"),
             source_system=kwargs.get("source_system"),
             target_system=kwargs.get("target_system"),
@@ -8917,6 +8918,113 @@ class ActivityGenerator:
                 method(**ev.kwargs)
         finally:
             self._expanding_types.discard(event_type)
+
+    def _maybe_expand_file_create(
+        self,
+        *,
+        file_path: str,
+        time: datetime,
+        system: System,
+        actor: User | None = None,
+        pid: int | None = None,
+        process_image: str | None = None,
+    ) -> None:
+        """Hot-path-safe causal-expansion hook for file_create dispatch sites.
+
+        ``file_create`` is one of the hottest dispatch paths in the generator
+        (baseline noise, EDR side effects, storyline drops, transfers), so this
+        hook applies a cheap path-substring pre-check *before* building an
+        ``ExpansionContext``. The only file_create expansion rule today is the
+        macOS BTM consequent (``btm_launch_item_add``) for
+        LaunchAgents/LaunchDaemons plist drops, so the pre-check keeps the hook
+        effectively free — no context allocation, no engine call — for every
+        other file_create in the system.
+        """
+        if system is None:
+            return
+        if "LaunchAgents" not in file_path and "LaunchDaemons" not in file_path:
+            return
+        self._expand_and_emit(
+            "file_create",
+            time,
+            file_path=file_path,
+            target_system=system,
+            actor=actor,
+            source_pid=pid,
+            source_image=process_image,
+            os_category=_get_os_category(system.os),
+        )
+
+    def _emit_btm_launch_item_add(
+        self,
+        *,
+        system: System,
+        plist_path: str,
+        time: datetime,
+        actor: User | None = None,
+        pid: int | None = None,
+        process_image: str | None = None,
+    ) -> None:
+        """Emit a macOS BTM ``btm_launch_item_add`` event (Endpoint Security only).
+
+        Consequent of a LaunchAgents/LaunchDaemons plist create, invoked by the
+        causal expansion engine (see ``PlistCreateBeforeBtmLaunchItem``). This is
+        an eslogger-only event type; no other emitter renders it. It reuses the
+        canonical file/process/host contexts of the triggering plist create so
+        the BTM record agrees with the file_create by construction.
+        """
+        if system is None:
+            return
+        host_ctx = self._build_host_context(system)
+        username = actor.username if actor is not None else ""
+        actor_id = ""
+        proc_ctx: ProcessContext | None = None
+        running_proc = (
+            self.state_manager.get_process(system.hostname, pid)
+            if isinstance(pid, int) and pid > 0
+            else None
+        )
+        if running_proc is not None:
+            proc_ctx = ProcessContext(
+                pid=running_proc.pid,
+                parent_pid=running_proc.parent_pid,
+                image=running_proc.image,
+                command_line=running_proc.command_line,
+                username=running_proc.username,
+                logon_id=running_proc.logon_id,
+                start_time=running_proc.start_time,
+            )
+            actor_id = self.state_manager.get_process_object_id(system.hostname, running_proc.pid)
+            if not username:
+                username = running_proc.username
+        elif process_image is not None:
+            proc_ctx = ProcessContext(
+                pid=pid or 0,
+                parent_pid=0,
+                image=process_image,
+                command_line=process_image,
+                username=username,
+            )
+        self.dispatcher.dispatch(
+            SecurityEvent(
+                timestamp=time,
+                event_type="btm_launch_item_add",
+                src_host=host_ctx,
+                auth=AuthContext(username=username) if username else None,
+                process=proc_ctx,
+                file=FileContext(path=plist_path, action="create", pid=pid or 0),
+                edr=EdrContext(
+                    object_id=stable_uuid(
+                        "btm-launch-item-add",
+                        system.hostname,
+                        plist_path,
+                        time.isoformat(),
+                    ),
+                    actor_id=actor_id,
+                ),
+                storyline_origin=True,
+            )
+        )
 
     def generate_logon(
         self,
@@ -11313,6 +11421,16 @@ class ActivityGenerator:
                         ),
                         storyline_origin=from_storyline,
                     )
+                )
+                # macOS BTM: a plist landing under LaunchAgents/LaunchDaemons
+                # registers a launch item. Cheap no-op for every other path.
+                self._maybe_expand_file_create(
+                    file_path=process_name,
+                    time=file_create_time,
+                    system=system,
+                    actor=user,
+                    pid=file_process_pid,
+                    process_image=file_process_image,
                 )
 
         # Phase 8.2: Probabilistic EDR object diversity via canonical SecurityEvent

@@ -175,6 +175,61 @@ class DnsBeforeConnection(ExpansionRule):
 
 
 @dataclass
+class PlistCreateBeforeBtmLaunchItem(ExpansionRule):
+    """Emit a macOS BTM launch-item-add after a LaunchAgents/LaunchDaemons plist create.
+
+    When a property list is created under a macOS ``LaunchAgents`` or
+    ``LaunchDaemons`` directory, the Background Task Management (BTM) subsystem
+    records a ``btm_launch_item_add`` Endpoint Security event. This consequent is
+    generated automatically so scenario authors do not have to specify it
+    manually (mirrors how ``btmd`` observes persistence registration on real
+    hosts).
+
+    ``matches()`` is intentionally a cheap attribute/substring gate (no I/O, no
+    RNG). ``file_create`` is one of the hottest dispatch paths in the generator,
+    so the rule fires only for a macOS file_create whose path lives under a
+    launch-item directory; every other file_create returns immediately.
+    """
+
+    name: str = field(default="plist_create_before_btm_launch_item")
+    description: str = field(
+        default="Emit macOS btm_launch_item_add after LaunchAgents/LaunchDaemons plist create"
+    )
+    priority: int = field(default=15)
+
+    def matches(self, event_type: str, ctx: ExpansionContext) -> bool:
+        return (
+            event_type == "file_create"
+            and ctx.os_category == "macos"
+            and ctx.file_path is not None
+            and ("LaunchAgents" in ctx.file_path or "LaunchDaemons" in ctx.file_path)
+        )
+
+    def expand(self, event_type: str, ctx: ExpansionContext) -> list[ExpandedEvent]:
+        from evidenceforge.generation.causal.engine import ExpandedEvent
+
+        return [
+            ExpandedEvent(
+                method="_emit_btm_launch_item_add",
+                kwargs={
+                    "system": ctx.target_system or ctx.source_system,
+                    "plist_path": ctx.file_path,
+                    "actor": ctx.actor,
+                    "pid": ctx.source_pid,
+                    "process_image": ctx.source_image,
+                },
+                timing=_timing_spec(
+                    "macos.btm_after_plist_create",
+                    default_min_ms=50,
+                    default_max_ms=1200,
+                    default_position="after",
+                ),
+                description="btm_launch_item_add after LaunchAgents/LaunchDaemons plist create",
+            )
+        ]
+
+
+@dataclass
 class ProcessAccessAfterRemoteThread(ExpansionRule):
     """Emit Sysmon Event 10 (ProcessAccess) before CreateRemoteThread.
 

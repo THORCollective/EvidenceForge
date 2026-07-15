@@ -35,6 +35,7 @@ from evidenceforge.generation.causal.rules import (
     DnsBeforeConnection,
     ExpansionRule,
     KerberosBeforeLogon,
+    PlistCreateBeforeBtmLaunchItem,
     ProcessAccessAfterRemoteThread,
     SupplementaryAuditEvents,
 )
@@ -334,6 +335,126 @@ class TestDefaultRegistry:
         rules = default_rules()
         names = [r.name for r in rules]
         assert "kerberos_before_logon" in names
+
+    def test_btm_rule_in_defaults(self):
+        from evidenceforge.generation.causal.registry import default_rules
+
+        rules = default_rules()
+        names = [r.name for r in rules]
+        assert "plist_create_before_btm_launch_item" in names
+
+
+# --- PlistCreateBeforeBtmLaunchItem rule ---
+
+
+class TestPlistCreateBeforeBtmLaunchItem:
+    def test_matches_launchagents_plist_on_macos(self):
+        rule = PlistCreateBeforeBtmLaunchItem()
+        ctx = _make_ctx(
+            event_type="file_create",
+            os_category="macos",
+            file_path="/Users/jappleseed/Library/LaunchAgents/com.evil.agent.plist",
+        )
+        assert rule.matches("file_create", ctx) is True
+
+    def test_matches_launchdaemons_plist_on_macos(self):
+        rule = PlistCreateBeforeBtmLaunchItem()
+        ctx = _make_ctx(
+            event_type="file_create",
+            os_category="macos",
+            file_path="/Library/LaunchDaemons/com.evil.daemon.plist",
+        )
+        assert rule.matches("file_create", ctx) is True
+
+    def test_skips_non_macos_os(self):
+        """A Linux/Windows file_create must never fire BTM, even with a matching path."""
+        rule = PlistCreateBeforeBtmLaunchItem()
+        ctx = _make_ctx(
+            event_type="file_create",
+            os_category="linux",
+            file_path="/opt/LaunchAgents/com.evil.plist",
+        )
+        assert rule.matches("file_create", ctx) is False
+
+    def test_skips_ordinary_path(self):
+        rule = PlistCreateBeforeBtmLaunchItem()
+        ctx = _make_ctx(
+            event_type="file_create",
+            os_category="macos",
+            file_path="/Users/jappleseed/Downloads/report.pdf",
+        )
+        assert rule.matches("file_create", ctx) is False
+
+    def test_skips_none_path(self):
+        rule = PlistCreateBeforeBtmLaunchItem()
+        ctx = _make_ctx(event_type="file_create", os_category="macos", file_path=None)
+        assert rule.matches("file_create", ctx) is False
+
+    def test_skips_non_file_create_event(self):
+        rule = PlistCreateBeforeBtmLaunchItem()
+        ctx = _make_ctx(
+            event_type="connection",
+            os_category="macos",
+            file_path="/Library/LaunchDaemons/com.evil.daemon.plist",
+        )
+        assert rule.matches("connection", ctx) is False
+
+    def test_expand_returns_single_after_btm_event(self):
+        rule = PlistCreateBeforeBtmLaunchItem()
+        plist = "/Users/jappleseed/Library/LaunchAgents/com.evil.agent.plist"
+        ctx = _make_ctx(
+            event_type="file_create",
+            os_category="macos",
+            file_path=plist,
+            target_system="MAC-01",
+            actor="jappleseed",
+            source_pid=501,
+            source_image="/usr/bin/curl",
+        )
+        result = rule.expand("file_create", ctx)
+        assert len(result) == 1
+        ev = result[0]
+        assert ev.method == "_emit_btm_launch_item_add"
+        assert ev.timing.position == "after"
+        assert ev.kwargs["plist_path"] == plist
+        assert ev.kwargs["system"] == "MAC-01"
+        assert ev.kwargs["actor"] == "jappleseed"
+        assert ev.kwargs["pid"] == 501
+        assert ev.kwargs["process_image"] == "/usr/bin/curl"
+
+    def test_expand_falls_back_to_source_system(self):
+        rule = PlistCreateBeforeBtmLaunchItem()
+        ctx = _make_ctx(
+            event_type="file_create",
+            os_category="macos",
+            file_path="/Library/LaunchDaemons/com.evil.daemon.plist",
+            target_system=None,
+            source_system="MAC-02",
+        )
+        result = rule.expand("file_create", ctx)
+        assert result[0].kwargs["system"] == "MAC-02"
+
+    def test_engine_returns_empty_for_ordinary_file_create_fast(self):
+        """Hot-path guard: an ordinary file_create expands to nothing quickly.
+
+        file_create is one of the highest-volume dispatch paths, so this asserts
+        the rule adds no meaningful work for the common (non-plist) case.
+        """
+        engine = CausalExpansionEngine()
+        ordinary = _make_ctx(
+            event_type="file_create",
+            os_category="macos",
+            file_path="/Users/jappleseed/Documents/notes.txt",
+        )
+        import time as _time
+
+        start = _time.perf_counter()
+        for _ in range(50_000):
+            assert engine.expand("file_create", ordinary) == []
+        elapsed = _time.perf_counter() - start
+        # 50k non-matching expansions should be trivially fast (well under 1s);
+        # matches() is pure attribute/substring checks with no allocation.
+        assert elapsed < 2.0
 
 
 # --- KerberosBeforeLogon rule ---

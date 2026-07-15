@@ -3273,6 +3273,19 @@ class StorylineMixin:
                         storyline_origin=True,
                     )
                 )
+                # macOS BTM: a plist written under LaunchAgents/LaunchDaemons
+                # registers a launch item via causal expansion. Cheap no-op for
+                # every other output-file path.
+                btm_hook = getattr(self.activity_generator, "_maybe_expand_file_create", None)
+                if callable(btm_hook):
+                    btm_hook(
+                        file_path=output_file,
+                        time=file_time,
+                        system=system,
+                        actor=process_actor,
+                        pid=pid,
+                        process_image=process_name,
+                    )
                 malicious_event["output_file"] = output_file
 
             http_url = self._extract_http_url(command_line)
