@@ -76,6 +76,40 @@ class TestStateManagerInit:
         assert earlier_id < later_id
         assert later_id - earlier_id < 600
 
+    def test_macos_audit_session_ids_are_monotonic_and_asid_ranged(self):
+        """macOS ES audit session ids (asid) should be a per-host monotonic sequence."""
+        import random
+
+        sm = StateManager()
+        start = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+        rng = random.Random(11)
+
+        first = sm.next_macos_audit_session_id("mac01", rng, start)
+        second = sm.next_macos_audit_session_id("mac01", rng, start + timedelta(minutes=5))
+        third = sm.next_macos_audit_session_id("mac01", rng, start + timedelta(minutes=6))
+
+        # Seeded near 100000 (well above the reserved low range), never a small
+        # logind-style number.
+        assert first >= 100000
+        # Strictly increasing per host.
+        assert first < second < third
+
+    def test_macos_audit_session_ids_are_per_host(self):
+        """Each host keeps its own macOS audit-session sequence."""
+        import random
+
+        sm = StateManager()
+        start = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+
+        mac01_first = sm.next_macos_audit_session_id("mac01", random.Random(3), start)
+        mac02_first = sm.next_macos_audit_session_id("mac02", random.Random(3), start)
+
+        assert mac01_first >= 100000
+        assert mac02_first >= 100000
+        # Independent counters advance separately per host.
+        mac01_second = sm.next_macos_audit_session_id("mac01", random.Random(99), start)
+        assert mac01_second > mac01_first
+
     def test_linux_logind_session_ids_do_not_encode_elapsed_seconds(self):
         """Logind session IDs should look like allocator counters, not uptime seconds."""
         import random

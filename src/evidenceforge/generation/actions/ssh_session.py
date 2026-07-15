@@ -205,6 +205,35 @@ class _SshLinuxAuthPlan:
     syslog_seed: tuple[Any, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _SshMacosAuthState:
+    """Source-native macOS SSH authentication lifecycle facts.
+
+    macOS has no ``systemd-logind``; the ES audit-token session id
+    (``audit_session_id``) stands in as the session identity and maps onto
+    ``AuthContext.session_id`` — the same slot the Linux path fills with the
+    logind session id. macOS SSH auth surfaces via ES ``openssh_login`` /
+    ``openssh_logout`` events (rendered by a later eslogger emitter), not
+    syslog, so this state deliberately carries no syslog message content.
+    """
+
+    sshd_pid: int
+    audit_session_id: int
+    seed: tuple[Any, ...]
+    connection_time: datetime
+    login_time: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _SshMacosAuthPlan:
+    """macOS SSH auth ownership that must be known before transport opens."""
+
+    sshd_pid: int
+    conn_delay_ms: int
+    accepted_gap_ms: int
+    seed: tuple[Any, ...]
+
+
 class SshSessionExecutor(Protocol):
     """Adapter protocol implemented by the current activity generator."""
 
@@ -280,6 +309,19 @@ class SshSessionExecutor(Protocol):
         """Return or materialize the source-side SSH client process."""
         ...
 
+    def ensure_macos_ssh_client_process(
+        self,
+        *,
+        user: User,
+        source_system: System,
+        target_system: System,
+        time: datetime,
+        process_image: str,
+        source_port: int,
+    ) -> tuple[int, str] | None:
+        """Return or materialize the source-side macOS SSH client process."""
+        ...
+
     def _remember_ssh_responder_pid(
         self,
         source_ip: str,
@@ -340,22 +382,10 @@ class SshSessionActionBundle:
 
         state = self._plan_transport()
         self._ensure_session_identity(state)
-        auth_plan = self._prepare_linux_auth_plan(state)
-        self._open_transport(
-            state,
-            responding_pid=auth_plan.sshd_pid if auth_plan is not None else self.request.sshd_pid,
-        )
-        planning_event = self._build_session_event(state)
-        auth_state = self._plan_linux_auth(state, planning_event, auth_plan)
-        event = self._build_session_event(state, auth_state)
-        if auth_state is not None:
-            self._dispatch_linux_connection_message(state, event, auth_state)
-            self._mark_edr_login_readiness(state, event, auth_state)
-        self.executor.dispatcher.dispatch(event)
-        if auth_state is not None:
-            self._dispatch_linux_auth_messages(state, event, auth_state)
-            if self.request.emit_session_close:
-                self._dispatch_linux_session_close_lifecycle(state, event, auth_state)
+        if state.dst_host.os_category == "macos":
+            self._execute_macos_destination(state)
+        else:
+            self._execute_linux_destination(state)
 
         logger.debug(
             "Generated SSH session: %s -> %s (UID: %s)",
@@ -364,6 +394,69 @@ class SshSessionActionBundle:
             state.uid,
         )
         return state.uid if state.network_visible else ""
+
+    def _execute_linux_destination(self, state: _SshTransportState) -> None:
+        """Expand and dispatch SSH evidence for a Linux (or non-macOS) destination."""
+
+        auth_plan = self._prepare_linux_auth_plan(state)
+        self._open_transport(
+            state,
+            responding_pid=auth_plan.sshd_pid if auth_plan is not None else self.request.sshd_pid,
+        )
+        planning_event = self._build_session_event(state)
+        auth_state = self._plan_linux_auth(state, planning_event, auth_plan)
+        event = self._build_session_event(
+            state,
+            auth_state.logind_session_id if auth_state is not None else 0,
+        )
+        if auth_state is not None:
+            self._dispatch_linux_connection_message(state, event, auth_state)
+            self._mark_edr_login_readiness(
+                state,
+                event,
+                after_accept_seed=auth_state.syslog_seed,
+                pam_time=auth_state.pam_time,
+                session_floor_time=auth_state.logind_time,
+            )
+        self.executor.dispatcher.dispatch(event)
+        if auth_state is not None:
+            self._dispatch_linux_auth_messages(state, event, auth_state)
+            if self.request.emit_session_close:
+                self._dispatch_linux_session_close_lifecycle(state, event, auth_state)
+
+    def _execute_macos_destination(self, state: _SshTransportState) -> None:
+        """Expand and dispatch SSH evidence for a macOS destination.
+
+        macOS SSH targets get the same canonical TCP/22 transport and base
+        ``ssh_session`` occurrence as Linux, but the session identity is the ES
+        audit-token session id rather than a logind session id. The Linux
+        syslog dispatch (``_dispatch_linux_connection_message`` /
+        ``_dispatch_linux_auth_messages`` / ``_dispatch_linux_session_close_lifecycle``)
+        is deliberately skipped: macOS auth evidence surfaces via ES
+        ``openssh_login`` / ``openssh_logout`` events rendered by a later
+        eslogger emitter, not syslog.
+        """
+
+        auth_plan = self._prepare_macos_auth_plan(state)
+        self._open_transport(
+            state,
+            responding_pid=auth_plan.sshd_pid if auth_plan is not None else self.request.sshd_pid,
+        )
+        planning_event = self._build_session_event(state)
+        auth_state = self._plan_macos_auth(state, planning_event, auth_plan)
+        event = self._build_session_event(
+            state,
+            auth_state.audit_session_id if auth_state is not None else 0,
+        )
+        if auth_state is not None:
+            self._mark_edr_login_readiness(
+                state,
+                event,
+                after_accept_seed=auth_state.seed,
+                pam_time=auth_state.login_time,
+                session_floor_time=auth_state.login_time,
+            )
+        self.executor.dispatcher.dispatch(event)
 
     def _source_os(self) -> str:
         """Return the source OS category used for source-port reservation."""
@@ -490,19 +583,27 @@ class SshSessionActionBundle:
         source_system = self._source_system()
         source_pid = request.source_pid
         source_process_image = request.source_process_image
-        if (
-            source_pid <= 0
-            and source_system is not None
-            and _get_os_category(source_system.os) == "linux"
-        ):
-            client = executor.ensure_linux_ssh_client_process(
-                user=request.user,
-                source_system=source_system,
-                target_system=request.target_system,
-                time=request.time,
-                process_image=source_process_image or "/usr/bin/ssh",
-                source_port=state.source_port,
-            )
+        if source_pid <= 0 and source_system is not None:
+            source_os = _get_os_category(source_system.os)
+            client: tuple[int, str] | None = None
+            if source_os == "linux":
+                client = executor.ensure_linux_ssh_client_process(
+                    user=request.user,
+                    source_system=source_system,
+                    target_system=request.target_system,
+                    time=request.time,
+                    process_image=source_process_image or "/usr/bin/ssh",
+                    source_port=state.source_port,
+                )
+            elif source_os == "macos":
+                client = executor.ensure_macos_ssh_client_process(
+                    user=request.user,
+                    source_system=source_system,
+                    target_system=request.target_system,
+                    time=request.time,
+                    process_image=source_process_image or "/usr/bin/ssh",
+                    source_port=state.source_port,
+                )
             if client is not None:
                 source_pid, source_process_image = client
 
@@ -625,13 +726,18 @@ class SshSessionActionBundle:
     def _build_session_event(
         self,
         state: _SshTransportState,
-        auth_state: _SshLinuxAuthState | None = None,
+        session_id: int = 0,
     ) -> SecurityEvent:
         """Build the canonical SSH session occurrence.
 
         The TCP transport is a separate canonical ``connection`` occurrence owned by
         the network-connection bundle. The SSH session event carries only the
         authentication/session facts needed by endpoint session renderers.
+
+        ``session_id`` is the endpoint session identity attached to
+        ``AuthContext.session_id`` — a ``systemd-logind`` session id for Linux
+        destinations, or the ES audit-token session id for macOS destinations.
+        It defaults to ``0`` for the pre-auth planning event.
         """
 
         request = self.request
@@ -645,7 +751,7 @@ class SshSessionActionBundle:
                 source_ip=request.source_ip,
                 source_port=state.source_port,
                 logon_id=state.logon_id,
-                session_id=auth_state.logind_session_id if auth_state is not None else 0,
+                session_id=session_id,
                 logon_type=10,
             ),
             process=state.source_process,
@@ -734,6 +840,164 @@ class SshSessionActionBundle:
                 request.time.isoformat(),
             ),
         )
+
+    def _prepare_macos_auth_plan(self, state: _SshTransportState) -> _SshMacosAuthPlan | None:
+        """Resolve macOS SSH responder identity before opening canonical transport.
+
+        macOS ships ``sshd`` too, so the destination-side responder process is
+        resolved through the same shared path as Linux; only the downstream
+        session identity (ES audit-token session id) and the absence of syslog
+        dispatch differ.
+        """
+
+        request = self.request
+        if state.dst_host.os_category != "macos":
+            return None
+
+        conn_delay_ms = state.rng.randint(35, 160)
+        if request.auth_method == "publickey":
+            accepted_gap_ms = state.rng.randint(90, 550)
+        else:
+            accepted_gap_ms = state.rng.randint(450, 3500)
+        sshd_pid = self._resolve_responder_pid(state, conn_delay_ms)
+        return _SshMacosAuthPlan(
+            sshd_pid=sshd_pid,
+            conn_delay_ms=conn_delay_ms,
+            accepted_gap_ms=accepted_gap_ms,
+            seed=(
+                request.target_system.hostname,
+                request.source_ip,
+                state.source_port,
+                sshd_pid,
+                request.time.isoformat(),
+            ),
+        )
+
+    def _plan_macos_auth(
+        self,
+        state: _SshTransportState,
+        event: SecurityEvent,
+        plan: _SshMacosAuthPlan | None,
+    ) -> _SshMacosAuthState | None:
+        """Plan macOS SSH auth evidence and destination-side sshd ownership."""
+
+        request = self.request
+        executor = self.executor
+        if plan is None or not event.dst_host or event.dst_host.os_category != "macos":
+            return None
+
+        if state.logon_id:
+            executor.state_manager.update_session_metadata(
+                state.logon_id,
+                transport_pid=plan.sshd_pid,
+            )
+        resolved_times = self._resolve_macos_auth_lifecycle(
+            event=event,
+            seed=plan.seed,
+            conn_delay_ms=plan.conn_delay_ms,
+            accepted_gap_ms=plan.accepted_gap_ms,
+            transport_open_time=state.open_time or request.time,
+        )
+        if request.emit_session_close:
+            self._extend_transport_close_after(
+                state,
+                event,
+                resolved_times["login"] + timedelta(milliseconds=1),
+            )
+        audit_session_id = executor.state_manager.next_macos_audit_session_id(
+            request.target_system.hostname,
+            state.rng,
+            resolved_times["login"],
+        )
+        if state.logon_id:
+            executor.state_manager.update_session_metadata(
+                state.logon_id,
+                session_id=audit_session_id,
+            )
+        return _SshMacosAuthState(
+            sshd_pid=plan.sshd_pid,
+            audit_session_id=audit_session_id,
+            seed=plan.seed,
+            connection_time=resolved_times["connection"],
+            login_time=resolved_times["login"],
+        )
+
+    def _resolve_macos_auth_lifecycle(
+        self,
+        *,
+        event: SecurityEvent,
+        seed: tuple[Any, ...],
+        conn_delay_ms: int,
+        accepted_gap_ms: int,
+        transport_open_time: datetime,
+    ) -> dict[str, datetime]:
+        """Resolve macOS SSH connection/login lifecycle times through the temporal graph.
+
+        macOS has no PAM/logind phases, so only the pre-auth connection moment
+        and the ES ``openssh_login`` moment are modeled. As on Linux, the login
+        moment is held past the source-visible EDR/ES flow observation window so
+        authentication evidence never precedes the transport observation.
+        """
+
+        request = self.request
+        flow_window = get_timing_window(
+            "source.ecar_flow",
+            default_min_ms=40,
+            default_max_ms=300,
+            default_position="after",
+            default_class="source_latency",
+        )
+        canonical_transport_open_time = ensure_utc(transport_open_time)
+        canonical_event_time = ensure_utc(event.timestamp)
+        canonical_offset_ms = max(
+            0,
+            math.ceil(
+                (canonical_event_time - canonical_transport_open_time).total_seconds() * 1000
+            ),
+        )
+        auth_ready_delay_ms = max(
+            conn_delay_ms + accepted_gap_ms,
+            canonical_offset_ms + flow_window.max_ms + 25,
+        )
+        graph = TemporalConstraintGraph()
+        graph.add_node("transport_open", transport_open_time)
+        graph.add_node(
+            "connection",
+            _ssh_syslog_time(
+                transport_open_time,
+                "connection",
+                conn_delay_ms,
+                *seed,
+            ),
+        )
+        graph.add_node(
+            "login",
+            _ssh_syslog_time(
+                transport_open_time,
+                "accepted",
+                auth_ready_delay_ms,
+                *seed,
+            ),
+        )
+        graph.constrain_after(
+            "connection",
+            "transport_open",
+            min_gap=timedelta(milliseconds=conn_delay_ms),
+        )
+        graph.constrain_after(
+            "login",
+            "connection",
+            min_gap=timedelta(milliseconds=max(1, accepted_gap_ms)),
+        )
+        resolved = graph.resolve()
+        logger.debug(
+            "Planned macOS SSH auth graph for %s -> %s: connection=%s login=%s",
+            request.source_ip,
+            event.dst_host.hostname if event.dst_host else request.target_system.hostname,
+            resolved["connection"],
+            resolved["login"],
+        )
+        return resolved
 
     def _resolve_linux_auth_lifecycle(
         self,
@@ -953,14 +1217,24 @@ class SshSessionActionBundle:
         self,
         state: _SshTransportState,
         event: SecurityEvent,
-        auth_state: _SshLinuxAuthState,
+        *,
+        after_accept_seed: tuple[Any, ...],
+        pam_time: datetime,
+        session_floor_time: datetime,
     ) -> None:
-        """Record when EDR/session-owned child evidence may appear."""
+        """Record when EDR/session-owned child evidence may appear.
+
+        The timing mechanism is OS-agnostic: session-owned child evidence must
+        appear after both the source-visible EDR/ES login and the destination
+        session becomes established. Linux passes its PAM/logind lifecycle times;
+        macOS passes its ES ``openssh_login`` time for both, since it has no
+        distinct PAM/logind phases.
+        """
 
         request = self.request
         ecar_after_accept_gap = sample_timing_delta(
             "source.ecar_ssh_session_after_accept",
-            seed_parts=auth_state.syslog_seed,
+            seed_parts=after_accept_seed,
         )
         ecar_seed = (
             "login",
@@ -979,7 +1253,7 @@ class SshSessionActionBundle:
             seed_parts=ecar_seed,
         )
         graph = TemporalConstraintGraph()
-        graph.add_node("pam", auth_state.pam_time)
+        graph.add_node("pam", pam_time)
         graph.add_node("ecar_login", preferred_ecar_login_time)
         graph.constrain_after("ecar_login", "pam", min_gap=ecar_after_accept_gap)
         ecar_login_time = graph.resolved_time("ecar_login")
@@ -994,7 +1268,7 @@ class SshSessionActionBundle:
             f"{request.target_system.hostname}:{request.user.username}:{request.source_ip}:"
             f"{state.source_port}:{state.logon_id}:{request.time.isoformat()}"
         )
-        ready_time = max(ecar_login_time, auth_state.logind_time) + timedelta(
+        ready_time = max(ecar_login_time, session_floor_time) + timedelta(
             milliseconds=80 + (ready_seed % 160)
         )
         self.executor._remember_ssh_session_ready_time(

@@ -71,6 +71,34 @@ def _reset_thread_rng() -> None:
         delattr(_thread_local, "rng")
 
 
+def _seed_macos_launchd(gen, system: System, boot_time: datetime) -> None:
+    """Register a macOS launchd (PID 1) anchor so parent-chain resolution works.
+
+    Production always seeds the macOS process tree before activity; unit tests
+    that exercise macOS source ancestry must provide the launchd root that the
+    parent-chain resolver falls back to.
+    """
+
+    from evidenceforge.models.state import RunningProcess
+
+    sm = gen.state_manager
+    sm.state.running_processes[(system.hostname, 1)] = RunningProcess(
+        pid=1,
+        parent_pid=0,
+        image="/sbin/launchd",
+        command_line="/sbin/launchd",
+        username="root",
+        system=system.hostname,
+        start_time=boot_time,
+        integrity_level="System",
+        ecar_object_id=f"launchd-{system.hostname}",
+    )
+    sm._process_object_ids[(system.hostname, 1)] = f"launchd-{system.hostname}"
+    existing = getattr(gen, "_system_pids", {}) or {}
+    existing[system.hostname] = {"launchd": 1}
+    gen._system_pids = existing
+
+
 def _make_activity_gen() -> tuple[ActivityGenerator, list[SecurityEvent]]:
     """Create ActivityGenerator with mock dependencies that capture dispatched events."""
 
@@ -994,6 +1022,175 @@ class TestSslContextPopulation:
         assert pam_event.timestamp < logind_event.timestamp
         assert pam_event.timestamp < session.source_ready_time
         assert all(event.timestamp < close_time for event in syslog_events)
+
+    def test_ssh_session_bundle_macos_target_uses_audit_session_identity(self, activity_gen):
+        gen, events = activity_gen
+        user = User(username="admin", full_name="Admin User", email="admin@example.com")
+        target = System(
+            hostname="mac01",
+            ip="10.0.30.10",
+            os="macOS 14",
+            type="workstation",
+        )
+        base_time = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+        logon_id = gen.state_manager.create_session(
+            username=user.username,
+            system=target.hostname,
+            logon_type=10,
+            source_ip="10.0.10.50",
+            source_port=51222,
+            session_kind="ssh",
+            start_time=base_time,
+        )
+        request = SshSessionRequest(
+            user=user,
+            target_system=target,
+            time=base_time,
+            source_ip="10.0.10.50",
+            source_port=51222,
+            logon_id=logon_id,
+        )
+
+        uid = SshSessionActionBundle(request=request, executor=gen).execute()
+
+        assert uid
+        # Canonical TCP/22 transport is still produced for a macOS target.
+        transport_event = _ssh_transport_event(events)
+        assert transport_event.network.dst_port == 22
+        assert transport_event.network.responding_pid is not None
+
+        ssh_event = next(event for event in events if event.event_type == "ssh_session")
+        assert ssh_event.dst_host is not None
+        assert ssh_event.dst_host.os_category == "macos"
+        assert ssh_event.auth is not None
+        # macOS session identity is the ES audit-token session id (asid),
+        # seeded near 100000 — never a small logind session number.
+        assert ssh_event.auth.session_id >= 100000
+        # ...and it is persisted onto the session state.
+        session = gen.state_manager.get_session(logon_id)
+        assert session is not None
+        assert session.session_id == ssh_event.auth.session_id
+        assert session.session_id >= 100000
+
+        # No Linux-specific syslog auth evidence for a macOS destination.
+        syslog_events = [
+            event for event in events if event.event_type == "syslog" and event.syslog is not None
+        ]
+        assert not any(event.syslog.app_name == "systemd-logind" for event in syslog_events)
+        assert not any(
+            "pam_unix(sshd:session)" in (event.syslog.message or "") for event in syslog_events
+        )
+        assert not any(
+            (event.syslog.message or "").startswith("New session") for event in syslog_events
+        )
+
+    def test_ssh_session_bundle_macos_source_materializes_ssh_client_process(self):
+        _reset_thread_rng()
+        gen, events = _make_activity_gen()
+        source = System(
+            hostname="mac-wks01",
+            ip="10.0.10.60",
+            os="macOS 14",
+            type="workstation",
+        )
+        target = System(
+            hostname="linux01",
+            ip="10.0.20.10",
+            os="Ubuntu 24.04",
+            type="server",
+            roles=["web_server"],
+        )
+        base_time = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+        _seed_macos_launchd(gen, source, base_time - timedelta(minutes=10))
+        gen.state_manager.set_current_time(base_time)
+
+        request = SshSessionRequest(
+            user=User(username="admin", full_name="Admin User", email="admin@example.com"),
+            target_system=target,
+            time=base_time,
+            source_ip=source.ip,
+            source_system=source,
+            source_port=51333,
+        )
+
+        uid = SshSessionActionBundle(request=request, executor=gen).execute()
+
+        assert uid
+        # A source-side /usr/bin/ssh client process is materialized for the macOS origin.
+        ssh_clients = [
+            proc
+            for proc in gen.state_manager.get_processes_on_system(source.hostname)
+            if proc.image == "/usr/bin/ssh"
+        ]
+        assert len(ssh_clients) == 1
+        client = ssh_clients[0]
+        assert client.username == "admin"
+        assert client.parent_pid > 0
+        # It is parented by an interactive macOS shell (Terminal-parented zsh/bash),
+        # not by launchd directly.
+        parent = gen.state_manager.get_process(source.hostname, client.parent_pid)
+        assert parent is not None
+        assert parent.image in {"/bin/zsh", "/bin/bash"}
+        # The canonical transport attributes the flow to the client PID.
+        transport_event = _ssh_transport_event(events)
+        assert transport_event.network.initiating_pid == client.pid
+
+    def test_ensure_ssh_session_shell_is_os_aware_for_shell_process(self):
+        def _run(os_string: str):
+            _reset_thread_rng()
+            gen, _events = _make_activity_gen()
+            target = System(
+                hostname="host01",
+                ip="10.0.30.10",
+                os=os_string,
+                type="workstation",
+            )
+            base_time = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+            gen.state_manager.set_current_time(base_time - timedelta(seconds=30))
+            sshd_pid = gen.state_manager.create_process(
+                system=target.hostname,
+                parent_pid=0,
+                image="/usr/sbin/sshd",
+                command_line="/usr/sbin/sshd -D",
+                username="root",
+                integrity_level="System",
+            )
+            gen._system_pids = {target.hostname: {"sshd": sshd_pid}}
+            gen.state_manager.set_current_time(base_time)
+            user = User(username="admin", full_name="Admin User", email="admin@example.com")
+            logon_id = gen.state_manager.create_session(
+                username=user.username,
+                system=target.hostname,
+                logon_type=10,
+                source_ip="10.0.10.50",
+                source_port=51111,
+                session_kind="ssh",
+                start_time=base_time,
+            )
+            shell_pid = gen.ensure_linux_ssh_session_shell(
+                user,
+                target,
+                logon_id,
+                base_time,
+                base_time + timedelta(seconds=5),
+            )
+            assert shell_pid is not None
+            shell_proc = gen.state_manager.get_process(target.hostname, shell_pid)
+            session = gen.state_manager.get_session(logon_id)
+            session_sshd = gen.state_manager.get_process(target.hostname, session.process_tree_root)
+            return shell_proc, session_sshd
+
+        macos_shell, macos_sshd = _run("macOS 14")
+        assert macos_shell.image == "/bin/zsh"
+        assert macos_shell.command_line == "-zsh"
+        # The per-session sshd image is unchanged across OSes.
+        assert macos_sshd.image == "/usr/sbin/sshd"
+
+        linux_shell, linux_sshd = _run("Ubuntu 24.04")
+        # Linux behavior is byte-for-byte unchanged.
+        assert linux_shell.image == "/bin/bash"
+        assert linux_shell.command_line == "-bash"
+        assert linux_sshd.image == "/usr/sbin/sshd"
 
     def test_ssl_service_gets_ssl_context(self, activity_gen):
         gen, events = activity_gen

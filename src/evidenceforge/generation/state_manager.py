@@ -127,6 +127,11 @@ class StateManager:
         self._linux_logind_session_last_ids: dict[str, int] = {}
         self._linux_logind_session_used_ids: dict[str, set[int]] = {}
         self._linux_logind_session_allocations: dict[str, list[tuple[datetime, int]]] = {}
+        # macOS has no systemd-logind; the ES audit-token session id (asid)
+        # stands in as the per-login-session identity. Keep the counter here so
+        # every generation path that needs a macOS session id draws from one
+        # monotonic sequence per host, mirroring the logind counter above.
+        self._macos_audit_session_counters: dict[str, int] = {}
         self._lock = RLock()  # Reentrant lock for thread safety
 
         # Entity lifecycle: per-system boot times for temporal validation
@@ -730,6 +735,39 @@ class StateManager:
                 self._linux_logind_session_counters[system] = rng.randint(20, 250)
             self._linux_logind_session_counters[system] += rng.randint(1, 4)
             return self._linux_logind_session_counters[system]
+
+    def next_macos_audit_session_id(
+        self,
+        system: str,
+        rng: random.Random,
+        event_time: datetime | None = None,
+    ) -> int:
+        """Return the next macOS ES audit-token session id (asid) for a host.
+
+        macOS Endpoint Security process audit tokens carry an audit session id
+        (``asid``) that identifies the login session a process belongs to. It is
+        the macOS analog of the Linux ``systemd-logind`` session id used by
+        :meth:`next_linux_logind_session_id`; there is no ``logind`` on macOS.
+        Real kernel-assigned asids are per-boot monotonic values seeded well
+        above the reserved low range, so this returns a per-host monotonic
+        sequence starting around 100000. Keeping the counter in StateManager
+        prevents split-brain session sequences across generation paths.
+
+        Args:
+            system: System hostname
+            rng: Random source for the per-host base/increment jitter
+            event_time: Accepted for signature symmetry with
+                ``next_linux_logind_session_id``; the macOS sequence is purely
+                monotonic per host and does not encode wall-clock elapsed time.
+
+        Returns:
+            The next macOS audit session id for the host.
+        """
+        with self._lock:
+            if system not in self._macos_audit_session_counters:
+                self._macos_audit_session_counters[system] = 100000 + rng.randint(0, 900)
+            self._macos_audit_session_counters[system] += rng.randint(1, 6)
+            return self._macos_audit_session_counters[system]
 
     def _linux_logind_session_block_offset(self, system: str, block: int) -> int:
         """Return deterministic logind session churn before a four-hour block."""
