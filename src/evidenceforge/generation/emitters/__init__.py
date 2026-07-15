@@ -26,6 +26,7 @@ from evidenceforge.generation.emitters.base import LogEmitter
 from evidenceforge.generation.emitters.bash_history import BashHistoryEmitter
 from evidenceforge.generation.emitters.cisco_asa import CiscoAsaEmitter
 from evidenceforge.generation.emitters.ecar import EcarEmitter
+from evidenceforge.generation.emitters.eslogger import ESLoggerEmitter
 from evidenceforge.generation.emitters.proxy import ProxyEmitter
 from evidenceforge.generation.emitters.snort import SnortEmitter
 from evidenceforge.generation.emitters.syslog import SyslogEmitter
@@ -68,6 +69,7 @@ __all__ = [
     "ZeekPacketFilterEmitter",
     "ZeekReporterEmitter",
     "EcarEmitter",
+    "ESLoggerEmitter",
     "SyslogEmitter",
     "BashHistoryEmitter",
     "ProxyEmitter",
