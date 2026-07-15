@@ -67,7 +67,11 @@ HTTP_SURFACES: frozenset[str] = frozenset({"http_user_agent", "http_request_url"
 
 # Surfaces that only model on Linux hosts. process_command_line and the http_*
 # surfaces are cross-OS; dns_qname is cross-OS (a Zeek sensor sees it regardless of host
-# OS). auth_user renders a Linux sshd auth.log line (Windows 4625 is a different format).
+# OS). auth_user renders a Linux sshd auth.log line (Windows 4625 is a different format;
+# macOS eslogger renders SSH login as a native ES session event, not a syslog-style
+# auth.log line, so macOS is excluded here too despite being a recognized OS category).
+# syslog_message is likewise excluded for macOS: there is no macOS syslog daemon
+# rendering path in this scope.
 LINUX_ONLY_SURFACES: frozenset[str] = frozenset({"syslog_message", "auth_user"})
 
 # Single source of truth: surface -> the output format that records it (also its

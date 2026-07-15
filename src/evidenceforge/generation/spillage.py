@@ -71,7 +71,10 @@ HTTP_SCHEMES: frozenset[str] = frozenset({"http", "https"})
 
 # Surfaces that only model on Linux hosts (syslog/bash). process_command_line
 # and the http_* surfaces are cross-OS (process telemetry and web requests exist
-# on Windows and Linux).
+# on Windows, Linux, and macOS). macOS is excluded from this set even though it
+# is a recognized OS category: its default shell is zsh (no zsh-history-rendering
+# emitter exists in this scope) and it has no Linux-style syslog daemon rendering
+# path, so both surfaces would still be phantom positives on macOS.
 LINUX_ONLY_SURFACES: frozenset[str] = frozenset({"shell_history", "syslog_message"})
 
 # Unicode label separators that IDNA / UTS-46 map to ASCII '.' — a real resolver

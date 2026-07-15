@@ -1834,6 +1834,98 @@ class TestFormatOsCompatibility:
         ]
         assert len(os_issues) == 0
 
+    def test_macos_format_no_macos_systems_error(self):
+        """eslogger format with only Linux systems should error."""
+        scenario = Scenario(
+            version="1.0",
+            name="test",
+            description="Test",
+            environment=Environment(
+                description="Test env",
+                users=[User(username="u1", full_name="U", email="u@test.com")],
+                systems=[
+                    System(
+                        hostname="LNX-01", ip="10.0.0.1", os="Linux Ubuntu 22.04", type="server"
+                    ),
+                ],
+            ),
+            time_window=TimeWindow(start=datetime(2024, 1, 15, 10, 0, 0), duration="1h"),
+            baseline_activity=BaselineActivity(
+                description="Test", intensity="medium", variation="low"
+            ),
+            output=OutputSpec(logs=[{"format": "eslogger"}], destination="./output"),
+        )
+        validator = ScenarioValidator(scenario)
+        issues = validator.validate()
+
+        errors = [
+            i for i in issues if i.severity == "error" and "requires macos" in i.message.lower()
+        ]
+        assert len(errors) >= 1
+
+    def test_macos_system_and_eslogger_format_no_issues(self):
+        """macOS system with eslogger in output should produce no OS-binding issues."""
+        scenario = Scenario(
+            version="1.0",
+            name="test",
+            description="Test",
+            environment=Environment(
+                description="Test env",
+                users=[User(username="u1", full_name="U", email="u@test.com")],
+                systems=[
+                    System(hostname="MAC-01", ip="10.0.0.1", os="macOS 14.5", type="workstation"),
+                ],
+            ),
+            time_window=TimeWindow(start=datetime(2024, 1, 15, 10, 0, 0), duration="1h"),
+            baseline_activity=BaselineActivity(
+                description="Test", intensity="medium", variation="low"
+            ),
+            output=OutputSpec(logs=[{"format": "eslogger"}], destination="./output"),
+        )
+        validator = ScenarioValidator(scenario)
+        issues = validator.validate()
+
+        os_issues = [
+            i
+            for i in issues
+            if "output.logs" == i.field_path and ("requires" in i.message or "no" in i.message)
+        ]
+        assert len(os_issues) == 0
+
+    def test_macos_system_windows_format_only_produces_mismatch(self):
+        """macOS system with only windows_event_security format should error + warn."""
+        scenario = Scenario(
+            version="1.0",
+            name="test",
+            description="Test",
+            environment=Environment(
+                description="Test env",
+                users=[User(username="u1", full_name="U", email="u@test.com")],
+                systems=[
+                    System(hostname="MAC-01", ip="10.0.0.1", os="macOS 14.5", type="workstation"),
+                ],
+            ),
+            time_window=TimeWindow(start=datetime(2024, 1, 15, 10, 0, 0), duration="1h"),
+            baseline_activity=BaselineActivity(
+                description="Test", intensity="medium", variation="low"
+            ),
+            output=OutputSpec(logs=[{"format": "windows_event_security"}], destination="./output"),
+        )
+        validator = ScenarioValidator(scenario)
+        issues = validator.validate()
+
+        errors = [
+            i for i in issues if i.severity == "error" and "requires windows" in i.message.lower()
+        ]
+        assert len(errors) >= 1
+
+        warnings = [
+            i
+            for i in issues
+            if i.severity == "warning" and "MAC-01" in i.message and "macos" in i.message.lower()
+        ]
+        assert len(warnings) >= 1
+
 
 class TestProxyOutputTopology:
     """Tests for _validate_proxy_output_topology."""
@@ -2714,6 +2806,41 @@ class TestStorylineOsPlausibility:
             if "specific" in i.message.lower() and ("Windows" in i.message or "Linux" in i.message)
         ]
         assert len(os_warnings) == 0
+
+    def test_ssh_on_macos_no_warning(self):
+        """SSH session on macOS system should not warn (SSH bundle supports macOS)."""
+        scenario = Scenario(
+            version="1.0",
+            name="test",
+            description="Test",
+            environment=Environment(
+                description="Test env",
+                users=[User(username="jdoe", full_name="J", email="j@test.com")],
+                systems=[
+                    System(hostname="MAC-01", ip="10.0.0.1", os="macOS 14.5", type="workstation"),
+                ],
+            ),
+            storyline=[
+                StorylineEvent(
+                    id="evt-val-021",
+                    time="2024-01-15T10:00:00Z",
+                    actor="jdoe",
+                    system="MAC-01",
+                    activity="ssh session",
+                    events=[{"type": "ssh_session"}],
+                ),
+            ],
+            time_window=TimeWindow(start=datetime(2024, 1, 15, 10, 0, 0), duration="1h"),
+            baseline_activity=BaselineActivity(
+                description="Test", intensity="medium", variation="low"
+            ),
+            output=OutputSpec(logs=[{"format": "eslogger"}], destination="./output"),
+        )
+        validator = ScenarioValidator(scenario)
+        issues = validator.validate()
+
+        warnings = [i for i in issues if "Linux-specific" in i.message]
+        assert len(warnings) == 0
 
 
 class TestStorylineLinkability:

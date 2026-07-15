@@ -88,12 +88,14 @@ _OS_BOUND_FORMATS: dict[str, str] = {
     "windows_event_sysmon": "windows",
     "syslog": "linux",
     "bash_history": "linux",
+    "eslogger": "macos",
 }
 
 # Reverse: OS → expected host-local formats
 _OS_EXPECTED_FORMATS: dict[str, set[str]] = {
     "windows": {"windows_event_security", "windows_event_sysmon"},
     "linux": {"syslog", "bash_history"},
+    "macos": {"eslogger"},
 }
 
 # Event types that are Windows-specific
@@ -110,6 +112,12 @@ _WINDOWS_EVENT_TYPES = {
 
 # Event types that imply Linux/SSH
 _LINUX_EVENT_TYPES = {"ssh_session"}
+
+# Event types from _LINUX_EVENT_TYPES that are ALSO valid on macOS (the SSH bundle
+# supports macOS sources/destinations per Task 5). Kept as an independent set
+# rather than merged/renamed into _LINUX_EVENT_TYPES: not every Linux-only event
+# type is meaningful on macOS, so each type needs its own per-OS decision.
+_MACOS_EVENT_TYPES = {"ssh_session"}
 
 # Process command patterns indicating wrong OS
 _WINDOWS_COMMAND_INDICATORS = {"powershell.exe", "cmd.exe", "reg.exe", "net.exe"}
@@ -1900,6 +1908,30 @@ class ScenarioValidator:
                         )
                     )
 
+                # Linux-specific events on macOS, EXCEPT the subset that Task 5's
+                # SSH bundle also supports on macOS (_MACOS_EVENT_TYPES). This is a
+                # per-type decision, not a blanket exemption: a future Linux-only
+                # event type not in _MACOS_EVENT_TYPES would still be flagged here.
+                if (
+                    os_cat == "macos"
+                    and event_type in _LINUX_EVENT_TYPES
+                    and event_type not in _MACOS_EVENT_TYPES
+                ):
+                    self.issues.append(
+                        ValidationIssue(
+                            severity="warning",
+                            field_path=(f"storyline.{idx}.events.{spec_idx}"),
+                            message=(
+                                f"[{event.id}] Event type '{event_type}' is Linux-specific "
+                                f"but system '{event.system}' is {os_cat}"
+                            ),
+                            suggestion=(
+                                "Change the target system to a Linux host "
+                                "or use a different event type"
+                            ),
+                        )
+                    )
+
                 # Process command OS mismatch
                 if event_type == "process" and hasattr(spec, "command_line"):
                     cmd = spec.command_line or spec.process_name
@@ -2068,11 +2100,17 @@ class ScenarioValidator:
                 field_path = f"storyline.{idx}.events.{spec_idx}"
 
                 # shell_history/syslog are Linux-modeled; emitting them on any non-Linux
-                # host (Windows OR an unknown OS such as macOS/BSD/Solaris) would silently
-                # drop the credential while still labeling it in ground truth — a phantom
-                # positive — so this is a hard error. The emitter only handles linux, so
-                # gate on != "linux", not == "windows". (process_command_line is cross-OS,
-                # so it is exempt.)
+                # host (Windows, macOS, or a still-unrecognized OS such as BSD/Solaris)
+                # would silently drop the credential while still labeling it in ground
+                # truth — a phantom positive — so this is a hard error. The emitter only
+                # handles linux, so gate on != "linux", not == "windows". macOS is a
+                # recognized OS category (not "unknown") but is deliberately excluded
+                # here too: its default shell is zsh (Task 4) and there is no
+                # zsh-history-rendering emitter in Phase A scope, and macOS has no
+                # Linux-style syslog daemon rendering path (the `syslog` format is
+                # Linux-bound per _OS_BOUND_FORMATS), so both surfaces would still be
+                # phantom positives on macOS. (process_command_line is cross-OS, so it
+                # is exempt.)
                 if os_cat != "linux" and spec.surface in LINUX_ONLY_SURFACES:
                     self.issues.append(
                         ValidationIssue(
@@ -2236,10 +2274,17 @@ class ScenarioValidator:
                     continue
                 field_path = f"storyline.{idx}.events.{spec_idx}"
 
-                # syslog_message is Linux-modeled; on any non-Linux host (Windows OR an
-                # unknown OS such as macOS/BSD/Solaris) the payload would be ground-truthed
-                # but never emitted — a phantom positive. The emitter only handles linux, so
-                # gate on != "linux", not == "windows".
+                # syslog_message/auth_user are Linux-modeled; on any non-Linux host
+                # (Windows, macOS, or a still-unrecognized OS such as BSD/Solaris) the
+                # payload would be ground-truthed but never emitted — a phantom
+                # positive. The emitter only handles linux, so gate on != "linux", not
+                # == "windows". macOS is a recognized OS category (not "unknown") but
+                # is deliberately excluded here too: there is no macOS syslog-daemon
+                # rendering path (the `syslog` format is Linux-bound per
+                # _OS_BOUND_FORMATS) and no Linux-sshd-style auth.log emitter for
+                # macOS in Phase A scope (the eslogger emitter renders SSH login as
+                # native ES session events, not a syslog-style auth.log line), so both
+                # surfaces would still be phantom positives on macOS.
                 if os_cat != "linux" and spec.surface in LINUX_ONLY_SURFACES:
                     self.issues.append(
                         ValidationIssue(
