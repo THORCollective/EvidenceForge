@@ -81,6 +81,7 @@ scenarios/llm-injection-demo/*
 scenarios/macos-eslogger-demo/*
 !scenarios/macos-eslogger-demo/scenario.yaml
 !scenarios/macos-eslogger-demo/README.md
+!scenarios/macos-eslogger-demo/CFP-ABSTRACT.md
 
 
 # Scan / analysis tool output
@@ -91,3 +92,6 @@ requirements.txt
 
 # Sample data (reference only, not tracked)
 sample_data/
+
+# Agent goal-tracking scratch state (session-local, not project content)
+goals/
