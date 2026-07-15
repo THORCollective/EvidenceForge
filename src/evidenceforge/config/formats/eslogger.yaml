@@ -90,6 +90,10 @@ fields:
     required: false
     description: "Code-signing identifier (e.g. com.apple.osascript)"
 
+  # `required: false` is this schema's only nullability signal (the FieldType
+  # enum has no null-union variant); it is the same convention used elsewhere
+  # for a JSON-emitted field whose *present* value may be null (e.g.
+  # zeek_conn.yaml's "service"). team_id already follows that convention.
   - name: process.team_id
     type: string
     required: false
@@ -263,10 +267,20 @@ fields:
     required: false
     description: "Whether the sudo elevation succeeded"
 
+  - name: event.sudo.from_uid
+    type: integer
+    required: false
+    description: "Invoking user's uid for sudo events"
+
   - name: event.sudo.from_username
     type: string
     required: false
     description: "Invoking user for sudo events"
+
+  - name: event.sudo.to_uid
+    type: integer
+    required: false
+    description: "Elevated target user's uid for sudo events (0/root by default)"
 
   - name: event.sudo.to_username
     type: string
@@ -283,15 +297,30 @@ fields:
     required: false
     description: "Whether the su elevation succeeded"
 
+  - name: event.su.from_uid
+    type: integer
+    required: false
+    description: "Invoking user's uid for su events"
+
   - name: event.su.from_username
     type: string
     required: false
     description: "Invoking user for su events"
 
+  - name: event.su.to_uid
+    type: integer
+    required: false
+    description: "Elevated target user's uid for su events (0/root by default)"
+
   - name: event.su.to_username
     type: string
     required: false
     description: "Elevated target user for su events (root by default)"
+
+  - name: event.su.shell
+    type: string
+    required: false
+    description: "Shell launched by su events"
 
 output:
   format: json
