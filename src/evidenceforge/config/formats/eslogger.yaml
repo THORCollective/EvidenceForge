@@ -168,6 +168,41 @@ fields:
     required: false
     description: "Working directory for exec events"
 
+  - name: event.fork.child.pid
+    type: integer
+    required: false
+    description: "Child process PID for fork events (fork subject is the parent)"
+
+  - name: event.fork.child.audit_token.pidversion
+    type: integer
+    required: false
+    description: "Child process PID generation counter for fork events"
+
+  - name: event.create.destination.path
+    type: string
+    required: false
+    description: "Destination path for file create events"
+
+  - name: event.open.file.path
+    type: string
+    required: false
+    description: "File path for file open events"
+
+  - name: event.write.target.path
+    type: string
+    required: false
+    description: "Target path for file write events"
+
+  - name: event.rename.source.path
+    type: string
+    required: false
+    description: "Source path for file rename events (destination not modeled)"
+
+  - name: event.unlink.target.path
+    type: string
+    required: false
+    description: "Target path for file unlink events"
+
   - name: event.openssh_login.username
     type: string
     required: false
@@ -178,10 +213,30 @@ fields:
     required: false
     description: "Source address for openssh_login events"
 
+  - name: event.openssh_logout.username
+    type: string
+    required: false
+    description: "Username for openssh_logout events"
+
+  - name: event.openssh_logout.source_address
+    type: string
+    required: false
+    description: "Source address for openssh_logout events"
+
   - name: event.btm_launch_item_add.item.url.path
     type: string
     required: false
     description: "plist path for btm_launch_item_add events"
+
+  - name: event.btm_launch_item_add.item.item_type
+    type: string
+    required: false
+    description: "\"agent\" or \"daemon\" classification for btm_launch_item_add events"
+
+  - name: event.btm_launch_item_add.executable_path
+    type: string
+    required: false
+    description: "Acting executable path for btm_launch_item_add events"
 
   - name: event.lw_session_lock.username
     type: string
@@ -197,6 +252,11 @@ fields:
     type: string
     required: false
     description: "Unlocking user for lw_session_unlock events"
+
+  - name: event.lw_session_unlock.graphical_session_id
+    type: integer
+    required: false
+    description: "Graphical (audit) session id for lw_session_unlock events"
 
   - name: event.sudo.success
     type: boolean
@@ -217,6 +277,11 @@ fields:
     type: string
     required: false
     description: "Command run under sudo"
+
+  - name: event.su.success
+    type: boolean
+    required: false
+    description: "Whether the su elevation succeeded"
 
   - name: event.su.from_username
     type: string

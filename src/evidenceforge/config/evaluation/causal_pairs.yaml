@@ -173,3 +173,47 @@ pairs:
     # shared username key is weak. A later matching TGT is not proof that a
     # target-host logon inverted Kerberos causality.
     allow_missing_prior: true
+
+  # --- macOS eslogger (Endpoint Security) rules ---
+  # eslogger's flat `event_type` integer is the record discriminator (see
+  # co_occurrence.yaml's eslogger: section header comment for the full code
+  # table and the "no hostname field" caveat that shapes match/extra_match
+  # choices below).
+
+  - name: "eslogger exec before process exit"
+    before:
+      format: eslogger
+      condition:
+        event_type: 9  # exec
+    after:
+      format: eslogger
+      condition:
+        event_type: 15  # exit
+    match_fields:
+      before: process.pid
+      after: process.pid
+    # eslogger records have no hostname field to scope cross-host PID
+    # collisions (unlike eCAR's `extra_match: hostname`); pidversion
+    # disambiguates PID-slot reuse instead, which is exactly what
+    # StateManager tracks it for.
+    extra_match: process.audit_token.pidversion
+
+  - name: "eslogger plist create before btm_launch_item_add"
+    before:
+      format: eslogger
+      condition:
+        event_type: 13  # create
+    after:
+      format: eslogger
+      condition:
+        event_type: 105  # btm_launch_item_add
+    match_fields:
+      before: event.create.destination.path
+      after: event.btm_launch_item_add.item.url.path
+    # btm_launch_item_add is causal-engine-generated (Task 7's
+    # PlistCreateBeforeBtmLaunchItem rule) from a plist file_create, but the
+    # match key is a bare file path with no host scoping, so the same
+    # LaunchAgents/LaunchDaemons path on a different macOS host (or a plist
+    # created outside the evaluated window) is not proof of inversion —
+    # mirrors "eCAR login before process create"'s allow_missing_prior use.
+    allow_missing_prior: true
