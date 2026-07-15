@@ -155,6 +155,10 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         # follows from the single-producer/single-consumer FIFO dispatch path.
         self._seq_by_host: dict[str, int] = {}
         self._global_seq: int = 0
+        # (hostname, audit_session_id) of every SSH session for which this
+        # emitter rendered an `openssh_login`. An `openssh_logout` is only
+        # rendered for a session in this set — see can_handle() for why.
+        self._openssh_login_sessions: set[tuple[str, int]] = set()
 
     # ------------------------------------------------------------------
     # Dispatch / selection
@@ -176,7 +180,25 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         if event.event_type not in self._supported_types:
             return False
         host = self._target_host(event)
-        return host is not None and getattr(host, "os_category", "") == "macos"
+        if host is None or getattr(host, "os_category", "") != "macos":
+            return False
+        # A `logoff` renders as `openssh_logout` ONLY for a session whose
+        # `openssh_login` this emitter already rendered (recorded from the
+        # `ssh_session` event). This is symmetric with the login side — only
+        # `ssh_session` events (never generic interactive `logon`s) render as
+        # `openssh_login` — and it is robust: local/console (type 2), network
+        # (type 3), cached-interactive (type 11), and any spurious non-SSH
+        # `logon_type == 10` session teardown has no recorded login, so it is
+        # dropped here instead of surfacing as an orphan `openssh_logout` with
+        # no preceding login (Task 11c watch item). Dispatch is single-threaded
+        # and delivers a session's login before its logout, so the set is
+        # populated by the time the logout is evaluated.
+        if event.event_type == "logoff":
+            auth = getattr(event, "auth", None)
+            if auth is None:
+                return False
+            return (host.hostname, auth.session_id) in self._openssh_login_sessions
+        return True
 
     def emit(self, event: SecurityEvent) -> None:
         """Dispatch a SecurityEvent to the matching ES renderer."""
@@ -362,6 +384,10 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         auth = event.auth
         if host is None or auth is None:
             return
+        # Record the session so its matching `openssh_logout` is allowed to
+        # render (see can_handle()); an SSH close with no rendered login is an
+        # orphan and must be dropped.
+        self._openssh_login_sessions.add((host.hostname, auth.session_id))
         process_obj = self._sshd_process_object(host, auth.session_id)
         uid = self._macos_ids(auth.username)["uid"]
         self._queue_record(

@@ -248,6 +248,54 @@ class TestGenerateAfterHoursAdmin:
 
         assert result["time"] < current_hour + timedelta(hours=1)
 
+    def test_windows_target_may_use_rdp_logon_type(self, users, current_hour):
+        """Windows targets can surface an RDP (logon_type 10) after-hours logon."""
+        win_systems = [
+            System(hostname="SRV-DC-01", ip="10.0.0.5", os="Windows Server 2022", type="server")
+        ]
+        logon_types = {
+            generate_after_hours_admin(random.Random(i), users, win_systems, current_hour)[
+                "logon_type"
+            ]
+            for i in range(40)
+        }
+        assert logon_types <= {3, 10}
+        assert 10 in logon_types, "Windows after-hours admin should sometimes use RDP (type 10)"
+
+    def test_macos_target_never_uses_rdp_logon_type(self, users, current_hour):
+        """macOS has no RDP: after-hours admin must never fabricate logon_type 10.
+
+        A generic logon_type-10 session on macOS would produce a spurious
+        eslogger `openssh_logout` at teardown with no matching `openssh_login`.
+        """
+        mac_systems = [
+            System(hostname="MAC-01", ip="10.0.0.9", os="macOS 14.5", type="workstation")
+        ]
+        logon_types = {
+            generate_after_hours_admin(random.Random(i), users, mac_systems, current_hour)[
+                "logon_type"
+            ]
+            for i in range(40)
+        }
+        assert logon_types == {3}, (
+            f"macOS after-hours admin must be network-only, got {logon_types}"
+        )
+
+    def test_linux_target_never_uses_rdp_logon_type(self, users, current_hour):
+        """Linux has no RDP either: after-hours admin must never use logon_type 10."""
+        linux_systems = [
+            System(hostname="SRV-APP-01", ip="10.0.0.10", os="Ubuntu 22.04", type="server")
+        ]
+        logon_types = {
+            generate_after_hours_admin(random.Random(i), users, linux_systems, current_hour)[
+                "logon_type"
+            ]
+            for i in range(40)
+        }
+        assert logon_types == {3}, (
+            f"Linux after-hours admin must be network-only, got {logon_types}"
+        )
+
 
 class TestGenerateTempDirExecution:
     """Tests for temporary-directory execution noise."""

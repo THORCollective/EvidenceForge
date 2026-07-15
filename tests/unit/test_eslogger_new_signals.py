@@ -143,6 +143,55 @@ def test_macos_ssh_session_close_renders_login_then_logout(tmp_path):
     assert logout_rows[0]["event"]["openssh_logout"]["username"] == "alice"
 
 
+def test_macos_logoff_renders_openssh_logout_only_for_a_rendered_login(tmp_path):
+    """openssh_logout renders only for a session whose openssh_login was rendered.
+
+    A logoff whose session had no `ssh_session` login rendered on this host
+    (local/console type 2, network type 3, cached type 11, or any spurious
+    non-SSH type-10 session) is an orphan logout with no preceding login and
+    must not be handled (Task 11c watch item). A logoff for a session whose
+    login this emitter rendered IS handled.
+    """
+    from evidenceforge.events.contexts import AuthContext, HostContext
+
+    emitter = _eslogger(tmp_path, StateManager())
+    host = HostContext(
+        hostname="MAC-01",
+        ip="10.0.0.50",
+        os="macOS 14.4",
+        os_category="macos",
+        system_type="workstation",
+    )
+
+    def _logoff(session_id: int, logon_type: int) -> SecurityEvent:
+        return SecurityEvent(
+            timestamp=TS,
+            event_type="logoff",
+            dst_host=host,
+            auth=AuthContext(
+                username="alice", logon_id="0x1234", session_id=session_id, logon_type=logon_type
+            ),
+        )
+
+    # No login has been rendered yet: every logoff (incl. type 10) is dropped.
+    for logon_type, sid in ((2, 5), (3, 6), (11, 7), (10, 8)):
+        assert emitter.can_handle(_logoff(sid, logon_type)) is False, (
+            f"type {logon_type} logoff without a rendered login must be dropped"
+        )
+
+    # Render an SSH login for session 42, then its logout is handled; a
+    # different session's logout is still dropped.
+    login = SecurityEvent(
+        timestamp=TS,
+        event_type="ssh_session",
+        dst_host=host,
+        auth=AuthContext(username="alice", logon_id="0x1234", session_id=42, logon_type=10),
+    )
+    _render(emitter, login)
+    assert emitter.can_handle(_logoff(42, 10)) is True, "logout for a rendered login must render"
+    assert emitter.can_handle(_logoff(99, 10)) is False, "logout for an unseen session is an orphan"
+
+
 # ---------------------------------------------------------------------------
 # Sub-item 2: screen lock/unlock -> lw_session
 # ---------------------------------------------------------------------------

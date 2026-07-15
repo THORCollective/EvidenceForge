@@ -193,12 +193,23 @@ def generate_after_hours_admin(
     offset = timedelta(seconds=rng.randint(0, 3599))
     event_time = current_hour + offset
 
+    # RDP (remote-interactive, logon_type 10) is a Windows-only concept — there
+    # is no mstsc.exe / RDP session on macOS or Linux. On a non-Windows target,
+    # after-hours remote admin surfaces as a network logon (logon_type 3), not a
+    # fabricated RDP session. Emitting a generic logon_type-10 session on macOS
+    # would also produce a spurious eslogger `openssh_logout` at teardown with no
+    # matching `openssh_login` (only real SSH-bundle sessions carry that pair).
+    if _get_os_category(system) == "windows":
+        logon_type = 10 if rng.random() < 0.4 else 3  # RDP or network
+    else:
+        logon_type = 3  # network logon (no RDP on macOS/Linux)
+
     return {
         "pattern": "after_hours_admin",
         "user": user,
         "system": system,
         "time": event_time,
-        "logon_type": 10 if rng.random() < 0.4 else 3,  # RDP or network
+        "logon_type": logon_type,
     }
 
 
