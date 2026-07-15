@@ -85,6 +85,7 @@ class StateManager:
         state: GeneratorState containing all active entities
         _logon_id_host_bases: Per-host base ranges for Windows LogonID/LUID allocation
         _pid_counters: Per-system PID counters dict[system_hostname, int]
+        _pidversion: Per-(system, pid) generation counter for macOS ES pidversion
         _connection_id_counter: Counter for generating unique connection IDs
         _lock: Reentrant lock for thread-safe access to state and counters
 
@@ -106,6 +107,12 @@ class StateManager:
         self._pid_counters: dict[str, int] = {}  # Per-system PID counters
         self._pid_os: dict[str, str] = {}  # Per-system OS type for PID allocation
         self._pid_rngs: dict[str, random.Random] = {}  # Per-system PID RNGs
+        # macOS ES process audit tokens carry pidversion, an incrementing
+        # generation counter for a given PID slot (macOS reuses PIDs, so
+        # pidversion disambiguates which "generation" of that PID a given
+        # process instance is). Keyed by (system, pid); starts at 0 for a
+        # PID slot's first occupant and increments each time the slot is reused.
+        self._pidversion: dict[tuple[str, int], int] = {}
         self._pid_time_epochs: dict[str, datetime] = {}
         self._pid_bucket_offsets: dict[tuple[str, int, int], int] = {}
         self._linux_pid_block_offsets: dict[str, dict[int, int]] = {}
@@ -812,6 +819,14 @@ class StateManager:
             start = pid_rng.randint(2000, 6000)
             self._pid_counters[system] = start - (start % 4)
             self._pid_os[system] = "windows"
+        elif os_category == "macos":
+            # Real macOS PIDs are small kernel-assigned integers (launchd is
+            # PID 1; PID_MAX is 99999). Use a distinct, much lower range than
+            # the arbitrary Linux one below to reflect a host that has been
+            # up for a while but hasn't churned through anywhere near the
+            # Linux-shaped PID space.
+            self._pid_counters[system] = pid_rng.randint(200, 4000)
+            self._pid_os[system] = "macos"
         else:
             self._pid_counters[system] = pid_rng.randint(8000, 42000)
             self._pid_os[system] = "linux"
@@ -946,6 +961,25 @@ class StateManager:
             pid_rng = self._pid_rngs[system]
             return self._allocate_linux_pid(system, pid_rng, event_time)
 
+    def _bump_pidversion(self, system: str, pid: int) -> int:
+        """Increment and return the generation counter for a PID slot.
+
+        Backs the macOS ES ``pidversion`` audit-token field. A PID slot's
+        first occupant is generation 0; each later reuse of that PID number
+        on the same system increments the generation by one. Call this
+        exactly once per process creation for a given ``(system, pid)``.
+
+        Args:
+            system: System hostname
+            pid: Process ID being (re)allocated
+
+        Returns:
+            The PID slot's new generation counter value.
+        """
+        key = (system, pid)
+        self._pidversion[key] = self._pidversion.get(key, -1) + 1
+        return self._pidversion[key]
+
     def create_process(
         self,
         system: str,
@@ -955,6 +989,7 @@ class StateManager:
         username: str,
         integrity_level: str,
         logon_id: str = "",
+        os_category: str | None = None,
     ) -> int:
         """Create a new running process.
 
@@ -965,6 +1000,15 @@ class StateManager:
             command_line: Full command line with arguments
             username: User running the process
             integrity_level: Windows integrity level (System, High, Medium, Low)
+            logon_id: LogonID/session identifier owning this process, if any
+            os_category: OS category ("windows", "linux", "macos") for the
+                system, used only the first time a PID allocator is
+                initialized for this system. When omitted, falls back to a
+                backslash-in-path heuristic (Windows vs. everything else,
+                defaulting to Linux) — pass this explicitly whenever the
+                caller already knows the system's OS category, since the
+                path heuristic cannot distinguish macOS from Linux (both use
+                forward-slash paths).
 
         Returns:
             Allocated PID for the process
@@ -988,9 +1032,16 @@ class StateManager:
 
             # Allocate PID for this system — OS-aware allocation (Phase 6.0)
             if system not in self._pid_counters:
-                # Detect OS from image path: backslash = Windows, forward slash = Linux
-                is_windows = "\\" in image
-                self._initialize_pid_allocator(system, "windows" if is_windows else "linux")
+                if os_category is not None:
+                    detected_os = os_category
+                else:
+                    # Fallback when the caller doesn't know the system's OS
+                    # category: backslash = Windows, forward slash = everything
+                    # else (defaults to Linux). This heuristic cannot tell
+                    # macOS apart from Linux — both use forward-slash paths —
+                    # so it must not be relied on for macOS systems.
+                    detected_os = "windows" if "\\" in image else "linux"
+                self._initialize_pid_allocator(system, detected_os)
 
             # Increment with OS-aware gaps
             if system not in self._pid_rngs:
@@ -1028,6 +1079,8 @@ class StateManager:
                     pid_rng,
                     minimum_pid_exclusive=minimum_pid_exclusive,
                 )
+
+            self._bump_pidversion(system, pid)
 
             # Create process
             ecar_object_id = stable_uuid(
@@ -1073,6 +1126,25 @@ class StateManager:
         with self._lock:
             key = (system, pid)
             return self.state.running_processes.get(key)
+
+    def get_pidversion(self, system: str, pid: int) -> int:
+        """Return the current pidversion generation counter for a PID slot.
+
+        macOS Endpoint Security process audit tokens carry ``pidversion``, an
+        incrementing generation counter disambiguating which "generation" of
+        a reused PID number a given process instance is. This is read-only
+        state for emitters; only ``create_process`` bumps it.
+
+        Args:
+            system: System hostname
+            pid: Process ID
+
+        Returns:
+            The PID slot's current generation counter (0 if the slot has
+            never been allocated by ``create_process``).
+        """
+        with self._lock:
+            return self._pidversion.get((system, pid), 0)
 
     def get_session_object_id(self, logon_id: str) -> str:
         """Get the eCAR objectID for a session."""

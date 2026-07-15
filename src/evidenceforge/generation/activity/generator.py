@@ -11155,6 +11155,7 @@ class ActivityGenerator:
             username=process_username,
             integrity_level=_integrity,
             logon_id=process_logon_id,
+            os_category=_get_os_category(system.os),
         )
 
         # Phase 2: Build SecurityEvent
@@ -20529,6 +20530,7 @@ class ActivityGenerator:
             username=username,
             integrity_level="System",
             logon_id=logon_id,
+            os_category=_get_os_category(system.os),
         )
 
         # Determine system-level SID and logon ID
@@ -28141,6 +28143,7 @@ class ActivityGenerator:
             username=user.username,
             integrity_level="System" if user.username == "SYSTEM" else "Medium",
             logon_id=logon_id,
+            os_category=os_cat,
         )
 
         # Determine if this is a pre-existing process (no creation event)
