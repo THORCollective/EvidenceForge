@@ -12188,6 +12188,127 @@ class ActivityGenerator:
         self.state_manager.set_current_time(requested_time)
         return pid, image
 
+    def ensure_macos_ssh_client_process(
+        self,
+        *,
+        user: User,
+        source_system: System,
+        target_system: System,
+        time: datetime,
+        process_image: str,
+        source_port: int,
+    ) -> tuple[int, str] | None:
+        """Return the source-side SSH client process for a macOS origin host.
+
+        macOS ships the OpenSSH client at ``/usr/bin/ssh`` (and ``scp``),
+        normally launched interactively from a Terminal-parented shell. The
+        Terminal->zsh->ssh ancestry is built through the shared macOS-aware
+        parent-chain resolver rather than the Linux session-shell helpers, so
+        the client rides on a real interactive session and correlates with the
+        canonical TCP/22 connection the SSH bundle then opens.
+        """
+        if _get_os_category(source_system.os) != "macos":
+            return None
+
+        requested_time = ensure_utc(time)
+        image = process_image or "/usr/bin/ssh"
+        exe_name = image.rsplit("/", 1)[-1].lower()
+        if exe_name == "sshd":
+            image = "/usr/bin/ssh"
+            exe_name = "ssh"
+        if exe_name not in {"ssh", "scp"}:
+            image = "/usr/bin/ssh"
+            exe_name = "ssh"
+
+        target_host = self._build_host_context(target_system).fqdn or target_system.hostname
+        command_line = _linux_ssh_client_command_line(
+            exe_name=exe_name,
+            username=user.username,
+            target_host=target_host,
+            target_ip=target_system.ip,
+            source_hostname=source_system.hostname,
+            source_port=source_port,
+            requested_time=requested_time,
+        )
+
+        seed = _stable_seed(
+            "macos_ssh_client_process:"
+            f"{source_system.hostname}:{user.username}:{target_system.hostname}:"
+            f"{source_port}:{requested_time.isoformat()}:{image}"
+        )
+        process_time = requested_time - timedelta(milliseconds=6500 + (seed % 11500))
+        scenario_start = getattr(self, "_scenario_start_time", None)
+        if scenario_start is not None:
+            scenario_start = ensure_utc(scenario_start)
+        if scenario_start is not None and requested_time >= scenario_start:
+            latest_with_visible_headroom = requested_time - timedelta(seconds=5)
+            if process_time < scenario_start and latest_with_visible_headroom > scenario_start:
+                process_time = min(
+                    latest_with_visible_headroom,
+                    scenario_start + timedelta(milliseconds=400 + (seed % 1800)),
+                )
+
+        session = self._active_source_macos_session(user, source_system, requested_time)
+        if session is None:
+            logon_time = process_time - timedelta(seconds=7 + (seed % 9))
+            logon_id = self.generate_logon(
+                user,
+                source_system,
+                logon_time,
+                logon_type=2,
+            )
+            session = self.state_manager.get_session(logon_id)
+        if session is None:
+            return None
+
+        if process_time <= ensure_utc(session.start_time):
+            process_time = ensure_utc(session.start_time) + timedelta(milliseconds=250)
+        if process_time >= requested_time:
+            process_time = requested_time - timedelta(milliseconds=800)
+        if not _session_active_for_activity(session, process_time, margin_seconds=0.5):
+            return None
+
+        parent_pid = self._ensure_parent_chain(
+            source_system,
+            user,
+            process_time,
+            session.logon_id,
+            exe_name,
+            "macos",
+        )
+
+        pid = self.generate_process(
+            user=user,
+            system=source_system,
+            time=process_time,
+            logon_id=session.logon_id,
+            process_name=image,
+            command_line=command_line,
+            parent_pid=parent_pid,
+            suppress_command_file_effect=True,
+        )
+        self._record_user_process(source_system, user, pid, image)
+        self.state_manager.update_process_activity_time(source_system.hostname, pid, requested_time)
+        self.state_manager.set_current_time(requested_time)
+        return pid, image
+
+    def _active_source_macos_session(
+        self,
+        user: User,
+        system: System,
+        time: datetime,
+    ) -> ActiveSession | None:
+        """Return the newest active macOS session that can launch an SSH client."""
+        candidates = [
+            session
+            for session in self.state_manager.get_sessions_for_user_at(user.username, time)
+            if session.system == system.hostname
+            and _session_active_for_activity(session, time, margin_seconds=1.5)
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda session: ensure_utc(session.start_time))
+
     def _active_source_linux_session(
         self,
         user: User,
@@ -19261,13 +19382,25 @@ class ActivityGenerator:
         ):
             bash_time = max(sshd_time + timedelta(milliseconds=20), latest_bash_time)
 
+        # The destination-side login shell is OS-specific. macOS ships zsh as the
+        # default interactive shell (rendered as the login shell "-zsh"), while
+        # Linux distros default to bash ("-bash"). The per-session sshd process
+        # image is "/usr/sbin/sshd" on both (see system_processes.yaml), so only
+        # the shell differs.
+        if _get_os_category(target_system.os) == "macos":
+            shell_image = "/bin/zsh"
+            shell_command_line = "-zsh"
+        else:
+            shell_image = "/bin/bash"
+            shell_command_line = "-bash"
+
         bash_pid = self.generate_process(
             user=user,
             system=target_system,
             time=bash_time,
             logon_id=logon_id,
-            process_name="/bin/bash",
-            command_line="-bash",
+            process_name=shell_image,
+            command_line=shell_command_line,
             parent_pid=session_sshd_pid,
             suppress_command_file_effect=True,
         )
@@ -26695,6 +26828,46 @@ class ActivityGenerator:
         sys_pids["systemd"] = pid
         return pid
 
+    def _macos_anchor_pid(self, system: System, time: datetime) -> int:
+        """Return a tracked macOS launchd (PID 1) process for parent-chain fallbacks.
+
+        The macOS analog of :meth:`_linux_anchor_pid`. launchd is PID 1 by
+        kernel convention (see ``_seed_macos_process_tree``); production always
+        seeds it, but paths that build macOS process ancestry before seeding
+        (or in isolation) need a guaranteed root to parent under, exactly as the
+        Linux path guarantees systemd. Registers launchd directly at PID 1
+        rather than via ``create_process`` (which would allocate a different
+        PID), mirroring the seed.
+        """
+        sys_pids = getattr(self, "_system_pids", {}).setdefault(system.hostname, {})
+        pid = sys_pids.get("launchd")
+        if pid and self._is_pid_active_at(system, pid, time):
+            return pid
+        existing = self.state_manager.get_process(system.hostname, 1)
+        if existing is not None:
+            sys_pids.setdefault("launchd", 1)
+            return 1
+
+        from evidenceforge.models.state import RunningProcess
+
+        boot_time = time - timedelta(minutes=5)
+        object_id = stable_uuid("macos-launchd", system.hostname)
+        self.state_manager.state.running_processes[(system.hostname, 1)] = RunningProcess(
+            pid=1,
+            parent_pid=0,
+            image="/sbin/launchd",
+            command_line="/sbin/launchd",
+            username="root",
+            system=system.hostname,
+            start_time=boot_time,
+            integrity_level="System",
+            logon_id="",
+            ecar_object_id=object_id,
+        )
+        self.state_manager._process_object_ids[(system.hostname, 1)] = object_id
+        sys_pids["launchd"] = 1
+        return 1
+
     def _active_session_shell_pid(
         self,
         system: System,
@@ -28027,9 +28200,10 @@ class ActivityGenerator:
                 return sys_pids.get("services", sys_pids.get("wininit", 4))
             if os_cat == "macos":
                 # launchd is macOS's PID-1 root — its PID is fixed by kernel
-                # convention (see emitter_setup._seed_macos_process_tree), so
-                # it is always a safe anchor even if untracked in sys_pids.
-                return sys_pids.get("launchd", 1)
+                # convention (see emitter_setup._seed_macos_process_tree). Use
+                # the anchor helper so an unseeded host still gets a real,
+                # parentable launchd, mirroring the Linux systemd anchor below.
+                return self._macos_anchor_pid(system, time)
             return (
                 sys_pids.get("bash") or sys_pids.get("sshd") or self._linux_anchor_pid(system, time)
             )
@@ -28045,7 +28219,7 @@ class ActivityGenerator:
                     return session_explorer
                 return sys_pids.get("services", sys_pids.get("wininit", 4))
             if os_cat == "macos":
-                return sys_pids.get("launchd", 1)
+                return self._macos_anchor_pid(system, time)
             return (
                 sys_pids.get("bash") or sys_pids.get("sshd") or self._linux_anchor_pid(system, time)
             )
