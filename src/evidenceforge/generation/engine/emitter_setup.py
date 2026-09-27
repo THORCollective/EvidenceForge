@@ -626,8 +626,9 @@ class EmitterSetupMixin:
 
         # Register system IP→FQDN mappings so DNS queries use correct hostnames
         # (e.g., DC-01.meridian-healthcare.com instead of host-10.corp.local)
-        from evidenceforge.generation.activity.network import REVERSE_DNS
+        from evidenceforge.generation.activity.network import REVERSE_DNS, reset_reverse_dns
 
+        reset_reverse_dns()
         ad_domain = self._resolve_ad_domain()
         for system in self.scenario.environment.systems:
             fqdn = f"{system.hostname}.{ad_domain}"

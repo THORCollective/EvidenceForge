@@ -56,6 +56,21 @@ def _is_private_ip(ip: str) -> bool:
 
 # Backward-compatible: IP → domain (used by many modules)
 REVERSE_DNS: dict[str, str] = get_reverse_dns()
+# Registry-only snapshot: generation registers each scenario's host IP → FQDN
+# mappings into REVERSE_DNS, so it must be reset between generations.
+_REGISTRY_REVERSE_DNS: dict[str, str] = dict(REVERSE_DNS)
+
+
+def reset_reverse_dns() -> None:
+    """Restore REVERSE_DNS to the registry-only mappings, in place.
+
+    Called at the start of each generation so host mappings registered by an
+    earlier scenario in the same process cannot leak into the next one. The
+    dict is mutated in place because other modules alias it by import.
+    """
+    REVERSE_DNS.clear()
+    REVERSE_DNS.update(_REGISTRY_REVERSE_DNS)
+
 
 # Backward-compatible: domain → first IP
 FORWARD_DNS: dict[str, str] = {d: ips[0] for d, ips in get_forward_dns().items()}
