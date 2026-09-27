@@ -104,32 +104,36 @@ output:
 
 storyline:
   # --- Hunt 1: AMOS / Atomic Stealer -------------------------------------------
-  # The trojanized "CleanMyMac X" installer payload is the unsigned/ad-hoc
-  # dropper process (per the macos_signing.yaml AMOS convention). It owns the
-  # keychain read and the TLS exfil; it execs the genuine, Apple-signed
-  # /usr/bin/osascript only to render the fake system-password prompt.
-  #
-  # Emission order puts the credential-theft + exfil (attributed to the dropper,
-  # the last-recorded storyline process) immediately after the dropper exec, so
-  # both carry the dropper's unsigned identity — not osascript's. The osascript
-  # password prompt is a signed child that fires last.
+  # The trojanized "CleanMyMac X" installer payload is the ad-hoc signed dropper
+  # (no Team ID; see the macos_signing.yaml AMOS convention). In the order real
+  # AMOS runs: it execs the genuine, Apple-signed /usr/bin/osascript to phish
+  # the login password with a fake system dialog, then reads the login keychain
+  # and exfiltrates over TLS itself. process_ref pins the keychain read and the
+  # upload to the dropper, so the signed osascript child never owns them.
   - id: amos-infection
     time: "+22m"
     actor: dana.reyes
     system: MAC-DESIGN-01
-    activity: "AMOS/Atomic Stealer: fake CleanMyMac X installer harvests the login keychain and exfiltrates over TLS, prompting for the user password via osascript"
+    activity: "AMOS/Atomic Stealer: fake CleanMyMac X installer phishes the login password via osascript, then harvests the login keychain and exfiltrates over TLS"
     events:
       - type: process
         technique: "T1204.002 - User Execution: Malicious File"
-        description: "Trojanized, unnotarized CleanMyMac X installer payload (unsigned/ad-hoc) launches"
+        description: "Trojanized, unnotarized CleanMyMac X installer payload (ad-hoc signed, no Team ID) launches"
         process_name: "/Applications/CleanMyMacX Helper.app/Contents/MacOS/CleanMyMacX Helper"
         command_line: "/Applications/CleanMyMacX\\ Helper.app/Contents/MacOS/CleanMyMacX\\ Helper"
         process_ref: amos_dropper
+      - type: process
+        technique: "T1056.002 - Input Capture: GUI Input Capture"
+        description: "Dropper execs the genuine Apple-signed osascript to render a fake system-password dialog"
+        process_name: "/usr/bin/osascript"
+        command_line: "osascript -e \"display dialog \\\"macOS needs your password to update system settings.\\\" default answer \\\"\\\" with hidden answer with icon caution\""
+        parent_ref: amos_dropper
       - type: file
         technique: "T1555.001 - Credentials from Password Stores: Keychain"
         description: "Dropper opens the user login keychain to harvest stored secrets"
         path: "/Users/dana.reyes/Library/Keychains/login.keychain-db"
         action: open
+        process_ref: amos_dropper
       - type: connection
         technique: "T1041 - Exfiltration Over C2 Channel"
         description: "Dropper exfiltrates the harvested keychain + browser data over TLS to the stealer panel"
@@ -139,16 +143,14 @@ storyline:
         service: ssl
         orig_bytes: 2450000
         resp_bytes: 640
-      - type: process
-        technique: "T1059.002 - Command and Scripting Interpreter: AppleScript"
-        description: "Dropper execs the genuine Apple-signed osascript to render a fake system-password dialog"
-        process_name: "/usr/bin/osascript"
-        command_line: "osascript -e \"display dialog \\\"macOS needs your password to update system settings.\\\" default answer \\\"\\\" with hidden answer with icon caution\""
-        parent_ref: amos_dropper
+        process_ref: amos_dropper
 
   # --- Hunt 2: DPRK BeaverTail --------------------------------------------------
-  # A developer runs `npm install` of an attacker-controlled package; its
-  # postinstall script spawns `node`, which beacons to attacker infrastructure.
+  # A developer runs `npm install` of an attacker-controlled package in their
+  # webapp checkout. npm is a `#!/usr/bin/env node` script, so ES sees an exec
+  # of node with the npm script in argv. npm runs the package's postinstall
+  # lifecycle script through `sh -c` from the package directory; that node
+  # process beacons to attacker infrastructure.
   - id: beavertail-npm-postinstall
     time: "+51m"
     actor: sam.okafor
@@ -157,16 +159,27 @@ storyline:
     events:
       - type: process
         technique: "T1195.001 - Supply Chain Compromise: Compromise Software Dependencies and Development Tools"
-        description: "Developer installs a trojanized npm package; npm runs its postinstall lifecycle script"
-        process_name: "/usr/local/bin/npm"
-        command_line: "npm install @clearwater-ui/react-icons-pro"
+        description: "Developer installs a trojanized npm package (npm runs as a node script)"
+        process_name: "/usr/local/bin/node"
+        command_line: "node /usr/local/bin/npm install @clearwater-ui/react-icons-pro"
+        working_directory: "/Users/sam.okafor/dev/webapp"
         process_ref: npm_install
       - type: process
-        technique: "T1059.007 - Command and Scripting Interpreter: JavaScript"
-        description: "Malicious postinstall spawns node to run the BeaverTail stage-1 loader"
-        process_name: "/usr/local/bin/node"
-        command_line: "node /Users/sam.okafor/dev/webapp/node_modules/@clearwater-ui/react-icons-pro/scripts/postinstall.js"
+        technique: "T1059.004 - Command and Scripting Interpreter: Unix Shell"
+        description: "npm runs the package's postinstall lifecycle script through sh"
+        process_name: "/bin/sh"
+        command_line: "sh -c \"node scripts/postinstall.js\""
+        working_directory: "/Users/sam.okafor/dev/webapp/node_modules/@clearwater-ui/react-icons-pro"
         parent_ref: npm_install
+        process_ref: npm_lifecycle
+      - type: process
+        technique: "T1059.007 - Command and Scripting Interpreter: JavaScript"
+        description: "Malicious postinstall runs the BeaverTail stage-1 loader in node"
+        process_name: "/usr/local/bin/node"
+        command_line: "node scripts/postinstall.js"
+        working_directory: "/Users/sam.okafor/dev/webapp/node_modules/@clearwater-ui/react-icons-pro"
+        parent_ref: npm_lifecycle
+        process_ref: beavertail_loader
       - type: connection
         technique: "T1071.001 - Application Layer Protocol: Web Protocols"
         description: "node stage-1 loader beacons to attacker infrastructure to pull the stage-2 payload"
@@ -176,20 +189,21 @@ storyline:
         service: ssl
         orig_bytes: 1800
         resp_bytes: 96000
+        process_ref: beavertail_loader
 
   # --- Hunt 3: CloudMensis-style persistence -----------------------------------
-  # An unsigned helper drops a LaunchAgent plist. Do NOT declare the BTM event
+  # An ad-hoc signed helper drops a LaunchAgent plist. Do NOT declare the BTM event
   # here: the causal engine emits btm_launch_item_add automatically because the
   # file `create` lands under LaunchAgents.
   - id: cloudmensis-persistence
     time: "+86m"
     actor: riley.chen
     system: MAC-IT-01
-    activity: "CloudMensis-style persistence: an unsigned helper writes a masquerading LaunchAgent plist (BTM launch-item-add follows automatically)"
+    activity: "CloudMensis-style persistence: an ad-hoc signed helper writes a masquerading LaunchAgent plist (BTM launch-item-add follows automatically)"
     events:
       - type: process
         technique: "T1543.001 - Create or Modify System Process: Launch Agent"
-        description: "Unsigned persistence helper stages itself under /Users/Shared"
+        description: "Ad-hoc signed persistence helper (no Team ID) stages itself under /Users/Shared"
         process_name: "/Users/Shared/.cloudsync/cloudsyncd"
         command_line: "/Users/Shared/.cloudsync/cloudsyncd --install"
         process_ref: cloudmensis_helper
@@ -198,6 +212,7 @@ storyline:
         description: "Helper drops a LaunchAgent plist masquerading as an Apple iCloud sync daemon (drives the BTM causal rule)"
         path: "/Users/riley.chen/Library/LaunchAgents/com.apple.cloudsyncd.plist"
         action: create
+        process_ref: cloudmensis_helper
 
   # --- Supporting: legitimate admin SSH (exercises openssh_login + openssh_logout) --
   # A complete SSH session lifecycle: login on the macOS destination (rendered as

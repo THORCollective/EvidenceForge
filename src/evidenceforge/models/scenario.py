@@ -758,6 +758,7 @@ class ProcessEventSpec(_EventSpecBase):
     command_line: str | None = None  # defaults to process_name at generation time
     process_ref: str | None = None  # Optional durable ref for explicit parent/child lineage
     parent_ref: str | None = None  # Optional process_ref to use as this process parent
+    working_directory: str | None = None  # Optional cwd (ES exec.cwd / Sysmon CurrentDirectory)
     supplementary: Literal["auto", "none"] = "auto"
 
 
@@ -799,6 +800,7 @@ class FileEventSpec(_EventSpecBase):
     pid: int | None = (
         None  # Optional explicit actor PID override; default resolves from session/process context
     )
+    process_ref: str | None = None  # Optional earlier process_ref that performs this file action
 
 
 class ConnectionEventSpec(_EventSpecBase):
@@ -823,6 +825,7 @@ class ConnectionEventSpec(_EventSpecBase):
     orig_bytes: int | None = None  # Originator payload bytes (large for exfil)
     resp_bytes: int | None = None  # Responder payload bytes (large for downloads)
     conn_state: str | None = None  # Connection outcome (default: SF for storyline)
+    process_ref: str | None = None  # Optional earlier process_ref that owns this connection
 
     @field_validator("hostname")
     @classmethod

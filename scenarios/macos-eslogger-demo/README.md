@@ -37,54 +37,58 @@ eforge generate scenarios/macos-eslogger-demo/scenario.yaml -o ./output
 All three run `macOS 14.5` on the `10.20.10.0/24` segment. A core SPAN sensor
 (`ZEEK-CORE`) records their egress. A modest business-day baseline (app
 launches, `zsh`, browsing, Spotlight/Time Machine-style daemon churn) gives the
-hunts realistic noise to stand out from.
+hunts some noise to stand out from.
 
 ## The three hunts
 
 ### 1. AMOS / Atomic Stealer (`MAC-DESIGN-01`)
 
 A trojanized "CleanMyMac X" installer (a documented real-world AMOS lure)
-harvests the login keychain and exfiltrates it.
+phishes the login password, harvests the login keychain, and exfiltrates it.
 
 | Beat | ESF / Zeek evidence |
 |---|---|
-| Dropper runs | `exec` of `/Applications/CleanMyMacX Helper.app/Contents/MacOS/CleanMyMacX Helper` — **unsigned / ad-hoc** (`is_platform_binary=false`, empty `signing_id`, `CS_ADHOC`) |
-| Keychain theft | `open` of `~/Library/Keychains/login.keychain-db`, **attributed to the unsigned dropper** |
-| Fake password prompt | `exec` of `/usr/bin/osascript` — a **genuine, Apple-signed** platform binary (`com.apple.osascript`), spawned as a child of the dropper |
-| Exfiltration | Zeek `conn` + `dns` + `ssl`: `10.20.10.31 → 193.42.33.14:443` (`gateway.macos-analytics.top`), ~2.4 MB uploaded |
+| Dropper runs | `exec` whose `target` is `/Applications/CleanMyMacX Helper.app/Contents/MacOS/CleanMyMacX Helper` — **ad-hoc signed, no Team ID** (`team_id: null`, `is_platform_binary: false`, `CS_ADHOC` set in `codesigning_flags`), launched by LaunchServices (`ppid` 1) |
+| Fake password prompt | `exec` of `/usr/bin/osascript` — a **genuine, Apple-signed** platform binary (`com.apple.osascript`) whose parent is the dropper, running `display dialog … with hidden answer` |
+| Keychain theft | `open` of `~/Library/Keychains/login.keychain-db`, **attributed to the dropper** (not to `osascript`) |
+| Exfiltration | Zeek `dns` + `conn` + `ssl`: `10.20.10.31 → 193.42.33.14:443` (`gateway.macos-analytics.top`), ~2.4 MB uploaded by the dropper itself |
 
 **The signal is the code-signing identity.** `osascript` is a legitimate,
-ubiquitous macOS automation binary — it stays signed. The malice lives in *what
-spawned it* (an unsigned dropper) and in the keychain access + egress the
-dropper performs itself. Hunt on: unsigned process → keychain access → outbound
-TLS.
+ubiquitous macOS automation binary — it stays Apple-signed. The malice lives in
+*what spawned it* (a no-Team-ID, ad-hoc signed app) and in the keychain access
+and egress that app performs itself. Hunt on: non-platform process with no Team
+ID → keychain access → outbound TLS.
 
 ### 2. DPRK BeaverTail (`MAC-DEV-01`)
 
-A developer runs `npm install` of a malicious package; its postinstall script
-launches `node`, which beacons to attacker infrastructure.
+A developer runs `npm install` of a malicious package in their webapp checkout;
+its postinstall lifecycle script launches `node`, which beacons to attacker
+infrastructure.
 
 | Beat | ESF / Zeek evidence |
 |---|---|
-| Malicious install | `exec` of `npm` (`npm install @clearwater-ui/react-icons-pro`) |
-| Postinstall payload | `exec` of `node` running `.../scripts/postinstall.js` — child of `npm` |
-| Beacon | Zeek `conn` + `dns`: `10.20.10.32 → 45.128.199.72:443` (`api.ipcheck-beaver.cc`) |
+| Malicious install | `exec` of `/usr/local/bin/node` with argv `node /usr/local/bin/npm install @clearwater-ui/react-icons-pro` (npm is a node script), `cwd` `~/dev/webapp` |
+| Lifecycle script | `exec` of `/bin/sh -c "node scripts/postinstall.js"`, child of npm, `cwd` = the package directory |
+| Postinstall payload | `exec` of `node scripts/postinstall.js`, child of `sh` |
+| Beacon | Zeek `conn` + `dns` + `ssl`: `10.20.10.32 → 45.128.199.72:443` (`api.ipcheck-beaver.cc`) |
 
-ESF has **no TCP-connect event** (deliberate — real ES clients pair with
-NetworkExtension). The `node` egress is hunted by correlating the ES `exec`
-ancestry with the Zeek flow/DNS for the same host — a stronger cross-source
-story than a single-source alert.
+`node` itself is the official, Node.js Foundation Developer ID-signed binary —
+signing is not the signal here. The hunt is the **ancestry** (npm → `sh` →
+`node` from inside `node_modules`) plus the egress. ESF has **no TCP-connect
+event** (real ES clients pair with NetworkExtension), so the `node` egress is
+found by correlating the ES `exec` ancestry with the Zeek flow/DNS for the same
+host at the same time.
 
 ### 3. CloudMensis-style persistence (`MAC-IT-01`)
 
-An unsigned helper installs a LaunchAgent that masquerades as an Apple iCloud
-sync daemon.
+An ad-hoc signed helper installs a LaunchAgent that masquerades as an Apple
+iCloud sync daemon.
 
 | Beat | ESF evidence |
 |---|---|
-| Helper stages itself | `exec` of `/Users/Shared/.cloudsync/cloudsyncd` (unsigned) |
-| Persistence dropped | `create` of `~/Library/LaunchAgents/com.apple.cloudsyncd.plist` |
-| Background Task Management | `btm_launch_item_add` — **auto-generated by the causal engine**, not declared in the scenario, referencing the same plist (`item_type: agent`) |
+| Helper runs | `exec` of `/Users/Shared/.cloudsync/cloudsyncd --install` (ad-hoc signed, no Team ID) |
+| Persistence dropped | `create` of `~/Library/LaunchAgents/com.apple.cloudsyncd.plist` by the helper |
+| Background Task Management | `btm_launch_item_add` reported by `backgroundtaskmanagementd`, with the helper as `instigator`, `item_type: 3` (agent), `legacy: true`, and `item_url` pointing at the same plist — **auto-generated by the causal engine**, not declared in the scenario |
 
 The `btm_launch_item_add` event is the modern (macOS 13+) persistence signal.
 The scenario author writes **only** the plist `create`; EvidenceForge's causal
@@ -92,17 +96,21 @@ expansion emits the BTM event because the file lands under `LaunchAgents`.
 
 ### Supporting: legitimate SSH (`MAC-DEV-01`)
 
-The IT admin SSHes in for maintenance and logs off — a complete
-`openssh_login` → `openssh_logout` pair (same audit-session id), included so the
+The IT admin (`riley.chen`, from `MAC-IT-01`) SSHes into the developer
+workstation for maintenance and logs off — a complete `openssh_login` →
+`openssh_logout` pair on `MAC-DEV-01` (same audit-session id), included so the
 ESF SSH lifecycle is observable end-to-end alongside the malicious beats.
 
 ## What to verify
 
-- **Signing identity is the hunt's thesis.** In `eslogger.ndjson`, the AMOS
-  dropper, BeaverTail `npm`/`node`, and the CloudMensis helper are all unsigned;
-  `osascript` and system binaries are Apple-signed platform binaries. Full
-  `argv`, `signing_id`, `team_id`, `cdhash`, and `is_platform_binary` are on
-  every process record.
+- **Record shape.** Records follow Apple's `es_message_t` layout: `event_type`
+  values from `ESTypes.h`, the launched program in `event.exec.target` (the
+  exec's `process` is the pre-exec image), PIDs only inside audit tokens, and
+  `codesigning_flags` as the `cs_blobs.h` bitmask.
+- **Signing identity is the hunt's thesis.** The AMOS dropper and the
+  CloudMensis helper are ad-hoc signed with no Team ID; `osascript` and every
+  binary on the system volume are Apple platform binaries; third-party apps
+  (Chrome, VS Code, node) carry their real vendor Team IDs.
 - **Cross-source correlation.** Join the ES `exec` ancestry to the Zeek
   `conn`/`dns` rows for the same host to tie a process to its egress.
 - **BTM without authoring it.** Confirm `btm_launch_item_add` appears even

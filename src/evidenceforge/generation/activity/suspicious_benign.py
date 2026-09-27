@@ -96,6 +96,22 @@ _BENIGN_LINUX_CMD = [
     "lsof -i :22",
 ]
 
+# macOS commands that look like recon or credential/code-signing access but are
+# routine admin and developer tasks (image path, command line).
+_BENIGN_MACOS_CMD = [
+    ("/usr/bin/security", "security find-identity -v -p codesigning"),
+    ("/usr/bin/codesign", "codesign -dv --verbose=4 /Applications/Slack.app"),
+    ("/usr/bin/dscl", "dscl . -list /Users UniqueID"),
+    ("/usr/sbin/spctl", "spctl --status"),
+    ("/usr/bin/csrutil", "csrutil status"),
+    ("/bin/launchctl", "launchctl list"),
+    ("/usr/bin/defaults", "defaults read /Library/Preferences/com.apple.loginwindow"),
+    ("/usr/sbin/system_profiler", "system_profiler SPSoftwareDataType"),
+    ("/usr/bin/log", "log show --last 1h --predicate 'process == \"sshd\"'"),
+    ("/usr/sbin/lsof", "lsof -i :22"),
+    ("/usr/bin/last", "last -n 50"),
+]
+
 
 def get_suspicious_event_count(noise_level: str, rng: random.Random) -> int:
     """Get the number of suspicious events to generate for this hour.
@@ -237,6 +253,8 @@ def generate_suspicious_cli(
         else:
             cmd = rng.choice(_BENIGN_CMD)
             process = r"C:\Windows\System32\cmd.exe"
+    elif os_cat == "macos":
+        process, cmd = rng.choice(_BENIGN_MACOS_CMD)
     else:
         cmd = rng.choice(_BENIGN_LINUX_CMD)
         process = cmd.split()[0]

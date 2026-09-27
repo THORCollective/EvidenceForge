@@ -152,6 +152,11 @@ class TestGetSigningIdentity:
             ("/usr/libexec/sharingd", "com.apple.sharingd"),
             ("/System/Library/CoreServices/NotificationCenter", "com.apple.NotificationCenter"),
             ("/usr/bin/zip", "com.apple.zip"),
+            (
+                "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/"
+                "com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent",
+                "com.apple.WebKit.WebContent",
+            ),
         ],
     )
     def test_unlisted_system_volume_path_is_apple_platform_binary(self, path, signing_id):

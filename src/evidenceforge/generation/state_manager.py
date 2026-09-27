@@ -54,6 +54,7 @@ _MACOS_PID_FLOOR = 100
 # churn (XPC services, mdworker, etc.). A lightly used Mac wraps PID_MAX about
 # every one to two days; heavily used ones wrap several times a day.
 _MACOS_PID_CHURN_PER_SECOND = 0.7
+_MACOS_PID_SLOT_WIDTH = 6
 _MAX_GENERATED_LOGON_LUID = 0xFFFFFFFF
 _GENERATED_LOGON_LUID_SPAN = _MAX_GENERATED_LOGON_LUID - _MIN_GENERATED_LOGON_LUID + 1
 _HOST_LOGON_BUCKET_SPACE = 0x01000000
@@ -890,20 +891,17 @@ class StateManager:
         current_time = ensure_utc(current_time or self.state.current_time)
         epoch = self._pid_time_epochs.setdefault(system, current_time)
         elapsed = max(0.0, (current_time - epoch).total_seconds())
-        block = int(elapsed // 300)
-        # Per-block jitter stays well under one block's churn (~210 PIDs), so
-        # PIDs remain time-ordered across block boundaries without encoding
-        # exact elapsed seconds.
-        jitter = _stable_seed(f"macos_pid_block_jitter:{system}:{block}") % 40
-        second = int(elapsed)
-        ordinal = self._pid_bucket_offsets.get((system, -1, second), 0)
-        self._pid_bucket_offsets[(system, -1, second)] = (
-            ordinal + 1 + (_stable_seed(f"macos_pid_ordinal:{system}:{second}:{ordinal}") % 3)
-        )
+        # Each churn slot spans _MACOS_PID_SLOT_WIDTH PIDs (~8.6 s at the
+        # churn rate). Processes landing in the same slot take successive
+        # ordinals, so same-slot processes stay below the next slot's PIDs;
+        # the per-slot offset keeps PID deltas from encoding exact seconds.
+        slot = int(elapsed * _MACOS_PID_CHURN_PER_SECOND / _MACOS_PID_SLOT_WIDTH)
+        ordinal = self._pid_bucket_offsets.get((system, -1, slot), 0)
+        self._pid_bucket_offsets[(system, -1, slot)] = ordinal + 1
         raw = (
             self._pid_counters[system]
-            + int(elapsed * _MACOS_PID_CHURN_PER_SECOND)
-            + jitter
+            + slot * _MACOS_PID_SLOT_WIDTH
+            + _stable_seed(f"macos_pid_slot:{system}:{slot}") % 2
             + ordinal
         )
         self._macos_pid_sequence[system] = raw

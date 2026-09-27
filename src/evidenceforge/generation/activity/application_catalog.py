@@ -317,9 +317,20 @@ def resolve_image_path(exe_basename: str, os_category: str = "windows", username
         return sys_path
 
     # 4. Last resort — assume System32 (Windows) or /usr/bin (Linux/macOS)
+    return _fallback_image_path(exe_basename, os_category)
+
+
+def _fallback_image_path(exe_basename: str, os_category: str) -> str:
+    """Return the last-resort guessed path for an executable with no configured path."""
     if os_category in ("linux", "macos"):
         return f"/usr/bin/{exe_basename}"
     return rf"C:\Windows\System32\{exe_basename}"
+
+
+def has_configured_image_path(exe_basename: str, os_category: str = "windows") -> bool:
+    """Return whether ``resolve_image_path`` finds a configured path, not a fallback guess."""
+    resolved = resolve_image_path(exe_basename, os_category)
+    return resolved != exe_basename and resolved != _fallback_image_path(exe_basename, os_category)
 
 
 def _build_path_index() -> dict[str, dict[str, str]]:

@@ -2810,6 +2810,97 @@ class TestStorylineOsPlausibility:
             for issue in issues
         )
 
+    def test_unknown_binary_full_path_is_not_flagged_as_noncanonical(self):
+        """An attacker-chosen path for a binary with no configured path is legitimate."""
+        scenario = Scenario(
+            version="1.0",
+            name="test",
+            description="Test",
+            environment=Environment(
+                description="Test env",
+                users=[User(username="jdoe", full_name="J", email="j@test.com")],
+                systems=[
+                    System(hostname="MAC-01", ip="10.0.0.1", os="macOS 14.5", type="workstation"),
+                ],
+            ),
+            storyline=[
+                StorylineEvent(
+                    id="evt-val-unknown-binary",
+                    time="2024-01-15T10:00:00Z",
+                    actor="jdoe",
+                    system="MAC-01",
+                    activity="run dropper",
+                    events=[
+                        {
+                            "type": "process",
+                            "process_name": "/Users/Shared/.cloudsync/cloudsyncd",
+                        }
+                    ],
+                ),
+            ],
+            time_window=TimeWindow(start=datetime(2024, 1, 15, 10, 0, 0), duration="1h"),
+            baseline_activity=BaselineActivity(
+                description="Test", intensity="medium", variation="low"
+            ),
+            output=OutputSpec(logs=[{"format": "eslogger"}], destination="./output"),
+        )
+
+        issues = ScenarioValidator(scenario).validate()
+
+        assert not any(
+            "differs from configured canonical path" in issue.message for issue in issues
+        )
+
+    @pytest.mark.parametrize("event_type", ["file", "connection"])
+    def test_file_and_connection_process_ref_must_match_earlier_process(self, event_type):
+        """process_ref on a file/connection event names an earlier storyline process."""
+        action = (
+            {"type": "file", "path": "/Users/jdoe/Library/Keychains/login.keychain-db"}
+            if event_type == "file"
+            else {"type": "connection", "dst_ip": "203.0.113.10", "dst_port": 443}
+        )
+        scenario = Scenario(
+            version="1.0",
+            name="test",
+            description="Test",
+            environment=Environment(
+                description="Test env",
+                users=[User(username="jdoe", full_name="J", email="j@test.com")],
+                systems=[
+                    System(hostname="MAC-01", ip="10.0.0.1", os="macOS 14.5", type="workstation"),
+                ],
+            ),
+            storyline=[
+                StorylineEvent(
+                    id="evt-val-action-ref",
+                    time="2024-01-15T10:00:00Z",
+                    actor="jdoe",
+                    system="MAC-01",
+                    activity="dropper acts",
+                    events=[
+                        {
+                            "type": "process",
+                            "process_name": "/tmp/dropper",
+                            "process_ref": "dropper",
+                        },
+                        {**action, "process_ref": "dropper"},
+                        {**action, "process_ref": "missing"},
+                    ],
+                ),
+            ],
+            time_window=TimeWindow(start=datetime(2024, 1, 15, 10, 0, 0), duration="1h"),
+            baseline_activity=BaselineActivity(
+                description="Test", intensity="medium", variation="low"
+            ),
+            output=OutputSpec(logs=[{"format": "eslogger"}], destination="./output"),
+        )
+
+        issues = ScenarioValidator(scenario).validate()
+        ref_warnings = [issue for issue in issues if issue.field_path.endswith("process_ref")]
+
+        assert [issue.field_path for issue in ref_warnings] == ["storyline.0.events.2.process_ref"]
+        assert "missing" in ref_warnings[0].message
+
     def test_linux_path_on_windows_warning(self):
         """Process with /usr/ path on Windows should warn."""
         scenario = Scenario(

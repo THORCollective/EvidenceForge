@@ -131,8 +131,13 @@ def codesigning_flags_value(flag_names: list[str]) -> int:
 def _identity_from_entry(entry: dict[str, Any], binary_path: str) -> dict[str, Any]:
     """Build a fresh identity dict from a YAML entry or a templated fallback."""
     basename = binary_path.rsplit("/", 1)[-1]
+    signing_id = str(entry.get("signing_id", ""))
+    if signing_id == "com.apple.{basename}" and basename.startswith("com.apple."):
+        # XPC services such as com.apple.WebKit.WebContent are already named
+        # by their bundle identifier.
+        signing_id = basename
     return {
-        "signing_id": str(entry.get("signing_id", "")).replace("{basename}", basename),
+        "signing_id": signing_id.replace("{basename}", basename),
         "team_id": entry.get("team_id"),
         "is_platform_binary": bool(entry.get("is_platform_binary", False)),
         "codesigning_flags": codesigning_flags_value(list(entry.get("codesigning_flags", []))),

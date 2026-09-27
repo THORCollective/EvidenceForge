@@ -158,11 +158,66 @@ def test_hunt1_amos_unsigned_dropper_exec_and_keychain_open(tmp_path: Path) -> N
 def test_hunt2_beavertail_npm_node_exec_chain(tmp_path: Path) -> None:
     output = _generate(tmp_path)
     records = _eslogger_records(output, MACOS_HOSTS["MAC-DEV-01"])
-    exec_paths = {
-        _exec_target(r)["executable"]["path"] for r in records if _event_name(r) == "exec"
-    }
-    assert any(p.endswith("/npm") for p in exec_paths), f"no npm exec in {exec_paths}"
-    assert any(p.endswith("/node") for p in exec_paths), f"no node exec in {exec_paths}"
+    execs = [r for r in records if _event_name(r) == "exec"]
+
+    # npm is a node script: ES sees node exec'd with the npm script in argv.
+    npm = next(
+        r
+        for r in execs
+        if r["event"]["exec"]["args"][:3] == ["node", "/usr/local/bin/npm", "install"]
+    )
+    assert _exec_target(npm)["executable"]["path"] == "/usr/local/bin/node"
+    assert npm["event"]["exec"]["cwd"]["path"] == "/Users/sam.okafor/dev/webapp"
+
+    # npm -> sh -c (lifecycle script) -> node postinstall, from the package dir.
+    npm_pid = _exec_target(npm)["audit_token"]["pid"]
+    lifecycle = next(
+        r
+        for r in execs
+        if r["process"]["ppid"] == npm_pid and r["event"]["exec"]["args"][0] == "sh"
+    )
+    loader = next(
+        r for r in execs if r["process"]["ppid"] == _exec_target(lifecycle)["audit_token"]["pid"]
+    )
+    assert loader["event"]["exec"]["args"] == ["node", "scripts/postinstall.js"]
+    assert loader["event"]["exec"]["cwd"]["path"].endswith(
+        "/node_modules/@clearwater-ui/react-icons-pro"
+    )
+
+
+def test_hunt1_amos_runs_in_real_order_and_dropper_owns_exfil(tmp_path: Path) -> None:
+    output = _generate(tmp_path)
+    records = _eslogger_records(output, MACOS_HOSTS["MAC-DESIGN-01"])
+
+    dropper = next(
+        r
+        for r in records
+        if _event_name(r) == "exec" and _exec_target(r)["executable"]["path"] == AMOS_DROPPER
+    )
+    dropper_pid = _exec_target(dropper)["audit_token"]["pid"]
+    # LaunchServices launched the app: its parent is launchd, not a shell or sshd.
+    assert dropper["process"]["ppid"] == 1
+    prompt = next(
+        r
+        for r in records
+        if _event_name(r) == "exec"
+        and _exec_target(r)["executable"]["path"] == "/usr/bin/osascript"
+        and r["process"]["ppid"] == dropper_pid
+    )
+    keychain = next(
+        r
+        for r in records
+        if _event_name(r) == "open" and r["event"]["open"]["file"]["path"] == KEYCHAIN_PATH
+    )
+    # Real AMOS phishes the password first, then reads the keychain.
+    assert dropper["time"] < prompt["time"] < keychain["time"]
+    assert keychain["process"]["audit_token"]["pid"] == dropper_pid
+
+    # The dropper uploads natively; no curl is fabricated to own the exfil.
+    assert not any(
+        _event_name(r) == "exec" and "macos-analytics" in " ".join(r["event"]["exec"]["args"])
+        for r in records
+    )
 
 
 def test_hunt3_cloudmensis_plist_create_drives_btm(tmp_path: Path) -> None:

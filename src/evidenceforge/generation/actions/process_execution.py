@@ -50,6 +50,7 @@ class ProcessExecutionRequest:
     allow_existing_browser_reuse: bool = True
     allow_browser_launch_spacing: bool = True
     concurrency_group_id: str = ""
+    current_directory: str = ""  # Explicit working directory; derived when empty
     source: str = "activity_generator"
 
     @property

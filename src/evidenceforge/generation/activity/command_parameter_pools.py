@@ -56,3 +56,16 @@ def command_parameter_pools() -> dict[str, dict[str, list[str]]]:
             if isinstance(values, list)
         }
     return result
+
+
+def command_parameter_os_overrides(os_category: str) -> dict[str, list[str]]:
+    """Return pools that replace same-named general pools on hosts of ``os_category``."""
+    overrides = load_command_parameter_pools().get("os_overrides", {})
+    section = overrides.get(os_category, {}) if isinstance(overrides, dict) else {}
+    if not isinstance(section, dict):
+        return {}
+    return {
+        str(key): [str(value) for value in values if str(value)]
+        for key, values in section.items()
+        if isinstance(values, list)
+    }

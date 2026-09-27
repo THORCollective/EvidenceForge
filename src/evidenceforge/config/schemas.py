@@ -342,9 +342,19 @@ class CommandParameterPoolsConfig(BaseModel, extra="forbid"):
     general: dict[str, list[str]]
     query: dict[str, list[str]]
     linux_query: dict[str, list[str]] = Field(default_factory=dict)
+    os_overrides: dict[str, dict[str, list[str]]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def pools_are_non_empty_strings_and_urls_have_hosts(self) -> Self:
+        for os_category, section in self.os_overrides.items():
+            if os_category not in {"windows", "linux", "macos"}:
+                raise ValueError(
+                    f"os_overrides.{os_category} is not a known os_category "
+                    "(use windows, linux, or macos)"
+                )
+            for key, values in section.items():
+                if not values:
+                    raise ValueError(f"os_overrides.{os_category}.{key} must not be empty")
         for section_name in ("general", "query", "linux_query"):
             section = getattr(self, section_name)
             for key, values in section.items():

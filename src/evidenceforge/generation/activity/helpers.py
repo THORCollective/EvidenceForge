@@ -28,7 +28,7 @@ from evidenceforge.utils.rng for backward compatibility.
 
 from evidenceforge.utils.rng import _get_rng, _thread_local  # noqa: F401
 
-from .command_parameter_pools import command_parameter_pools
+from .command_parameter_pools import command_parameter_os_overrides, command_parameter_pools
 
 
 def _get_os_category(os_string: str) -> str:
@@ -222,7 +222,7 @@ _QUERY_PARAMS_LINUX = {
 }
 
 
-def _parameterize_command(rng, command_line: str, username: str = "") -> str:
+def _parameterize_command(rng, command_line: str, username: str = "", os_category: str = "") -> str:
     """Replace {placeholders} in command lines with random realistic values.
 
     Runs multiple passes since expanding one placeholder (e.g., {sql_query})
@@ -230,7 +230,8 @@ def _parameterize_command(rng, command_line: str, username: str = "") -> str:
 
     When username is provided, {username} is substituted first for per-user
     path customization. Per-user affinity is achieved by the caller seeding
-    the rng appropriately.
+    the rng appropriately. When os_category is provided, that OS's override
+    pools (e.g. macOS project paths) replace the Windows-shaped defaults.
     """
     # Substitute {username} first (literal, not random)
     if username and "{username}" in command_line:
@@ -239,6 +240,8 @@ def _parameterize_command(rng, command_line: str, username: str = "") -> str:
     all_params = {**_GENERAL_PARAMS, **_QUERY_PARAMS, **_QUERY_PARAMS_LINUX}
     for section_values in command_parameter_pools().values():
         all_params.update(section_values)
+    if os_category:
+        all_params.update(command_parameter_os_overrides(os_category))
     for _pass in range(3):  # Max 3 passes to resolve nested placeholders
         changed = False
         for key, values in all_params.items():

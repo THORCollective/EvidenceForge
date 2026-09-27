@@ -4953,7 +4953,9 @@ class ActivityGenerator:
             target = self._pick_database_target_placeholder(rng, command_line, system)
             if target:
                 command_line = command_line.replace("{db_server}", target)
-        return _parameterize_command(rng, command_line, username=username)
+        return _parameterize_command(
+            rng, command_line, username=username, os_category=_get_os_category(system.os)
+        )
 
     def _pick_internal_url_placeholder(self, rng: random.Random) -> str:
         """Return an internal URL in the current scenario namespace."""
@@ -10547,6 +10549,47 @@ class ActivityGenerator:
             return r"C:\Windows\System32"
         return rf"C:\Users\{account}"
 
+    def _derive_macos_current_directory(
+        self,
+        system: System,
+        username: str,
+        process_name: str,
+        command_line: str,
+        parent_pid: int,
+    ) -> str:
+        """Derive a macOS process working directory (ES ``exec.cwd``).
+
+        LaunchServices starts app bundles (and launchd starts daemons) with a
+        working directory of ``/``; root's home is ``/var/root``; interactive
+        users live under ``/Users``. Shell-launched developer tools run from a
+        project checkout, and npm lifecycle scripts run from their package
+        directory.
+        """
+        account = username.split("\\")[-1]
+        parent_image = (
+            self._lookup_process_name(system.hostname, parent_pid, "macos") or ""
+        ).rsplit("/", 1)[-1]
+        if ".app/Contents/MacOS/" in process_name or parent_image == "launchd":
+            return "/"
+        if account == "root":
+            # Daemon-spawned root helpers (e.g. sshd's privsep child) inherit
+            # "/"; only root's interactive shells run from its home.
+            return "/var/root" if parent_image in {"zsh", "bash", "sh", "sudo", "su"} else "/"
+        if not account or account.startswith("_") or account in _SYSTEM_ACCOUNTS:
+            return "/"
+        for token in command_line.split():
+            head, marker, tail = token.partition("/node_modules/")
+            if marker and head.startswith("/Users/"):
+                parts = tail.split("/")
+                depth = 2 if parts[0].startswith("@") and len(parts) > 1 else 1
+                return f"{head}{marker}{'/'.join(parts[:depth])}"
+        exe = process_name.rsplit("/", 1)[-1]
+        if exe in {"git", "node", "npm", "npx", "make", "python3", "cargo", "go", "docker"}:
+            repos = ("webapp", "api-service", "design-system", "infra", "data-tools")
+            repo = repos[_stable_seed(f"macos_repo:{system.hostname}:{account}") % len(repos)]
+            return f"/Users/{account}/dev/{repo}"
+        return f"/Users/{account}"
+
     def _derive_current_directory(
         self,
         system: System,
@@ -10557,6 +10600,10 @@ class ActivityGenerator:
         logon_type: int = 2,
     ) -> str:
         """Derive a source-native process working directory for Sysmon Event 1."""
+        if _get_os_category(system.os) == "macos":
+            return self._derive_macos_current_directory(
+                system, username, process_name, command_line, parent_pid
+            )
         if _get_os_category(system.os) != "windows":
             account = username.split("\\")[-1]
             return (
@@ -10938,6 +10985,7 @@ class ActivityGenerator:
         allow_existing_browser_reuse: bool = True,
         allow_browser_launch_spacing: bool = True,
         concurrency_group_id: str = "",
+        current_directory: str = "",
     ) -> int:
         """Generate process creation event across all applicable log formats.
 
@@ -10965,6 +11013,8 @@ class ActivityGenerator:
                 launches. Causal connection-owner processes disable this so process
                 creation stays before the socket evidence they own.
             concurrency_group_id: Explicit same-shell concurrency group for true pipelines.
+            current_directory: Explicit working directory (e.g. a scenario-declared
+                cwd); derived from the process and its parent when empty.
 
         Returns:
             PID of the new process
@@ -10983,6 +11033,7 @@ class ActivityGenerator:
             allow_existing_browser_reuse=allow_existing_browser_reuse,
             allow_browser_launch_spacing=allow_browser_launch_spacing,
             concurrency_group_id=concurrency_group_id,
+            current_directory=current_directory,
         )
         return ProcessExecutionActionBundle(self, request).execute()
 
@@ -11345,7 +11396,8 @@ class ActivityGenerator:
                 token_elevation=_token_elevation,
                 mandatory_label=_mandatory_label,
                 start_time=running_proc.start_time if running_proc is not None else None,
-                current_directory=self._derive_current_directory(
+                current_directory=request.current_directory
+                or self._derive_current_directory(
                     system=system,
                     username=process_username,
                     process_name=process_name,
@@ -11399,6 +11451,21 @@ class ActivityGenerator:
             )
             _is_linux_system_binary = _lower.startswith(_linux_system_binary_prefixes)
             _is_system_binary = _is_windows_system_binary or _is_linux_system_binary
+            _macos_image_writer = None
+            if not _is_system_binary and _get_os_category(system.os) == "macos":
+                # A macOS process cannot write its own executable after exec.
+                # The image was dropped by the parent before launch; when the
+                # parent is launchd (an app opened via LaunchServices) the
+                # writer (a download or installer) is outside the model.
+                _parent = self.state_manager.get_process(system.hostname, parent_pid)
+                if (
+                    _parent is not None
+                    and _parent.pid > 1
+                    and _parent.start_time < time - timedelta(milliseconds=180)
+                ):
+                    _macos_image_writer = _parent
+                else:
+                    _is_system_binary = True
             if not _is_system_binary:
                 file_create_time = time + timedelta(milliseconds=120)
                 file_process_pid = pid
@@ -11411,7 +11478,17 @@ class ActivityGenerator:
                     running_proc.start_time if running_proc is not None else None
                 )
                 file_actor_obj_id = proc_obj_id
-                if _exe_lower in {"psexesvc.exe", "healthmonitorsvc.exe"}:
+                if _macos_image_writer is not None:
+                    file_create_time = time - timedelta(milliseconds=180)
+                    file_process_pid = _macos_image_writer.pid
+                    file_process_parent_pid = _macos_image_writer.parent_pid
+                    file_process_image = _macos_image_writer.image
+                    file_process_command_line = _macos_image_writer.command_line
+                    file_process_username = _macos_image_writer.username
+                    file_process_logon_id = _macos_image_writer.logon_id
+                    file_process_start_time = _macos_image_writer.start_time
+                    file_actor_obj_id = _macos_image_writer.ecar_object_id
+                elif _exe_lower in {"psexesvc.exe", "healthmonitorsvc.exe"}:
                     file_create_time = time - timedelta(milliseconds=180)
                     parent_proc = self.state_manager.get_process(system.hostname, parent_pid)
                     if parent_proc is not None and parent_proc.start_time < file_create_time:
@@ -27360,6 +27437,25 @@ class ActivityGenerator:
                 return parent_pid
             return self._windows_system_parent_fallback(system, time)
 
+        if os_category == "macos":
+            # A macOS child may outlive its parent (it is reparented to launchd),
+            # so any parent alive at the child's start is valid -- including an
+            # explicit storyline parent whose exit was already generated.
+            if self._is_pid_active_at(system, parent_pid, time):
+                return parent_pid
+            if user_context:
+                resolved = self._resolve_parent(
+                    system,
+                    self._user_model_for_username(process_username),
+                    time,
+                    logon_id,
+                    process_name,
+                    command_line,
+                )
+                if self._is_pid_active_at(system, resolved, time):
+                    return resolved
+            return self._macos_anchor_pid(system, time)
+
         if user_context:
             repair_user = self._user_model_for_username(process_username)
             materialized_parent = self._materialize_visible_linux_shell_parent_for_child(
@@ -27755,6 +27851,22 @@ class ActivityGenerator:
 
             # Default: session-specific or system-wide explorer.exe
             return explorer_pid
+        elif os_cat == "macos":
+            # App bundles are started by LaunchServices, so launchd (PID 1) is
+            # their parent -- never a shell or sshd, even for malware the user
+            # double-clicked.
+            if ".app/Contents/MacOS/" in process_name:
+                return self._macos_anchor_pid(system, effective_time)
+            # CLI tools come from the user's own shell. Unlike Linux, there is
+            # no persistent root shell to borrow: a user process with no live
+            # shell of its own falls back to launchd, not to sshd.
+            session_shell_pid = self._active_session_shell_pid(system, user, time)
+            if session_shell_pid is not None:
+                return session_shell_pid
+            shells = [(pid, name) for pid, name in alive_history if name in self._LINUX_SHELLS]
+            if shells:
+                return shells[-1][0]
+            return self._macos_anchor_pid(system, effective_time)
         else:
             # Linux: most user commands spawn from a shell
             session_shell_pid = self._active_session_shell_pid(system, user, time)
@@ -28036,6 +28148,14 @@ class ActivityGenerator:
                     if "\\" in proc.image
                     else proc.image.rsplit("/", 1)[-1].lower()
                 )
+                if (
+                    os_cat == "macos"
+                    and proc_exe in {"zsh", "bash", "sh"}
+                    and proc.username != user.username
+                ):
+                    # Another account's shell (e.g. the seeded root shell) cannot
+                    # spawn this user's commands.
+                    continue
                 if proc_exe in possible_parents:
                     alive_parents.append((pid, proc.image))
 
@@ -28488,6 +28608,14 @@ class ActivityGenerator:
             if shell_parents:
                 possible_parents = shell_parents
 
+        if os_cat == "macos":
+            # zsh has been the macOS default login shell since 10.15, and an
+            # interactive login shell is started by Terminal's login(1).
+            if "zsh" in possible_parents:
+                possible_parents = ["zsh"]
+            elif child_exe_lower in {"zsh", "bash", "sh"} and "login" in possible_parents:
+                possible_parents = ["login"]
+
         # Prefer shells for CLI tools on Windows, sshd→bash for Linux
         chosen_parent = rng.choice(possible_parents)
         if os_cat == "windows" and chosen_parent.lower() == "explorer.exe":
@@ -28513,18 +28641,35 @@ class ActivityGenerator:
                     if "\\" in proc.image
                     else proc.image.rsplit("/", 1)[-1].lower()
                 )
-                if proc_exe == chosen_parent:
+                if (
+                    os_cat == "macos"
+                    and proc_exe in {"zsh", "bash", "sh"}
+                    and proc.username != user.username
+                ):
+                    continue
+                if proc_exe == chosen_parent.lower():
                     return pid
-
-        # Not a seeded process — need to create it, but first ensure ITS parent
-        grandparent_pid = self._ensure_parent_chain(
-            system, user, time, logon_id, chosen_parent, os_cat, depth=depth + 1
-        )
 
         # Get command template for the parent we're creating
         config = get_parent_config(os_cat, chosen_parent)
+        if os_cat == "macos":
+            # Anchor each ancestor to its own child's start so the chain nests
+            # strictly in time (grandparent < parent < child). Linux/Windows
+            # keep their existing timing below.
+            macos_delay = config.get("spawn_delay", [0.5, 3.0])
+            macos_parent_time = time - timedelta(
+                seconds=rng.uniform(macos_delay[0], macos_delay[1])
+            )
+            grandparent_pid = self._ensure_parent_chain(
+                system, user, macos_parent_time, logon_id, chosen_parent, os_cat, depth=depth + 1
+            )
+        else:
+            # Not a seeded process — need to create it, but first ensure ITS parent
+            grandparent_pid = self._ensure_parent_chain(
+                system, user, time, logon_id, chosen_parent, os_cat, depth=depth + 1
+            )
         cmd_templates = config.get("command_templates", [chosen_parent])
-        cmd_line = rng.choice(cmd_templates)
+        cmd_line = rng.choice(cmd_templates).replace("{username}", user.username)
 
         # Derive image path from command_templates (which have correct full paths)
         # rather than blindly prefixing C:\Windows\System32\
@@ -28549,9 +28694,12 @@ class ActivityGenerator:
                     image = f"/bin/{chosen_parent}"
 
         # Timing: parent is created before child
-        spawn_delay = config.get("spawn_delay", [0.5, 3.0])
-        delay_sec = rng.uniform(spawn_delay[0], spawn_delay[1])
-        parent_time = time - timedelta(seconds=delay_sec * (depth + 1))
+        if os_cat == "macos":
+            parent_time = macos_parent_time
+        else:
+            spawn_delay = config.get("spawn_delay", [0.5, 3.0])
+            delay_sec = rng.uniform(spawn_delay[0], spawn_delay[1])
+            parent_time = time - timedelta(seconds=delay_sec * (depth + 1))
         session = self.state_manager.get_session(logon_id)
         if session is not None and parent_time <= session.start_time:
             parent_time = session.start_time + timedelta(milliseconds=10 * (4 - depth))
@@ -28622,6 +28770,13 @@ class ActivityGenerator:
                     token_elevation="%%1938",
                     mandatory_label="S-1-16-8192",
                     start_time=self._lookup_parent_start_time(system.hostname, parent_pid),
+                    current_directory=(
+                        self._derive_macos_current_directory(
+                            system, user.username, image, cmd_line, grandparent_pid
+                        )
+                        if os_cat == "macos"
+                        else ""
+                    ),
                 ),
                 edr=EdrContext(object_id=proc_obj_id, actor_id=actor_obj_id),
             )

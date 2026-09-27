@@ -1186,6 +1186,28 @@ class ScenarioValidator:
                             )
                         )
 
+                if getattr(spec, "type", "") in {"file", "connection"}:
+                    action_ref = getattr(spec, "process_ref", None)
+                    if (
+                        action_ref is not None
+                        and (event.system, event.actor, action_ref) not in process_refs
+                    ):
+                        self.issues.append(
+                            ValidationIssue(
+                                severity="warning",
+                                field_path=f"storyline.{idx}.events.{spec_idx}.process_ref",
+                                message=(
+                                    f"{spec.type} process_ref '{action_ref}' has no earlier "
+                                    "matching process_ref for the same storyline actor and system"
+                                ),
+                                suggestion=(
+                                    "Define the acting process earlier with process_ref, or omit "
+                                    "process_ref to attribute the action to the most recent "
+                                    "storyline process."
+                                ),
+                            )
+                        )
+
                 if getattr(spec, "type", "") == "process":
                     ref_key_base = (event.system, event.actor)
                     parent_ref = getattr(spec, "parent_ref", None)
@@ -1987,12 +2009,19 @@ class ScenarioValidator:
                         )
                     elif process_name:
                         from evidenceforge.generation.activity.application_catalog import (
+                            has_configured_image_path,
                             resolve_image_path,
                         )
 
                         basename = process_name.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
                         resolved = resolve_image_path(basename, os_cat)
-                        if resolved != basename and resolved.lower() != process_name.lower():
+                        # Only compare against a path that comes from config; an
+                        # unknown binary (e.g. malware under an attacker-chosen
+                        # path) has no canonical location to differ from.
+                        if (
+                            has_configured_image_path(basename, os_cat)
+                            and resolved.lower() != process_name.lower()
+                        ):
                             self.issues.append(
                                 ValidationIssue(
                                     severity="warning",

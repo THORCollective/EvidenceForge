@@ -57,7 +57,30 @@ def _harness(os_name: str = "macOS 14"):
 
 def test_plist_create_produces_btm_launch_item_add_after_file_create() -> None:
     """A LaunchAgents plist create on macOS yields both file_create and BTM events."""
-    generator, _state, events, user, system, logon_id = _harness()
+    generator, state, events, user, system, logon_id = _harness()
+    # On macOS the new image is written by the (already running) parent
+    # before the exec, so the parent shell is the plist's writer here.
+    state.set_current_time(START - timedelta(seconds=30))
+    launchd_pid = state.create_process(
+        system.hostname,
+        0,
+        "/sbin/launchd",
+        "/sbin/launchd",
+        "root",
+        "System",
+        os_category="macos",
+    )
+    shell_pid = state.create_process(
+        system.hostname,
+        launchd_pid,
+        "/bin/zsh",
+        "-zsh",
+        user.username,
+        "Medium",
+        logon_id=logon_id,
+        os_category="macos",
+    )
+    state.set_current_time(START)
 
     generator.generate_process(
         user=user,
@@ -66,6 +89,7 @@ def test_plist_create_produces_btm_launch_item_add_after_file_create() -> None:
         logon_id=logon_id,
         process_name=LAUNCH_AGENT_PLIST,
         command_line=f"cp /tmp/payload {LAUNCH_AGENT_PLIST}",
+        parent_pid=shell_pid,
         ensure_file_event=True,
         from_storyline=True,
     )
@@ -75,6 +99,8 @@ def test_plist_create_produces_btm_launch_item_add_after_file_create() -> None:
 
     assert len(file_creates) == 1
     assert file_creates[0].file.path == LAUNCH_AGENT_PLIST
+    assert file_creates[0].process.pid == shell_pid
+    assert file_creates[0].timestamp < START
     assert len(btm_events) == 1
     btm = btm_events[0]
     assert btm.file is not None

@@ -464,6 +464,10 @@ linux:
       - runc
 
 macos:
+  # On macOS, launchd (PID 1) launches the per-user GUI session agents and --
+  # via LaunchServices -- every app bundle, so apps opened from the Dock,
+  # Finder or Spotlight all report ppid 1. Terminal starts login(1), which
+  # starts the user's login shell (zsh by default since macOS 10.15).
   launchd:
     command_templates:
       - "/sbin/launchd"
@@ -483,26 +487,42 @@ macos:
       - bluetoothd
       - locationd
       - launchservicesd
+      - Dock
+      - SystemUIServer
+      - Finder
+      - Terminal
+      - Safari
+      - Google Chrome
+      - firefox
+      - Electron
 
   loginwindow:
     command_templates:
       - "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow"
     lifetime: long
-    children:
-      - Dock
-      - SystemUIServer
-      - Finder
-      - Terminal
+    children: []
 
   Dock:
     command_templates:
       - "/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock"
     lifetime: long
+    children: []
+
+  Terminal:
+    command_templates:
+      - "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
+    lifetime: long
     children:
-      - Safari
-      - Google Chrome
-      - Terminal
-      - Electron
+      - login
+
+  login:
+    command_templates:
+      - "/usr/bin/login -pf {username}"
+    lifetime: long
+    spawn_delay: [0.05, 0.4]
+    children:
+      - zsh
+      - bash
 
   Safari:
     command_templates:
@@ -517,14 +537,6 @@ macos:
     lifetime: long
     children:
       - Google Chrome
-
-  Terminal:
-    command_templates:
-      - "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
-    lifetime: long
-    children:
-      - zsh
-      - bash
 
   sshd:
     command_templates:

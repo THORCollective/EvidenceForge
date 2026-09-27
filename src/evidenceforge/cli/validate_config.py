@@ -429,7 +429,7 @@ def validate_config() -> ValidationResult:
             "list_fields": {"dns_hosts": "hostname", "unusual_connections": "hostname"},
         },
         "activity/command_parameter_pools.yaml": {
-            "dict_fields": {"general", "query", "linux_query"},
+            "dict_fields": {"general", "query", "linux_query", "os_overrides"},
         },
         "activity/process_access_patterns.yaml": {
             "list_fields": {"baseline_pairs": None},

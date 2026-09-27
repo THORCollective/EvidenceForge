@@ -645,6 +645,7 @@ system_binaries:
     - {exe: "locationd",                 path: "/usr/libexec/locationd"}
     - {exe: "launchservicesd",           path: "/System/Library/CoreServices/launchservicesd"}
     - {exe: "sshd",                      path: "/usr/sbin/sshd"}
+    - {exe: "login",                     path: "/usr/bin/login"}
 
     # --- CLI / admin tools ---
     - {exe: "osascript",                 path: "/usr/bin/osascript"}

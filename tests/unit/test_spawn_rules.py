@@ -144,7 +144,9 @@ class TestSpawnRulesYaml:
         reverse_macos = get_reverse_index_macos()
         assert "git" in reverse_macos, "git should be a known macOS shell child"
         assert len(reverse_macos["git"]) > 0
-        assert "terminal" in reverse_macos["zsh"], "zsh should be spawned by Terminal"
+        assert "login" in reverse_macos["zsh"], "zsh should be spawned by Terminal's login(1)"
+        assert "terminal" in reverse_macos["login"], "login should be spawned by Terminal"
+        assert "launchd" in reverse_macos["terminal"], "apps are launched by launchd"
 
     def test_get_parent_config_three_way_dispatch(self):
         """get_parent_config() should resolve macos configs distinctly from windows/linux."""
@@ -1809,27 +1811,26 @@ class TestMacosParentResolutionDispatch:
 
         linux_parents = get_reverse_index_linux().get("zsh", [])
         macos_parents = get_reverse_index_macos().get("zsh", [])
-        assert "terminal" not in linux_parents, (
-            "fixture assumption broke: Linux reverse index should not allow "
-            "Terminal as a zsh parent"
+        assert "login" not in linux_parents, (
+            "fixture assumption broke: Linux reverse index should not allow login as a zsh parent"
         )
-        assert "terminal" in macos_parents, (
-            "fixture assumption broke: macOS reverse index should allow Terminal as a zsh parent"
+        assert "login" in macos_parents, (
+            "fixture assumption broke: macOS reverse index should allow login as a zsh parent"
         )
 
     def test_resolve_parent_uses_macos_reverse_index_not_linux(
         self, state_manager, mock_emitters, macos_system, user
     ):
         """A macOS `zsh` process must resolve its parent from the macOS
-        reverse index (which allows Terminal), not the Linux one (which only
-        allows sshd for zsh).
+        reverse index (which allows Terminal's login), not the Linux one
+        (which only allows sshd for zsh).
 
-        Deliberately seeds only launchd + Terminal (no sshd/bash) so the
-        *only* way to find a live, valid parent for `zsh` is via the macOS
-        reverse index. If the dispatch regresses to the Linux index, no
+        Deliberately seeds only launchd + Terminal + login (no sshd/bash) so
+        the *only* way to find a live, valid parent for `zsh` is via the
+        macOS reverse index. If the dispatch regresses to the Linux index, no
         alive parent would match and this would instead fall through to
         auto-created-chain logic — resolving to something other than the
-        live Terminal PID.
+        live login PID.
         """
         ag = ActivityGenerator(state_manager, mock_emitters)
 
@@ -1850,8 +1851,20 @@ class TestMacosParentResolutionDispatch:
             user.username,
             "System",
         )
+        login_pid = state_manager.create_process(
+            macos_system.hostname,
+            terminal_pid,
+            "/usr/bin/login",
+            f"/usr/bin/login -pf {user.username}",
+            user.username,
+            "System",
+        )
         ag._system_pids = {
-            macos_system.hostname: {"launchd": launchd_pid, "terminal": terminal_pid}
+            macos_system.hostname: {
+                "launchd": launchd_pid,
+                "terminal": terminal_pid,
+                "login": login_pid,
+            }
         }
 
         parent_pid = ag._resolve_parent(
@@ -1862,8 +1875,8 @@ class TestMacosParentResolutionDispatch:
             "zsh",
         )
 
-        assert parent_pid == terminal_pid, (
-            "macOS zsh process should resolve its parent to the live Terminal "
+        assert parent_pid == login_pid, (
+            "macOS zsh process should resolve its parent to the live login "
             "process via the macOS reverse index, not fall through to "
             f"Linux-shaped resolution; got pid {parent_pid}"
         )
