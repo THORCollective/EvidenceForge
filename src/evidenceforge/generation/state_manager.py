@@ -47,6 +47,13 @@ from evidenceforge.utils.time import ensure_utc
 logger = logging.getLogger(__name__)
 
 _MIN_GENERATED_LOGON_LUID = 0x10000
+# macOS PID_MAX is 99999; the kernel wraps back to low PIDs once reached.
+_MACOS_PID_MAX = 99_998
+_MACOS_PID_FLOOR = 100
+# Average PIDs consumed per second of host uptime by background fork/exec
+# churn (XPC services, mdworker, etc.). A lightly used Mac wraps PID_MAX about
+# every one to two days; heavily used ones wrap several times a day.
+_MACOS_PID_CHURN_PER_SECOND = 0.7
 _MAX_GENERATED_LOGON_LUID = 0xFFFFFFFF
 _GENERATED_LOGON_LUID_SPAN = _MAX_GENERATED_LOGON_LUID - _MIN_GENERATED_LOGON_LUID + 1
 _HOST_LOGON_BUCKET_SPACE = 0x01000000
@@ -113,6 +120,9 @@ class StateManager:
         # process instance is). Keyed by (system, pid); starts at 0 for a
         # PID slot's first occupant and increments each time the slot is reused.
         self._pidversion: dict[tuple[str, int], int] = {}
+        # Unwrapped macOS PID sequence position of the latest allocation per
+        # host; pidversion is derived from it so both stay time-ordered.
+        self._macos_pid_sequence: dict[str, int] = {}
         self._pid_time_epochs: dict[str, datetime] = {}
         self._pid_bucket_offsets: dict[tuple[str, int, int], int] = {}
         self._linux_pid_block_offsets: dict[str, dict[int, int]] = {}
@@ -858,16 +868,51 @@ class StateManager:
             self._pid_counters[system] = start - (start % 4)
             self._pid_os[system] = "windows"
         elif os_category == "macos":
-            # Real macOS PIDs are small kernel-assigned integers (launchd is
-            # PID 1; PID_MAX is 99999). Use a distinct, much lower range than
-            # the arbitrary Linux one below to reflect a host that has been
-            # up for a while but hasn't churned through anywhere near the
-            # Linux-shaped PID space.
-            self._pid_counters[system] = pid_rng.randint(200, 4000)
+            # Real macOS PIDs are kernel-assigned sequentially from boot
+            # (launchd's first children land in the low hundreds) and wrap
+            # below PID_MAX (99999). _allocate_macos_pid grows from here.
+            self._pid_counters[system] = pid_rng.randint(250, 400)
             self._pid_os[system] = "macos"
         else:
             self._pid_counters[system] = pid_rng.randint(8000, 42000)
             self._pid_os[system] = "linux"
+
+    def _allocate_macos_pid(self, system: str, current_time: datetime | None = None) -> int:
+        """Allocate a macOS PID as a deterministic function of host uptime.
+
+        XNU hands out PIDs sequentially and wraps below PID_MAX, so on a
+        long-running Mac the PID of a new process tracks elapsed uptime modulo
+        the PID space. Deriving the PID from time (rather than from allocation
+        order) keeps PIDs increasing with wall-clock time regardless of the
+        order the generator builds events in, wraps exactly like the kernel,
+        and never needs bounded-retry searches.
+        """
+        current_time = ensure_utc(current_time or self.state.current_time)
+        epoch = self._pid_time_epochs.setdefault(system, current_time)
+        elapsed = max(0.0, (current_time - epoch).total_seconds())
+        block = int(elapsed // 300)
+        # Per-block jitter stays well under one block's churn (~210 PIDs), so
+        # PIDs remain time-ordered across block boundaries without encoding
+        # exact elapsed seconds.
+        jitter = _stable_seed(f"macos_pid_block_jitter:{system}:{block}") % 40
+        second = int(elapsed)
+        ordinal = self._pid_bucket_offsets.get((system, -1, second), 0)
+        self._pid_bucket_offsets[(system, -1, second)] = (
+            ordinal + 1 + (_stable_seed(f"macos_pid_ordinal:{system}:{second}:{ordinal}") % 3)
+        )
+        raw = (
+            self._pid_counters[system]
+            + int(elapsed * _MACOS_PID_CHURN_PER_SECOND)
+            + jitter
+            + ordinal
+        )
+        self._macos_pid_sequence[system] = raw
+        span = _MACOS_PID_MAX - _MACOS_PID_FLOOR + 1
+        pid = _MACOS_PID_FLOOR + (raw - _MACOS_PID_FLOOR) % span
+        running = {p.pid for (s, _), p in self.state.running_processes.items() if s == system}
+        while pid in running or pid == 1:
+            pid = _MACOS_PID_FLOOR + (pid + 1 - _MACOS_PID_FLOOR) % span
+        return pid
 
     def _allocate_linux_pid(
         self,
@@ -1000,23 +1045,30 @@ class StateManager:
             return self._allocate_linux_pid(system, pid_rng, event_time)
 
     def _bump_pidversion(self, system: str, pid: int) -> int:
-        """Increment and return the generation counter for a PID slot.
+        """Assign the XNU pidversion for a newly created process.
 
-        Backs the macOS ES ``pidversion`` audit-token field. A PID slot's
-        first occupant is generation 0; each later reuse of that PID number
-        on the same system increments the generation by one. Call this
-        exactly once per process creation for a given ``(system, pid)``.
+        Backs the macOS ES ``pidversion`` audit-token field. XNU draws
+        ``p_idversion`` from one per-boot counter (``nextpidversion``) that
+        advances on every fork and again on exec, so values are large, unique
+        per host, and increase over time -- not a per-PID-slot counter. The
+        value is derived from the unwrapped PID sequence position (each
+        process consumes a fork and an exec generation), so it is time-ordered
+        like the PID itself. The recorded value is the post-exec generation;
+        the pre-exec fork image carries this value minus one. Call exactly
+        once per process creation.
 
         Args:
             system: System hostname
             pid: Process ID being (re)allocated
 
         Returns:
-            The PID slot's new generation counter value.
+            The process's post-exec pidversion.
         """
-        key = (system, pid)
-        self._pidversion[key] = self._pidversion.get(key, -1) + 1
-        return self._pidversion[key]
+        base = 150_000 + _stable_seed(f"macos_pidversion_base:{system}") % 750_000
+        sequence = self._macos_pid_sequence.get(system, pid)
+        version = base + 2 * sequence + 1
+        self._pidversion[(system, pid)] = version
+        return version
 
     def create_process(
         self,
@@ -1103,6 +1155,8 @@ class StateManager:
                     }
                     while self._pid_counters[system] in running:
                         self._pid_counters[system] += 4
+            elif self._pid_os.get(system) == "macos":
+                pid = self._allocate_macos_pid(system)
             else:
                 minimum_pid_exclusive = None
                 parent = self.state.running_processes.get((system, parent_pid))
@@ -1166,20 +1220,20 @@ class StateManager:
             return self.state.running_processes.get(key)
 
     def get_pidversion(self, system: str, pid: int) -> int:
-        """Return the current pidversion generation counter for a PID slot.
+        """Return the post-exec pidversion of the process occupying a PID.
 
-        macOS Endpoint Security process audit tokens carry ``pidversion``, an
-        incrementing generation counter disambiguating which "generation" of
-        a reused PID number a given process instance is. This is read-only
-        state for emitters; only ``create_process`` bumps it.
+        macOS Endpoint Security process audit tokens carry ``pidversion``,
+        which disambiguates reuses of the same PID number. The pre-exec
+        (fork) image of the same process carries this value minus one. This
+        is read-only state for emitters; only ``create_process`` assigns it.
 
         Args:
             system: System hostname
             pid: Process ID
 
         Returns:
-            The PID slot's current generation counter (0 if the slot has
-            never been allocated by ``create_process``).
+            The process's post-exec pidversion (0 if the PID was never
+            allocated by ``create_process``).
         """
         with self._lock:
             return self._pidversion.get((system, pid), 0)

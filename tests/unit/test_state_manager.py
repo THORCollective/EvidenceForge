@@ -1108,8 +1108,8 @@ class TestProcessManagement:
 class TestMacOSProcessAllocation:
     """Tests for macOS PID allocation and pidversion tracking."""
 
-    def test_initialize_pid_allocator_macos_range_distinct_from_linux(self):
-        """macOS PID allocation should use a small, distinct range from Linux."""
+    def test_initialize_pid_allocator_macos_starts_in_boot_daemon_range(self):
+        """launchd's first children on a real Mac land in the low hundreds."""
         sm = StateManager()
 
         sm._initialize_pid_allocator("mac01", "macos")
@@ -1117,10 +1117,42 @@ class TestMacOSProcessAllocation:
 
         assert sm._pid_os["mac01"] == "macos"
         assert sm._pid_os["linux01"] == "linux"
-        assert 200 <= sm._pid_counters["mac01"] < 4000
+        assert 250 <= sm._pid_counters["mac01"] <= 400
         assert 8_000 <= sm._pid_counters["linux01"] < 42_000
-        # Ranges must not overlap so macOS PIDs are never mistaken for Linux ones.
-        assert sm._pid_counters["mac01"] < sm._pid_counters["linux01"]
+
+    def test_create_process_macos_long_uptime_host_stays_below_pid_max(self):
+        """A macOS host booted weeks earlier must still get PIDs below 99999."""
+        sm = StateManager()
+        boot = datetime(2024, 5, 21, 14, 0, 0, tzinfo=UTC)
+        sm.set_current_time(boot)
+        root = sm.create_process(
+            system="mac01",
+            parent_pid=0,
+            image="/sbin/launchd",
+            command_line="/sbin/launchd",
+            username="root",
+            integrity_level="System",
+            os_category="macos",
+        )
+        sm.register_boot_time("mac01", boot)
+
+        pids: list[int] = []
+        for hour in range(0, 72):
+            sm.set_current_time(datetime(2024, 6, 11, 0, 0, 0, tzinfo=UTC) + timedelta(hours=hour))
+            pids.append(
+                sm.create_process(
+                    system="mac01",
+                    parent_pid=root,
+                    image="/bin/zsh",
+                    command_line="-zsh",
+                    username="alice",
+                    integrity_level="Medium",
+                    os_category="macos",
+                )
+            )
+
+        assert all(100 <= pid <= 99_998 for pid in pids)
+        assert len(set(pids)) == len(pids)
 
     def test_initialize_pid_allocator_macos_is_idempotent(self):
         """Repeated allocation on the same macOS system should stay consistent."""
@@ -1204,28 +1236,69 @@ class TestMacOSProcessAllocation:
         # No explicit os_category and no backslash in the path => Linux fallback.
         assert sm._pid_os["unknown01"] == "linux"
 
-    def test_bump_pidversion_starts_at_zero_and_increments_per_pid_slot(self):
-        """pidversion should start at 0 and increment independently per (system, pid)."""
+    def test_pidversion_increases_with_process_creation_time(self):
+        """pidversion follows XNU's per-boot counter: large and time-ordered."""
         sm = StateManager()
+        base = datetime(2024, 6, 11, 9, 0, 0, tzinfo=UTC)
+        sm.set_current_time(base)
+        root = sm.create_process(
+            system="mac01",
+            parent_pid=0,
+            image="/sbin/launchd",
+            command_line="/sbin/launchd",
+            username="root",
+            integrity_level="System",
+            os_category="macos",
+        )
+        versions: list[int] = []
+        # Build events out of time order, as the generator can.
+        for minutes in (30, 5, 60, 15):
+            sm.set_current_time(base + timedelta(minutes=minutes))
+            pid = sm.create_process(
+                system="mac01",
+                parent_pid=root,
+                image="/bin/zsh",
+                command_line="-zsh",
+                username="alice",
+                integrity_level="Medium",
+                os_category="macos",
+            )
+            versions.append(sm.get_pidversion("mac01", pid))
 
-        assert sm.get_pidversion("mac01", 501) == 0
+        by_time = [versions[1], versions[3], versions[0], versions[2]]
+        assert by_time == sorted(by_time)
+        assert len(set(versions)) == len(versions)
+        assert min(versions) > 100_000
 
-        assert sm._bump_pidversion("mac01", 501) == 0
-        assert sm.get_pidversion("mac01", 501) == 0
+    def test_macos_pids_increase_with_time_regardless_of_build_order(self):
+        sm = StateManager()
+        base = datetime(2024, 6, 11, 9, 0, 0, tzinfo=UTC)
+        sm.set_current_time(base)
+        root = sm.create_process(
+            system="mac01",
+            parent_pid=0,
+            image="/sbin/launchd",
+            command_line="/sbin/launchd",
+            username="root",
+            integrity_level="System",
+            os_category="macos",
+        )
+        pids: dict[int, int] = {}
+        for minutes in (40, 10, 25):
+            sm.set_current_time(base + timedelta(minutes=minutes))
+            pids[minutes] = sm.create_process(
+                system="mac01",
+                parent_pid=root,
+                image="/bin/zsh",
+                command_line="-zsh",
+                username="alice",
+                integrity_level="Medium",
+                os_category="macos",
+            )
+        assert pids[10] < pids[25] < pids[40]
 
-        assert sm._bump_pidversion("mac01", 501) == 1
-        assert sm.get_pidversion("mac01", 501) == 1
-
-        assert sm._bump_pidversion("mac01", 501) == 2
-        assert sm.get_pidversion("mac01", 501) == 2
-
-        # A different PID slot on the same system is an independent counter.
-        assert sm._bump_pidversion("mac01", 502) == 0
-        assert sm.get_pidversion("mac01", 502) == 0
-        assert sm.get_pidversion("mac01", 501) == 2
-
-    def test_create_process_starts_pidversion_at_zero(self):
-        """A freshly allocated PID slot should report pidversion 0 through create_process."""
+    def test_create_process_assigns_nonzero_pidversion(self):
+        """A process created through create_process reports a realistic pidversion."""
         sm = StateManager()
         sm.set_current_time(datetime(2024, 1, 15, 8, 0, 0, tzinfo=UTC))
 
@@ -1239,31 +1312,7 @@ class TestMacOSProcessAllocation:
             os_category="macos",
         )
 
-        assert sm.get_pidversion("mac01", pid) == 0
-
-    def test_create_process_bumps_pidversion_when_pid_slot_is_reused(self):
-        """Simulate a create -> terminate -> reuse cycle and confirm pidversion increments."""
-        sm = StateManager()
-        sm.set_current_time(datetime(2024, 1, 15, 8, 0, 0, tzinfo=UTC))
-
-        pid = sm.create_process(
-            system="mac01",
-            parent_pid=0,
-            image="/sbin/launchd",
-            command_line="/sbin/launchd",
-            username="root",
-            integrity_level="System",
-            os_category="macos",
-        )
-        assert sm.get_pidversion("mac01", pid) == 0
-        sm.end_process("mac01", pid)
-
-        # PID-slot reuse is driven by StateManager's PID allocator, which is
-        # not guaranteed to hand back the same number deterministically in
-        # this generic path, so exercise the bump directly against the same
-        # slot to prove the reuse-tracking contract in isolation.
-        assert sm._bump_pidversion("mac01", pid) == 1
-        assert sm.get_pidversion("mac01", pid) == 1
+        assert sm.get_pidversion("mac01", pid) > 100_000
 
 
 class TestConnectionManagement:
