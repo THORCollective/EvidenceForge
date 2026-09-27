@@ -130,9 +130,9 @@ class TestParsesRealEmitterOutput:
         assert exec_record.fields["global_seq_num"] == 2
 
         # Nested "process.*"/"process.audit_token.*" flattened to dotted keys.
-        assert exec_record.fields["process.pid"] == 1500
-        assert "process.audit_token.pid" in exec_record.fields
-        assert exec_record.fields["process.signing_id"] is not None
+        assert exec_record.fields["process.audit_token.pid"] == 1500
+        assert exec_record.fields["event.exec.target.audit_token.pid"] == 1500
+        assert exec_record.fields["event.exec.target.signing_id"] is not None
 
         # "event.exec.*" flattened; the list-valued "args" leaf is preserved
         # as a list, not further flattened.
@@ -170,7 +170,7 @@ class TestParsesRealEmitterOutput:
         path = tmp_path / "MAC-01.corp.local" / "eslogger.ndjson"
         record = next(iter(ESLoggerParser().parse_file(path)))
         assert (
-            record.fields["event.create.destination.path"]
+            record.fields["event.create.destination.existing_file.path"]
             == "/Users/alice/Library/LaunchAgents/com.evil.persist.plist"
         )
 
@@ -215,3 +215,31 @@ class TestEndToEndWithCoOccurrenceRules:
         scorer = PlausibilityScorer()
         result = scorer._score_co_occurrence({"eslogger": records})
         assert result.score == 100.0, result.sample_failures
+
+
+class TestNanosecondTimestamps:
+    def test_nanosecond_time_is_truncated_to_microseconds(self, tmp_path):
+        path = tmp_path / "eslogger.ndjson"
+        path.write_text(
+            json.dumps({"time": "2024-06-11T14:21:51.126928123Z"}) + "\n", encoding="utf-8"
+        )
+        records = list(ESLoggerParser().parse_file(path))
+        assert records[0].timestamp == datetime(2024, 6, 11, 14, 21, 51, 126928, tzinfo=UTC)
+        assert records[0].parse_errors == []
+
+    def test_btm_item_url_exposes_decoded_item_path(self, tmp_path):
+        path = tmp_path / "eslogger.ndjson"
+        record = {
+            "time": "2024-06-11T14:21:51.126928123Z",
+            "event": {
+                "btm_launch_item_add": {
+                    "item": {"item_url": "file:///Users/a/Library/LaunchAgents/x%20y.plist"}
+                }
+            },
+        }
+        path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        fields = next(ESLoggerParser().parse_file(path)).fields
+        assert (
+            fields["event.btm_launch_item_add.item.item_path"]
+            == "/Users/a/Library/LaunchAgents/x y.plist"
+        )

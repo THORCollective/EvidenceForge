@@ -1533,7 +1533,14 @@ class CausalityScorer(DimensionScorer):
             match_fields = rule.get("match_fields", {})
             before_field = match_fields.get("before")
             after_field = match_fields.get("after")
-            extra_match = rule.get("extra_match")
+            # extra_match is one field name shared by both sides, or a
+            # {before, after} mapping when the two records name it differently.
+            extra_match_rule = rule.get("extra_match")
+            if isinstance(extra_match_rule, dict):
+                extra_match = extra_match_rule.get("before")
+                extra_match_after = extra_match_rule.get("after")
+            else:
+                extra_match = extra_match_after = extra_match_rule
             msg_contains = rule.get("before", {}).get("message_contains")
 
             before_records = records.get(before_fmt, [])
@@ -1607,8 +1614,8 @@ class CausalityScorer(DimensionScorer):
                     if not key_val:
                         continue
                     idx_key = str(key_val)
-                    if extra_match:
-                        idx_key = f"{idx_key}|{rec.fields.get(extra_match, '')}"
+                    if extra_match_after:
+                        idx_key = f"{idx_key}|{rec.fields.get(extra_match_after, '')}"
                     matching_befores = before_index.get(idx_key, [])
                     if not matching_befores:
                         continue

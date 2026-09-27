@@ -328,7 +328,7 @@ class TestCoOccurrenceDetectsViolations:
             auth=AuthContext(username="root"),
         )
         row = _rows(emitter, event)[0]
-        del row["event"]["btm_launch_item_add"]["item"]["url"]["path"]
+        del row["event"]["btm_launch_item_add"]["item"]["item_url"]
         records = [_record(row)]
         scorer = PlausibilityScorer()
         result = scorer._score_co_occurrence({"eslogger": records})

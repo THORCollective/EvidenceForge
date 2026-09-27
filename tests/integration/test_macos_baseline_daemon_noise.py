@@ -162,13 +162,13 @@ def test_spotlight_and_backupd_have_process_lifecycle_pairs(tmp_path: Path):
         records = _eslogger_records(output_dir, host_fqdn)
         for marker in ("mdworker_shared", "backupd"):
             exec_pids = {
-                record["process"]["pid"]
+                record["event"]["exec"]["target"]["audit_token"]["pid"]
                 for record in records
                 if _event_name(record) == "exec"
-                and marker in record["process"]["executable"]["path"]
+                and marker in record["event"]["exec"]["target"]["executable"]["path"]
             }
             exit_pids = {
-                record["process"]["pid"]
+                record["process"]["audit_token"]["pid"]
                 for record in records
                 if _event_name(record) == "exit"
                 and marker in record["process"]["executable"]["path"]
@@ -189,14 +189,14 @@ def test_time_machine_backup_timing_is_not_fixed_interval(tmp_path: Path):
             record["time"]
             for record in records
             if _event_name(record) == "exec"
-            and "backupd" in record["process"]["executable"]["path"]
+            and "backupd" in record["event"]["exec"]["target"]["executable"]["path"]
         )
         assert len(backupd_starts) >= 3, (
             f"{host_fqdn}: expected multiple backupd runs over 96h, got {backupd_starts}"
         )
 
         # Not on the exact hour (minute/second/microsecond == 0) every time.
-        on_the_hour = [ts for ts in backupd_starts if ts[-13:] == ":00:00.000000"]
+        on_the_hour = [ts for ts in backupd_starts if ts[14:26] == "00:00.000000"]
         assert len(on_the_hour) != len(backupd_starts), (
             f"{host_fqdn}: every backupd run landed exactly on the hour: {backupd_starts}"
         )
@@ -204,7 +204,7 @@ def test_time_machine_backup_timing_is_not_fixed_interval(tmp_path: Path):
         # Gaps between consecutive runs must not all be identical (no fixed-interval ticks).
         from datetime import datetime as _dt
 
-        parsed = [_dt.fromisoformat(ts.replace("Z", "+00:00")) for ts in backupd_starts]
+        parsed = [_dt.fromisoformat(ts[:26] + "+00:00") for ts in backupd_starts]
         gaps = [(b - a).total_seconds() for a, b in zip(parsed, parsed[1:], strict=False)]
         assert len(set(round(g) for g in gaps)) > 1, (
             f"{host_fqdn}: backupd gaps are all identical (looks fixed-interval): {gaps}"
@@ -228,10 +228,10 @@ def test_cfprefsd_churn_reuses_existing_seeded_process(tmp_path: Path):
         # No extra process create/terminate events for cfprefsd beyond the single
         # boot-seeded process (Task 3) -- churn must be file activity only.
         cfprefsd_execs = {
-            record["process"]["pid"]
+            record["event"]["exec"]["target"]["audit_token"]["pid"]
             for record in records
             if _event_name(record) == "exec"
-            and "/usr/sbin/cfprefsd" in record["process"]["executable"]["path"]
+            and "/usr/sbin/cfprefsd" in record["event"]["exec"]["target"]["executable"]["path"]
         }
         assert len(cfprefsd_execs) <= 1, (
             f"{host_fqdn}: expected cfprefsd to stay a single boot-seeded process, "

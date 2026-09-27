@@ -189,14 +189,17 @@ pairs:
       format: eslogger
       condition:
         event_type: 15  # exit
+    # The exec record's subject is the pre-exec image; the new program (and
+    # the post-exec pidversion that the later exit carries) is exec.target.
     match_fields:
-      before: process.pid
-      after: process.pid
+      before: event.exec.target.audit_token.pid
+      after: process.audit_token.pid
     # eslogger records have no hostname field to scope cross-host PID
     # collisions (unlike eCAR's `extra_match: hostname`); pidversion
-    # disambiguates PID-slot reuse instead, which is exactly what
-    # StateManager tracks it for.
-    extra_match: process.audit_token.pidversion
+    # disambiguates PID reuse instead.
+    extra_match:
+      before: event.exec.target.audit_token.pidversion
+      after: process.audit_token.pidversion
 
   - name: "eslogger plist create before btm_launch_item_add"
     before:
@@ -206,10 +209,10 @@ pairs:
     after:
       format: eslogger
       condition:
-        event_type: 105  # btm_launch_item_add
+        event_type: 124  # btm_launch_item_add
     match_fields:
-      before: event.create.destination.path
-      after: event.btm_launch_item_add.item.url.path
+      before: event.create.destination.existing_file.path
+      after: event.btm_launch_item_add.item.item_path
     # btm_launch_item_add is causal-engine-generated (Task 7's
     # PlistCreateBeforeBtmLaunchItem rule) from a plist file_create, but the
     # match key is a bare file path with no host scoping, so the same

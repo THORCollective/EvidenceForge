@@ -27,6 +27,7 @@ from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from . import LogParser, ParsedRecord, register_parser
 
@@ -60,12 +61,19 @@ class ESLoggerParser(LogParser):
             # eslogger rules (e.g. "event.exec.args", "process.audit_token.pid").
             fields = _flatten(data)
 
-            # Parse the "time" envelope field: ISO 8601 UTC with a Z suffix,
-            # matching ESLoggerEmitter._iso().
+            # BTM items identify their plist by file:// URL; expose the POSIX
+            # path too so it can be correlated with the plist's create event.
+            item_url = fields.get("event.btm_launch_item_add.item.item_url")
+            if isinstance(item_url, str) and item_url.startswith("file://"):
+                fields["event.btm_launch_item_add.item.item_path"] = unquote(item_url[7:])
+
+            # Parse the "time" envelope field: ISO 8601 UTC with a Z suffix.
+            # eslogger reports nanoseconds; datetime holds microseconds, so the
+            # fraction is truncated to six digits before parsing.
             ts_str = data.get("time")
             if ts_str is not None:
                 try:
-                    timestamp = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    timestamp = datetime.fromisoformat(_truncate_to_micros(ts_str))
                 except ValueError:
                     errors.append(f"Invalid timestamp: {ts_str}")
 
@@ -80,6 +88,17 @@ class ESLoggerParser(LogParser):
             parse_errors=errors,
             line_number=line_num,
         )
+
+
+def _truncate_to_micros(ts: str) -> str:
+    """Convert an eslogger ``...SS.fffffffffZ`` timestamp to a parseable form."""
+    ts = ts.replace("Z", "+00:00")
+    head, dot, rest = ts.partition(".")
+    if not dot:
+        return ts
+    digit_count = len(rest) - len(rest.lstrip("0123456789"))
+    digits, suffix = rest[:digit_count], rest[digit_count:]
+    return f"{head}.{digits[:6].ljust(6, '0')}{suffix}"
 
 
 def _flatten(obj: dict[str, Any], prefix: str = "") -> dict[str, Any]:

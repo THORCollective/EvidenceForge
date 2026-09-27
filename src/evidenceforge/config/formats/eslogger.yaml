@@ -13,26 +13,35 @@
 # Full schema: see docs/plans/2026-07-11-macos-eslogger-design.md
 
 name: eslogger
-version: "1.0"
+version: "2.0"
 description: "macOS Endpoint Security (eslogger) NDJSON host telemetry"
 category: host
 
 fields:
-  # --- Envelope ---
   - name: schema_version
     type: integer
     required: true
-    description: "ES message schema version"
+    description: "eslogger JSON schema version"
+
+  - name: version
+    type: integer
+    required: true
+    description: "es_message_t version (6 = macOS 13, 7 = macOS 14, 8 = macOS 15)"
 
   - name: time
     type: timestamp
     required: true
-    description: "Wall-clock event time (ISO 8601 UTC, microseconds, Z suffix)"
+    description: "Wall-clock event time (ISO 8601 UTC, nanoseconds, Z suffix)"
 
   - name: mach_time
     type: integer
     required: true
-    description: "Monotonic uptime-since-boot clock in nanoseconds"
+    description: "mach_absolute_time() at the event, in Apple Silicon 24 MHz ticks since boot"
+
+  - name: thread.thread_id
+    type: integer
+    required: true
+    description: "Mach thread id of the acting thread"
 
   - name: seq_num
     type: integer
@@ -44,16 +53,60 @@ fields:
     required: true
     description: "Run-global monotonic record sequence number across all hosts"
 
+  - name: action_type
+    type: integer
+    required: true
+    description: "es_action_type_t (1 = NOTIFY)"
+
+  - name: action.result.result_type
+    type: integer
+    required: true
+    description: "es_result_type_t of the notify result (0 = AUTH)"
+
   - name: event_type
     type: integer
     required: true
-    description: "es_event_type_t integer (best-effort; event key name is authoritative)"
+    description: "es_event_type_t from <EndpointSecurity/ESTypes.h>"
 
-  # --- Acting process (audit token + code-signing identity) ---
-  - name: process.pid
+  - name: process.audit_token.pid
     type: integer
     required: true
-    description: "Acting process PID"
+    description: "Acting process PID (es_process_t has no top-level pid)"
+
+  - name: process.audit_token.pidversion
+    type: integer
+    required: true
+    description: "Acting process XNU pidversion (disambiguates reused PIDs)"
+
+  - name: process.audit_token.euid
+    type: integer
+    required: true
+    description: "Acting process effective uid"
+
+  - name: process.audit_token.ruid
+    type: integer
+    required: true
+    description: "Acting process real uid"
+
+  - name: process.audit_token.egid
+    type: integer
+    required: true
+    description: "Acting process effective gid"
+
+  - name: process.audit_token.rgid
+    type: integer
+    required: true
+    description: "Acting process real gid"
+
+  - name: process.audit_token.auid
+    type: integer
+    required: true
+    description: "Acting process audit user id (4294967295 when not in a login session)"
+
+  - name: process.audit_token.asid
+    type: integer
+    required: true
+    description: "Acting process audit session id"
 
   - name: process.ppid
     type: integer
@@ -62,106 +115,209 @@ fields:
 
   - name: process.original_ppid
     type: integer
-    required: false
-    description: "Original parent PID at fork time"
+    required: true
+    description: "Acting process original parent PID"
+
+  - name: process.group_id
+    type: integer
+    required: true
+    description: "Acting process process group id"
 
   - name: process.session_id
     type: integer
-    required: false
-    description: "Audit session id (asid) the process belongs to"
-
-  - name: process.executable.path
-    type: string
     required: true
-    description: "Full path to the process executable"
+    description: "Acting process session id"
 
-  - name: process.start_time
-    type: string
-    required: false
-    description: "Process start time (ISO 8601 UTC)"
+  - name: process.codesigning_flags
+    type: integer
+    required: true
+    description: "Acting process cs_blobs.h code-signing flags (uint32 bitmask)"
 
   - name: process.is_platform_binary
     type: boolean
     required: true
-    description: "Whether the executable is an Apple platform binary"
+    description: "Acting process is an Apple platform binary"
 
-  - name: process.signing_id
-    type: string
-    required: false
-    description: "Code-signing identifier (e.g. com.apple.osascript)"
-
-  # `required: false` is this schema's only nullability signal (the FieldType
-  # enum has no null-union variant); it is the same convention used elsewhere
-  # for a JSON-emitted field whose *present* value may be null (e.g.
-  # zeek_conn.yaml's "service"). team_id already follows that convention.
-  - name: process.team_id
-    type: string
-    required: false
-    description: "Apple Developer Team ID (null for platform binaries / unsigned)"
+  - name: process.is_es_client
+    type: boolean
+    required: true
+    description: "Acting process is an Endpoint Security client"
 
   - name: process.cdhash
     type: string
     required: false
-    description: "Code directory hash (40 hex chars)"
+    description: "Acting process code directory hash (40 hex chars)"
 
-  - name: process.codesigning_flags
-    type: list
+  - name: process.signing_id
+    type: string
     required: false
-    description: "CS_* code-signing flag names"
+    description: "Acting process code-signing identifier"
 
-  # --- Acting process audit token ---
-  - name: process.audit_token.pid
-    type: integer
-    required: true
-    description: "Audit token PID"
-
-  - name: process.audit_token.pidversion
-    type: integer
-    required: true
-    description: "PID generation counter (disambiguates reused PIDs)"
-
-  - name: process.audit_token.euid
-    type: integer
-    required: true
-    description: "Effective user id"
-
-  - name: process.audit_token.ruid
-    type: integer
-    required: true
-    description: "Real user id"
-
-  - name: process.audit_token.egid
-    type: integer
+  - name: process.team_id
+    type: string
     required: false
-    description: "Effective group id"
+    description: "Acting process Apple Developer Team ID (null for platform and ad-hoc code)"
 
-  - name: process.audit_token.rgid
-    type: integer
+  - name: process.executable.path
+    type: string
+    required: true
+    description: "Acting process executable path (vnode-resolved)"
+
+  - name: process.executable.path_truncated
+    type: boolean
+    required: true
+    description: "Acting process executable path truncation flag"
+
+  - name: process.tty.path
+    type: string
     required: false
-    description: "Real group id"
+    description: "Acting process controlling terminal (null tty when none)"
 
-  - name: process.audit_token.auid
+  - name: process.start_time
+    type: timestamp
+    required: false
+    description: "Acting process start time (ISO 8601 UTC, microseconds)"
+
+  - name: process.responsible_audit_token.pid
     type: integer
     required: true
-    description: "Audit user id (4294967295 when not a login session)"
+    description: "Acting process responsible process PID"
 
-  - name: process.audit_token.asid
-    type: integer
-    required: true
-    description: "Audit session id"
-
-  # --- Parent audit token ---
   - name: process.parent_audit_token.pid
     type: integer
-    required: false
-    description: "Parent audit token PID"
+    required: true
+    description: "Acting process parent audit token PID"
 
   - name: process.parent_audit_token.pidversion
     type: integer
-    required: false
-    description: "Parent PID generation counter"
+    required: true
+    description: "Acting process parent pidversion"
 
-  # --- Event payload leaves (per event_type; all optional at the envelope level) ---
+  - name: event.exec.target.audit_token.pid
+    type: integer
+    required: false
+    description: "Exec target (new image) PID (es_process_t has no top-level pid)"
+
+  - name: event.exec.target.audit_token.pidversion
+    type: integer
+    required: false
+    description: "Exec target (new image) XNU pidversion (disambiguates reused PIDs)"
+
+  - name: event.exec.target.audit_token.euid
+    type: integer
+    required: false
+    description: "Exec target (new image) effective uid"
+
+  - name: event.exec.target.audit_token.ruid
+    type: integer
+    required: false
+    description: "Exec target (new image) real uid"
+
+  - name: event.exec.target.audit_token.egid
+    type: integer
+    required: false
+    description: "Exec target (new image) effective gid"
+
+  - name: event.exec.target.audit_token.rgid
+    type: integer
+    required: false
+    description: "Exec target (new image) real gid"
+
+  - name: event.exec.target.audit_token.auid
+    type: integer
+    required: false
+    description: "Exec target (new image) audit user id (4294967295 when not in a login session)"
+
+  - name: event.exec.target.audit_token.asid
+    type: integer
+    required: false
+    description: "Exec target (new image) audit session id"
+
+  - name: event.exec.target.ppid
+    type: integer
+    required: false
+    description: "Exec target (new image) parent PID"
+
+  - name: event.exec.target.original_ppid
+    type: integer
+    required: false
+    description: "Exec target (new image) original parent PID"
+
+  - name: event.exec.target.group_id
+    type: integer
+    required: false
+    description: "Exec target (new image) process group id"
+
+  - name: event.exec.target.session_id
+    type: integer
+    required: false
+    description: "Exec target (new image) session id"
+
+  - name: event.exec.target.codesigning_flags
+    type: integer
+    required: false
+    description: "Exec target (new image) cs_blobs.h code-signing flags (uint32 bitmask)"
+
+  - name: event.exec.target.is_platform_binary
+    type: boolean
+    required: false
+    description: "Exec target (new image) is an Apple platform binary"
+
+  - name: event.exec.target.is_es_client
+    type: boolean
+    required: false
+    description: "Exec target (new image) is an Endpoint Security client"
+
+  - name: event.exec.target.cdhash
+    type: string
+    required: false
+    description: "Exec target (new image) code directory hash (40 hex chars)"
+
+  - name: event.exec.target.signing_id
+    type: string
+    required: false
+    description: "Exec target (new image) code-signing identifier"
+
+  - name: event.exec.target.team_id
+    type: string
+    required: false
+    description: "Exec target (new image) Apple Developer Team ID (null for platform and ad-hoc code)"
+
+  - name: event.exec.target.executable.path
+    type: string
+    required: false
+    description: "Exec target (new image) executable path (vnode-resolved)"
+
+  - name: event.exec.target.executable.path_truncated
+    type: boolean
+    required: false
+    description: "Exec target (new image) executable path truncation flag"
+
+  - name: event.exec.target.tty.path
+    type: string
+    required: false
+    description: "Exec target (new image) controlling terminal (null tty when none)"
+
+  - name: event.exec.target.start_time
+    type: timestamp
+    required: false
+    description: "Exec target (new image) start time (ISO 8601 UTC, microseconds)"
+
+  - name: event.exec.target.responsible_audit_token.pid
+    type: integer
+    required: false
+    description: "Exec target (new image) responsible process PID"
+
+  - name: event.exec.target.parent_audit_token.pid
+    type: integer
+    required: false
+    description: "Exec target (new image) parent audit token PID"
+
+  - name: event.exec.target.parent_audit_token.pidversion
+    type: integer
+    required: false
+    description: "Exec target (new image) parent pidversion"
+
   - name: event.exec.args
     type: list
     required: false
@@ -172,90 +328,210 @@ fields:
     required: false
     description: "Working directory for exec events"
 
-  - name: event.fork.child.pid
+  - name: event.exec.dyld_exec_path
+    type: string
+    required: false
+    description: "Path dyld was asked to execute"
+
+  - name: event.exec.last_fd
     type: integer
     required: false
-    description: "Child process PID for fork events (fork subject is the parent)"
+    description: "Highest open file descriptor at exec"
+
+  - name: event.exec.image_cputype
+    type: integer
+    required: false
+    description: "Mach-O CPU type of the exec'd image"
+
+  - name: event.exec.image_cpusubtype
+    type: integer
+    required: false
+    description: "Mach-O CPU subtype of the exec'd image"
+
+  - name: event.fork.child.audit_token.pid
+    type: integer
+    required: false
+    description: "Forked child PID (still running the parent image)"
 
   - name: event.fork.child.audit_token.pidversion
     type: integer
     required: false
-    description: "Child process PID generation counter for fork events"
+    description: "Forked child pre-exec pidversion"
 
-  - name: event.create.destination.path
+  - name: event.fork.child.executable.path
     type: string
     required: false
-    description: "Destination path for file create events"
+    description: "Forked child image (the parent's image until exec)"
+
+  - name: event.exit.stat
+    type: integer
+    required: false
+    description: "Exit status"
+
+  - name: event.create.destination_type
+    type: integer
+    required: false
+    description: "es_destination_type_t (0 = EXISTING_FILE for notify create)"
+
+  - name: event.create.destination.existing_file.path
+    type: string
+    required: false
+    description: "Created file path"
+
+  - name: event.open.fflag
+    type: integer
+    required: false
+    description: "open(2) fflag bits (FREAD=1, FWRITE=2)"
 
   - name: event.open.file.path
     type: string
     required: false
-    description: "File path for file open events"
+    description: "Opened file path"
 
   - name: event.write.target.path
     type: string
     required: false
-    description: "Target path for file write events"
+    description: "Written file path"
 
   - name: event.rename.source.path
     type: string
     required: false
-    description: "Source path for file rename events (destination not modeled)"
+    description: "Renamed file source path"
+
+  - name: event.rename.destination_type
+    type: integer
+    required: false
+    description: "es_destination_type_t for the rename destination"
+
+  - name: event.rename.destination.new_path.filename
+    type: string
+    required: false
+    description: "Rename destination file name"
 
   - name: event.unlink.target.path
     type: string
     required: false
-    description: "Target path for file unlink events"
+    description: "Unlinked file path"
 
-  - name: event.openssh_login.username
+  - name: event.unlink.parent_dir.path
     type: string
     required: false
-    description: "Username for openssh_login events"
+    description: "Unlinked file's parent directory"
+
+  - name: event.openssh_login.success
+    type: boolean
+    required: false
+    description: "Whether the SSH login succeeded"
+
+  - name: event.openssh_login.result_type
+    type: integer
+    required: false
+    description: "es_openssh_login_result_type_t (2 = AUTH_SUCCESS)"
+
+  - name: event.openssh_login.source_address_type
+    type: integer
+    required: false
+    description: "es_address_type_t (1 = IPv4, 2 = IPv6)"
 
   - name: event.openssh_login.source_address
     type: string
     required: false
-    description: "Source address for openssh_login events"
+    description: "SSH client address"
 
-  - name: event.openssh_logout.username
+  - name: event.openssh_login.username
     type: string
     required: false
-    description: "Username for openssh_logout events"
+    description: "SSH login username"
+
+  - name: event.openssh_login.has_uid
+    type: boolean
+    required: false
+    description: "Whether uid is populated"
+
+  - name: event.openssh_login.uid.uid
+    type: integer
+    required: false
+    description: "SSH login uid"
+
+  - name: event.openssh_logout.source_address_type
+    type: integer
+    required: false
+    description: "es_address_type_t (1 = IPv4, 2 = IPv6)"
 
   - name: event.openssh_logout.source_address
     type: string
     required: false
-    description: "Source address for openssh_logout events"
+    description: "SSH client address"
 
-  - name: event.btm_launch_item_add.item.url.path
+  - name: event.openssh_logout.username
     type: string
     required: false
-    description: "plist path for btm_launch_item_add events"
+    description: "SSH logout username"
+
+  - name: event.openssh_logout.uid
+    type: integer
+    required: false
+    description: "SSH logout uid"
 
   - name: event.btm_launch_item_add.item.item_type
+    type: integer
+    required: false
+    description: "es_btm_item_type_t (3 = agent, 4 = daemon)"
+
+  - name: event.btm_launch_item_add.item.legacy
+    type: boolean
+    required: false
+    description: "True for legacy launchd plists"
+
+  - name: event.btm_launch_item_add.item.managed
+    type: boolean
+    required: false
+    description: "True when managed by MDM"
+
+  - name: event.btm_launch_item_add.item.uid
+    type: integer
+    required: false
+    description: "User id the item runs for"
+
+  - name: event.btm_launch_item_add.item.item_url
     type: string
     required: false
-    description: "\"agent\" or \"daemon\" classification for btm_launch_item_add events"
+    description: "file:// URL of the launch item plist"
 
   - name: event.btm_launch_item_add.executable_path
     type: string
     required: false
-    description: "Acting executable path for btm_launch_item_add events"
+    description: "Program path from the launchd plist"
+
+  - name: event.btm_launch_item_add.instigator.audit_token.pid
+    type: integer
+    required: false
+    description: "Process that instigated the BTM add (when known)"
+
+  - name: event.btm_launch_item_add.instigator.executable.path
+    type: string
+    required: false
+    description: "Instigating process image"
+
+  - name: event.btm_launch_item_add.instigator.signing_id
+    type: string
+    required: false
+    description: "Instigating process signing identifier"
 
   - name: event.lw_session_lock.username
     type: string
     required: false
-    description: "Locking user for lw_session_lock events"
+    description: "User for lw_session_lock events"
 
   - name: event.lw_session_lock.graphical_session_id
     type: integer
     required: false
-    description: "Graphical (audit) session id for lw_session lock/unlock events"
+    description: "Graphical (audit) session id for lw_session_lock events"
 
   - name: event.lw_session_unlock.username
     type: string
     required: false
-    description: "Unlocking user for lw_session_unlock events"
+    description: "User for lw_session_unlock events"
 
   - name: event.lw_session_unlock.graphical_session_id
     type: integer
@@ -265,27 +541,37 @@ fields:
   - name: event.sudo.success
     type: boolean
     required: false
-    description: "Whether the sudo elevation succeeded"
+    description: "Whether the elevation succeeded"
 
-  - name: event.sudo.from_uid
+  - name: event.sudo.has_from_uid
+    type: boolean
+    required: false
+    description: "Whether from_uid is populated"
+
+  - name: event.sudo.from_uid.uid
     type: integer
     required: false
-    description: "Invoking user's uid for sudo events"
+    description: "Invoking user's uid"
 
   - name: event.sudo.from_username
     type: string
     required: false
-    description: "Invoking user for sudo events"
+    description: "Invoking user"
 
-  - name: event.sudo.to_uid
+  - name: event.sudo.has_to_uid
+    type: boolean
+    required: false
+    description: "Whether to_uid is populated"
+
+  - name: event.sudo.to_uid.uid
     type: integer
     required: false
-    description: "Elevated target user's uid for sudo events (0/root by default)"
+    description: "Target user's uid"
 
   - name: event.sudo.to_username
     type: string
     required: false
-    description: "Elevated target user for sudo events (root by default)"
+    description: "Target user"
 
   - name: event.sudo.command
     type: string
@@ -295,32 +581,47 @@ fields:
   - name: event.su.success
     type: boolean
     required: false
-    description: "Whether the su elevation succeeded"
+    description: "Whether the elevation succeeded"
 
   - name: event.su.from_uid
     type: integer
     required: false
-    description: "Invoking user's uid for su events"
+    description: "Invoking user's uid"
 
   - name: event.su.from_username
     type: string
     required: false
-    description: "Invoking user for su events"
+    description: "Invoking user"
 
-  - name: event.su.to_uid
+  - name: event.su.has_to_uid
+    type: boolean
+    required: false
+    description: "Whether to_uid is populated"
+
+  - name: event.su.to_uid.uid
     type: integer
     required: false
-    description: "Elevated target user's uid for su events (0/root by default)"
+    description: "Target user's uid"
 
   - name: event.su.to_username
     type: string
     required: false
-    description: "Elevated target user for su events (root by default)"
+    description: "Target user"
 
   - name: event.su.shell
     type: string
     required: false
-    description: "Shell launched by su events"
+    description: "Shell launched by su"
+
+  - name: event.su.argc
+    type: integer
+    required: false
+    description: "su argument count"
+
+  - name: event.su.argv
+    type: list
+    required: false
+    description: "su argv"
 
 output:
   format: json

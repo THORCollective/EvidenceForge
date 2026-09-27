@@ -109,19 +109,27 @@ def test_eslogger_output_exists_for_every_macos_host(tmp_path: Path) -> None:
         assert not (names & {"connection", "flow", "network"})
 
 
+def _exec_target(record: dict) -> dict:
+    """Return the new program image of an ES exec record (es_event_exec_t.target)."""
+    return record["event"]["exec"]["target"]
+
+
 def test_hunt1_amos_unsigned_dropper_exec_and_keychain_open(tmp_path: Path) -> None:
     output = _generate(tmp_path)
     records = _eslogger_records(output, MACOS_HOSTS["MAC-DESIGN-01"])
 
-    # The AMOS dropper exec must carry the exact unsigned/ad-hoc binary_path.
+    # The AMOS dropper exec must carry the exact ad-hoc binary_path: a
+    # signing identifier but no Team ID and no platform bit.
     dropper_execs = [
         r
         for r in records
-        if _event_name(r) == "exec" and r["process"]["executable"]["path"] == AMOS_DROPPER
+        if _event_name(r) == "exec" and _exec_target(r)["executable"]["path"] == AMOS_DROPPER
     ]
     assert dropper_execs, "no exec for the AMOS dropper binary_path"
-    assert dropper_execs[0]["process"]["is_platform_binary"] is False
-    assert not dropper_execs[0]["process"]["signing_id"]
+    dropper = _exec_target(dropper_execs[0])
+    assert dropper["is_platform_binary"] is False
+    assert dropper["team_id"] is None
+    assert dropper["codesigning_flags"] & 0x2  # CS_ADHOC
 
     # The keychain `open` must be attributed to the unsigned dropper (Task 8
     # convention: the dropper owns the keychain read, NOT osascript).
@@ -139,17 +147,20 @@ def test_hunt1_amos_unsigned_dropper_exec_and_keychain_open(tmp_path: Path) -> N
     osascript_execs = [
         r
         for r in records
-        if _event_name(r) == "exec" and r["process"]["executable"]["path"] == "/usr/bin/osascript"
+        if _event_name(r) == "exec"
+        and _exec_target(r)["executable"]["path"] == "/usr/bin/osascript"
     ]
     assert osascript_execs, "no osascript exec"
-    assert osascript_execs[0]["process"]["is_platform_binary"] is True
-    assert osascript_execs[0]["process"]["signing_id"] == "com.apple.osascript"
+    assert _exec_target(osascript_execs[0])["is_platform_binary"] is True
+    assert _exec_target(osascript_execs[0])["signing_id"] == "com.apple.osascript"
 
 
 def test_hunt2_beavertail_npm_node_exec_chain(tmp_path: Path) -> None:
     output = _generate(tmp_path)
     records = _eslogger_records(output, MACOS_HOSTS["MAC-DEV-01"])
-    exec_paths = {r["process"]["executable"]["path"] for r in records if _event_name(r) == "exec"}
+    exec_paths = {
+        _exec_target(r)["executable"]["path"] for r in records if _event_name(r) == "exec"
+    }
     assert any(p.endswith("/npm") for p in exec_paths), f"no npm exec in {exec_paths}"
     assert any(p.endswith("/node") for p in exec_paths), f"no node exec in {exec_paths}"
 
@@ -163,7 +174,7 @@ def test_hunt3_cloudmensis_plist_create_drives_btm(tmp_path: Path) -> None:
         r
         for r in records
         if _event_name(r) == "create"
-        and r["event"]["create"]["destination"]["path"] == LAUNCHAGENT_PLIST
+        and r["event"]["create"]["destination"]["existing_file"]["path"] == LAUNCHAGENT_PLIST
     ]
     assert plist_creates, "no eslogger `create` for the LaunchAgent plist"
 
@@ -171,8 +182,8 @@ def test_hunt3_cloudmensis_plist_create_drives_btm(tmp_path: Path) -> None:
     # the scenario storyline) and reference the same plist path.
     btm = [r for r in records if _event_name(r) == "btm_launch_item_add"]
     assert btm, "BTM launch-item-add was not produced by the causal rule"
-    btm_paths = {r["event"]["btm_launch_item_add"]["item"]["url"]["path"] for r in btm}
-    assert LAUNCHAGENT_PLIST in btm_paths, f"BTM path mismatch: {btm_paths}"
+    btm_paths = {r["event"]["btm_launch_item_add"]["item"]["item_url"] for r in btm}
+    assert "file://" + LAUNCHAGENT_PLIST in btm_paths, f"BTM path mismatch: {btm_paths}"
 
 
 def test_file_events_render_with_new_vocabulary(tmp_path: Path) -> None:

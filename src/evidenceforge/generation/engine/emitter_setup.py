@@ -1031,6 +1031,16 @@ class EmitterSetupMixin:
         pids["mdnsresponder"] = _c(
             pids["launchd"], "/usr/sbin/mDNSResponder", "/usr/sbin/mDNSResponder", "_mdnsresponder"
         )
+        # Background Task Management: discovers LaunchAgent/LaunchDaemon plists
+        # and reports ES btm_launch_item_add events.
+        pids["backgroundtaskmanagementd"] = _c(
+            pids["launchd"],
+            "/System/Library/PrivateFrameworks/BackgroundTaskManagement.framework/"
+            "Versions/A/Resources/backgroundtaskmanagementd",
+            "/System/Library/PrivateFrameworks/BackgroundTaskManagement.framework/"
+            "Versions/A/Resources/backgroundtaskmanagementd",
+            "root",
+        )
 
         # Spotlight: mds is the metadata server; mdworker instances are its
         # on-demand indexing workers.

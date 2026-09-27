@@ -136,9 +136,9 @@ def test_macos_ssh_session_close_renders_login_then_logout(tmp_path):
     emitter = _eslogger(tmp_path, sm)
     login_rows = _render(emitter, login_ev)
     logout_rows = _render(emitter, logout_ev)
-    assert login_rows[0]["event_type"] == 106
+    assert login_rows[0]["event_type"] == 120
     assert "openssh_login" in login_rows[0]["event"]
-    assert logout_rows[0]["event_type"] == 107
+    assert logout_rows[0]["event_type"] == 121
     assert "openssh_logout" in logout_rows[0]["event"]
     assert logout_rows[0]["event"]["openssh_logout"]["username"] == "alice"
 
@@ -226,10 +226,10 @@ def test_macos_interactive_lock_unlock_renders_lw_session(tmp_path):
     emitter = _eslogger(tmp_path, sm)
     lock_rows = _render(emitter, lock_ev)
     unlock_rows = _render(emitter, unlock_ev)
-    assert lock_rows[0]["event_type"] == 108
+    assert lock_rows[0]["event_type"] == 116
     assert "lw_session_lock" in lock_rows[0]["event"]
     assert lock_rows[0]["event"]["lw_session_lock"]["username"] == "alice"
-    assert unlock_rows[0]["event_type"] == 109
+    assert unlock_rows[0]["event_type"] == 117
     assert "lw_session_unlock" in unlock_rows[0]["event"]
     # loginwindow is the reporting process for lw_session events.
     assert lock_rows[0]["process"]["executable"]["path"].endswith("loginwindow")
@@ -270,7 +270,7 @@ def test_privilege_elevation_renders_as_sudo(tmp_path):
     assert sudo["success"] is True
     assert sudo["from_username"] == "alice"
     assert sudo["to_username"] == "root"
-    assert sudo["to_uid"] == 0
+    assert sudo["to_uid"] == {"uid": 0}
     assert sudo["command"] == "sudo /usr/bin/whoami"
     assert rows[0]["process"]["executable"]["path"] == "/usr/bin/sudo"
 
@@ -286,7 +286,7 @@ def test_privilege_elevation_renders_as_su(tmp_path):
     ev = next(e for e in events if e.event_type == "privilege_elevation")
     emitter = _eslogger(tmp_path, sm)
     rows = _render(emitter, ev)
-    assert rows[0]["event_type"] == 130
+    assert rows[0]["event_type"] == 128
     assert "su" in rows[0]["event"]
     assert rows[0]["event"]["su"]["from_username"] == "alice"
 

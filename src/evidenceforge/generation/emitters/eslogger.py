@@ -28,8 +28,11 @@ per macOS host (per-FQDN directory routing, like eCAR).  It is a pure renderer:
 process identity, code-signing identity, audit-token session identity, and file
 paths all come from contexts and ``StateManager`` state that upstream layers
 already built (AGENTS.md realism rules #1/#1a).  ES-native envelope fields
-(``schema_version``, ``mach_time``, ``seq_num``/``global_seq_num``,
-``event_type``) are derived deterministically here.
+(``schema_version``, ``version``, ``mach_time``, ``thread``,
+``seq_num``/``global_seq_num``, ``action``, ``event_type``) are derived
+deterministically here.  Record shapes follow Apple's ``es_message_t`` /
+``es_process_t`` / ``es_event_*_t`` structs in <EndpointSecurity/ESMessage.h>.
+``es_file_t.stat`` is not rendered: no canonical layer owns inode metadata.
 
 The record is assembled as a Python dict and serialized with ``json.dumps``,
 bypassing Jinja2 exactly like ``EcarEmitter._render_event`` — the
@@ -45,6 +48,7 @@ import logging
 import shlex
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote
 
 from evidenceforge.events.base import SecurityEvent
 from evidenceforge.events.contexts import HostContext
@@ -70,30 +74,70 @@ _MACOS_SYSTEM_ASID = 100000
 # the per-host boot time registered during process-tree seeding.
 _MACH_TIME_FALLBACK_BOOT = datetime(2024, 1, 1, tzinfo=UTC)
 
-# ES event name -> es_event_type_t integer.  DESIGN NOTE (plan risk #6): no real
-# eslogger capture is available to verify these enum integers, so they are a
-# best-effort mapping.  The authoritative, hunt-relevant identity is the STRING
-# key of the ``event`` object (which the eslogger CLI --events flag and the
-# Nebulock macos-coresigma Sigma/ECS pipeline key on); the integer is rendered
-# for structural fidelity only and nothing downstream depends on its exact value.
+# ES event name -> es_event_type_t integer, from Apple's
+# <EndpointSecurity/ESTypes.h> (the enum is implicitly numbered; values checked
+# against the macOS 15 SDK). ES consumers -- including collectors that switch
+# on ``event_type`` rather than the ``event`` key -- depend on these exact
+# values, so never guess one: add it from the header.
 _ES_EVENT_TYPE_CODES: dict[str, int] = {
-    "exec": 9,
-    "open": 10,
-    "fork": 11,
-    "close": 12,
-    "create": 13,
-    "exit": 15,
-    "write": 24,
-    "rename": 26,
-    "unlink": 27,
-    "btm_launch_item_add": 105,
-    "openssh_login": 106,
-    "openssh_logout": 107,
-    "lw_session_lock": 108,
-    "lw_session_unlock": 109,
-    "su": 130,
-    "sudo": 131,
+    "exec": 9,  # ES_EVENT_TYPE_NOTIFY_EXEC
+    "open": 10,  # ES_EVENT_TYPE_NOTIFY_OPEN
+    "fork": 11,  # ES_EVENT_TYPE_NOTIFY_FORK
+    "close": 12,  # ES_EVENT_TYPE_NOTIFY_CLOSE
+    "create": 13,  # ES_EVENT_TYPE_NOTIFY_CREATE
+    "exit": 15,  # ES_EVENT_TYPE_NOTIFY_EXIT
+    "rename": 25,  # ES_EVENT_TYPE_NOTIFY_RENAME
+    "unlink": 32,  # ES_EVENT_TYPE_NOTIFY_UNLINK
+    "write": 33,  # ES_EVENT_TYPE_NOTIFY_WRITE
+    "lw_session_lock": 116,  # ES_EVENT_TYPE_NOTIFY_LW_SESSION_LOCK
+    "lw_session_unlock": 117,  # ES_EVENT_TYPE_NOTIFY_LW_SESSION_UNLOCK
+    "openssh_login": 120,  # ES_EVENT_TYPE_NOTIFY_OPENSSH_LOGIN
+    "openssh_logout": 121,  # ES_EVENT_TYPE_NOTIFY_OPENSSH_LOGOUT
+    "btm_launch_item_add": 124,  # ES_EVENT_TYPE_NOTIFY_BTM_LAUNCH_ITEM_ADD
+    "su": 128,  # ES_EVENT_TYPE_NOTIFY_SU
+    "sudo": 131,  # ES_EVENT_TYPE_NOTIFY_SUDO
 }
+
+# es_action_type_t / es_result_t values for a notify message.
+_ES_ACTION_TYPE_NOTIFY = 1
+_ES_NOTIFY_ACTION = {"result": {"result_type": 0, "result": {"auth": 0}}}
+
+# es_destination_type_t: NOTIFY_CREATE fires after the object exists, so it
+# reports ES_DESTINATION_TYPE_EXISTING_FILE (ESMessage.h, es_event_create_t).
+_ES_DESTINATION_TYPE_EXISTING_FILE = 0
+_ES_DESTINATION_TYPE_NEW_PATH = 1
+
+# es_address_type_t
+_ES_ADDRESS_TYPE_IPV4 = 1
+_ES_ADDRESS_TYPE_IPV6 = 2
+
+# es_openssh_login_result_type_t
+_ES_OPENSSH_AUTH_SUCCESS = 2
+_ES_OPENSSH_AUTH_FAIL_PASSWD = 4
+
+# es_btm_item_type_t
+_ES_BTM_ITEM_TYPE_AGENT = 3
+_ES_BTM_ITEM_TYPE_DAEMON = 4
+
+# open(2) fflag bits (FREAD/FWRITE) reported by NOTIFY_OPEN.
+_FREAD = 0x1
+_FWRITE = 0x2
+
+# Apple Silicon mach_absolute_time() ticks at 24 MHz (timebase 125/3), not
+# nanoseconds. Synthetic macOS hosts are modeled as Apple Silicon Macs.
+_MACH_TICKS_PER_NS = (3, 125)
+_CPU_TYPE_ARM64 = 0x0100000C
+# arm64e with the pointer-auth ABI capability bit, as Apple platform binaries
+# report; third-party arm64 code reports CPU_SUBTYPE_ARM64_ALL (0).
+_CPU_SUBTYPE_ARM64E_PTRAUTH = -2147483646
+
+# Reports BTM events: legacy LaunchAgent/LaunchDaemon plists are discovered by
+# backgroundtaskmanagementd, which is the ES message subject; the process that
+# dropped the plist (when known) is the ``instigator``.
+_BTM_DAEMON_IMAGE = (
+    "/System/Library/PrivateFrameworks/BackgroundTaskManagement.framework/"
+    "Versions/A/Resources/backgroundtaskmanagementd"
+)
 
 # Canonical file event_type -> ES file event name.  macOS file activity uses the
 # open/write/rename/unlink vocabulary widened onto FileContext by Task 6; plain
@@ -254,13 +298,18 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         event_payload: dict[str, Any],
     ) -> dict[str, Any]:
         """Build a complete ES record envelope (seq_num filled at render time)."""
+        audit_token = process_obj.get("audit_token", {})
         return {
             "schema_version": _SCHEMA_VERSION,
-            "time": self._iso(event_time),
+            "version": self._message_version(host),
+            "time": self._iso_ns(event_time, f"{event_name}:{audit_token.get('pid', 0)}"),
             "mach_time": self._mach_time(host, event_time),
+            "thread": {"thread_id": self._thread_id(host, audit_token)},
             "seq_num": 0,
             "global_seq_num": 0,
-            "event_type": _ES_EVENT_TYPE_CODES.get(event_name, -1),
+            "action_type": _ES_ACTION_TYPE_NOTIFY,
+            "action": _ES_NOTIFY_ACTION,
+            "event_type": _ES_EVENT_TYPE_CODES[event_name],
             "event": {event_name: event_payload},
             "process": process_obj,
         }
@@ -272,10 +321,11 @@ class ESLoggerEmitter(HostMultiplexEmitter):
     def _render_process_create(self, event: SecurityEvent) -> None:
         """Render an ES ``fork`` then ``exec`` pair for one process launch.
 
-        Real ``eslogger`` output shows both a fork (subject = parent, child in
-        the event) and an exec (subject = new image, argv + cwd in the event)
-        for a typical launch, so one canonical ``process_create`` maps to two
-        ES lines.
+        ``fork``: the subject is the parent; ``event.fork.child`` is the new
+        PID still running the parent's image (pre-exec pidversion).
+        ``exec``: the subject is that same pre-exec image; ``event.exec.target``
+        is the new program image with its own signing identity and the
+        post-exec pidversion. This matches es_event_fork_t / es_event_exec_t.
         """
         host = event.src_host
         proc = event.process
@@ -283,7 +333,9 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             return
         start_time = proc.start_time or event.timestamp
 
-        child_obj = self._build_process_object(
+        parent_obj = self._parent_process_object(host, proc, start_time)
+        parent_image = parent_obj["executable"]["path"]
+        target_obj = self._build_process_object(
             host,
             pid=proc.pid,
             ppid=proc.parent_pid,
@@ -292,7 +344,18 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             logon_id=proc.logon_id,
             start_time=start_time,
         )
-        parent_obj = self._parent_process_object(host, proc, start_time)
+        # The forked child keeps the parent's image and signing identity until
+        # it execs; XNU bumps pidversion on exec, so it is one generation older.
+        pre_exec_obj = self._build_process_object(
+            host,
+            pid=proc.pid,
+            ppid=proc.parent_pid,
+            image=parent_image,
+            username=proc.username,
+            logon_id=proc.logon_id,
+            start_time=start_time,
+            pidversion_offset=-1,
+        )
 
         self._queue_record(
             host,
@@ -301,20 +364,28 @@ class ESLoggerEmitter(HostMultiplexEmitter):
                 event_name="fork",
                 event_time=start_time,
                 process_obj=parent_obj,
-                event_payload={"child": child_obj},
+                event_payload={"child": pre_exec_obj},
             ),
         )
+        platform = bool(target_obj["is_platform_binary"])
         self._queue_record(
             host,
             self._envelope(
                 host=host,
                 event_name="exec",
                 event_time=start_time,
-                process_obj=child_obj,
+                process_obj=pre_exec_obj,
                 event_payload={
+                    "target": target_obj,
+                    "dyld_exec_path": proc.image,
+                    "script": None,
+                    "cwd": self._es_file(
+                        proc.current_directory or self._default_cwd(proc.username)
+                    ),
+                    "last_fd": 2 + _stable_seed(f"es_last_fd:{host.hostname}:{proc.pid}") % 6,
+                    "image_cputype": _CPU_TYPE_ARM64,
+                    "image_cpusubtype": _CPU_SUBTYPE_ARM64E_PTRAUTH if platform else 0,
                     "args": self._argv(proc.command_line, proc.image),
-                    "cwd": {"path": proc.current_directory or self._default_cwd(proc.username)},
-                    "target": {"executable": {"path": proc.image}},
                 },
             ),
         )
@@ -356,16 +427,33 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         path = fc.path
         pid_hint = fc.pid or (event.process.pid if event.process else 0)
         process_obj = self._process_object_for(host, event, pid_hint)
+        parent_dir, _, filename = path.rpartition("/")
 
         if event_name == "create":
-            payload: dict[str, Any] = {"destination": {"path": path}}
+            payload: dict[str, Any] = {
+                "destination_type": _ES_DESTINATION_TYPE_EXISTING_FILE,
+                "destination": {"existing_file": self._es_file(path)},
+            }
         elif event_name == "open":
-            payload = {"file": {"path": path}}
+            fflag = _FREAD | _FWRITE if fc.action == "write" else _FREAD
+            payload = {"fflag": fflag, "file": self._es_file(path)}
         elif event_name == "rename":
-            # FileContext carries a single path; the destination is not modeled.
-            payload = {"source": {"path": path}}
-        else:  # write, unlink
-            payload = {"target": {"path": path}}
+            # FileContext carries a single path; the rename destination is not
+            # modeled canonically, so report the new name in the same directory.
+            payload = {
+                "source": self._es_file(path),
+                "destination_type": _ES_DESTINATION_TYPE_NEW_PATH,
+                "destination": {
+                    "new_path": {"dir": self._es_file(parent_dir or "/"), "filename": filename}
+                },
+            }
+        elif event_name == "unlink":
+            payload = {
+                "target": self._es_file(path),
+                "parent_dir": self._es_file(parent_dir or "/"),
+            }
+        else:  # write
+            payload = {"target": self._es_file(path)}
 
         self._queue_record(
             host,
@@ -390,6 +478,7 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         self._openssh_login_sessions.add((host.hostname, auth.session_id))
         process_obj = self._sshd_process_object(host, auth.session_id)
         uid = self._macos_ids(auth.username)["uid"]
+        success = auth.result != "failure"
         self._queue_record(
             host,
             self._envelope(
@@ -398,13 +487,15 @@ class ESLoggerEmitter(HostMultiplexEmitter):
                 event_time=event.timestamp,
                 process_obj=process_obj,
                 event_payload={
-                    "success": True,
-                    "result_type": "AUTHORIZED",
+                    "success": success,
+                    "result_type": (
+                        _ES_OPENSSH_AUTH_SUCCESS if success else _ES_OPENSSH_AUTH_FAIL_PASSWD
+                    ),
                     "source_address_type": self._addr_type(auth.source_ip),
                     "source_address": auth.source_ip,
                     "username": auth.username,
                     "has_uid": True,
-                    "uid": uid,
+                    "uid": {"uid": uid},
                 },
             ),
         )
@@ -489,17 +580,37 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         from_username = (auth.subject_username if auth is not None else "") or proc.username
         to_username = (auth.username if auth is not None else "") or "root"
         success = not (auth is not None and auth.result == "failure")
-        payload: dict[str, Any] = {
-            "success": success,
-            "from_uid": self._macos_ids(from_username)["uid"],
-            "from_username": from_username,
-            "to_uid": self._macos_ids(to_username)["uid"],
-            "to_username": to_username,
-        }
+        from_uid = self._macos_ids(from_username)["uid"]
+        to_uid = self._macos_ids(to_username)["uid"]
+        payload: dict[str, Any]
         if tool == "sudo":
-            payload["command"] = proc.command_line or proc.image
+            payload = {
+                "success": success,
+                "reject_info": None,
+                "has_from_uid": True,
+                "from_uid": {"uid": from_uid},
+                "from_username": from_username,
+                "has_to_uid": True,
+                "to_uid": {"uid": to_uid},
+                "to_username": to_username,
+                "command": proc.command_line or proc.image,
+            }
         else:
-            payload["shell"] = proc.command_line or "/bin/zsh"
+            argv = self._argv(proc.command_line, proc.image)
+            payload = {
+                "success": success,
+                "failure_message": None if success else "Sorry",
+                "from_uid": from_uid,
+                "from_username": from_username,
+                "has_to_uid": True,
+                "to_uid": {"uid": to_uid},
+                "to_username": to_username,
+                "shell": "/bin/zsh",
+                "argc": len(argv),
+                "argv": argv,
+                "env_count": 0,
+                "env": [],
+            }
         self._queue_record(
             host,
             self._envelope(
@@ -512,35 +623,53 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         )
 
     def _render_btm_launch_item_add(self, event: SecurityEvent) -> None:
-        """Render an ES ``btm_launch_item_add`` for a LaunchAgents/Daemons plist."""
+        """Render an ES ``btm_launch_item_add`` for a LaunchAgents/Daemons plist.
+
+        backgroundtaskmanagementd discovers the legacy plist and is the message
+        subject; the process that dropped the plist, when known, is the
+        ``instigator`` (es_event_btm_launch_item_add_t).
+        """
         host = event.src_host
         if host is None:
             return
         plist = event.file.path if event.file else ""
         proc = event.process
-        process_obj = self._process_object_for(host, event, proc.pid if proc else 0)
-        item_type = "agent" if "LaunchAgents" in plist else "daemon"
+        instigator = self._process_object_for(host, event, proc.pid) if proc is not None else None
+        btmd_obj = self._named_system_process_object(
+            host,
+            image_suffix="backgroundtaskmanagementd",
+            session_id=_MACOS_SYSTEM_ASID,
+            fallback_image=_BTM_DAEMON_IMAGE,
+        )
+        is_agent = "LaunchAgents" in plist
         username = ""
         if event.auth is not None:
             username = event.auth.username
         elif proc is not None:
             username = proc.username
+        # LaunchDaemons run as root; LaunchAgents belong to the owning user.
+        uid = self._macos_ids(username)["uid"] if is_agent and username else 0
         self._queue_record(
             host,
             self._envelope(
                 host=host,
                 event_name="btm_launch_item_add",
                 event_time=event.timestamp,
-                process_obj=process_obj,
+                process_obj=btmd_obj,
                 event_payload={
+                    "instigator": instigator,
+                    "app": None,
                     "item": {
-                        "item_type": item_type,
-                        "legacy": False,
+                        "item_type": _ES_BTM_ITEM_TYPE_AGENT
+                        if is_agent
+                        else _ES_BTM_ITEM_TYPE_DAEMON,
+                        "legacy": True,
                         "managed": False,
-                        "uid": self._macos_ids(username)["uid"] if username else _KAUTH_UID_NONE,
-                        "url": {"path": plist},
+                        "uid": uid,
+                        "item_url": "file://" + quote(plist),
+                        "app_url": None,
                     },
-                    "executable_path": proc.image if proc is not None else "",
+                    "executable_path": proc.image if proc is not None else None,
                 },
             ),
         )
@@ -560,34 +689,47 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         logon_id: str = "",
         session_id: int = 0,
         start_time: datetime | None = None,
+        pidversion_offset: int = 0,
     ) -> dict[str, Any]:
-        """Build the ES ``process`` object: audit token, parents, and signing."""
+        """Build an ES ``es_process_t``: audit tokens, identity, and signing.
+
+        ``pidversion_offset=-1`` renders the pre-exec image of a process (the
+        forked child before it execs), one XNU pidversion generation earlier.
+        """
         hostname = host.hostname
         sm = getattr(self, "_state_manager", None)
         pidversion = sm.get_pidversion(hostname, pid) if sm is not None and pid > 0 else 0
+        if pidversion:
+            pidversion += pidversion_offset
 
         is_login = self._is_login_session(username, logon_id, session_id)
         asid = self._resolve_asid(hostname, username, logon_id, session_id, is_login)
         audit_token = self._audit_token(pid, pidversion, username, asid, is_login)
         parent_audit_token = self._parent_audit_token(host, ppid, asid)
+        # Launchd jobs and apps are responsible for themselves; anything they
+        # spawn is attributed to that responsible ancestor (approximated here
+        # by the immediate parent).
+        responsible_audit_token = audit_token if ppid <= 1 else parent_audit_token
 
         signing = get_signing_identity(image)
         tty = self._tty(hostname, username, logon_id, is_login)
         return {
-            "pid": pid,
+            "audit_token": audit_token,
             "ppid": ppid,
             "original_ppid": ppid,
+            "group_id": pid if ppid <= 1 else ppid,
             "session_id": asid,
-            "audit_token": audit_token,
-            "parent_audit_token": parent_audit_token,
-            "executable": {"path": image},
-            "tty": {"path": tty} if tty else None,
-            "start_time": self._iso(start_time) if start_time is not None else None,
+            "codesigning_flags": signing["codesigning_flags"],
             "is_platform_binary": signing["is_platform_binary"],
+            "is_es_client": False,
+            "cdhash": signing["cdhash"],
             "signing_id": signing["signing_id"],
             "team_id": signing["team_id"],
-            "cdhash": signing["cdhash"],
-            "codesigning_flags": signing["codesigning_flags"],
+            "executable": self._es_file(image),
+            "tty": self._es_file(tty) if tty else None,
+            "start_time": self._iso(start_time) if start_time is not None else None,
+            "responsible_audit_token": responsible_audit_token,
+            "parent_audit_token": parent_audit_token,
         }
 
     def _parent_process_object(
@@ -833,13 +975,26 @@ class ESLoggerEmitter(HostMultiplexEmitter):
 
     @staticmethod
     def _iso(dt: datetime) -> str:
-        """Render a datetime as ISO 8601 UTC with microseconds and a Z suffix."""
+        """Render a timeval (process start_time) as ISO 8601 UTC, microseconds."""
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=UTC)
         return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
+    @staticmethod
+    def _iso_ns(dt: datetime, scope: str) -> str:
+        """Render the message timespec as ISO 8601 UTC with nanoseconds.
+
+        Canonical timestamps carry microseconds; the sub-microsecond digits
+        are derived deterministically so they are not a constant ``000``.
+        """
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        dt = dt.astimezone(UTC)
+        nanos = _stable_seed(f"es_time_ns:{dt.isoformat()}:{scope}") % 1000
+        return dt.strftime("%Y-%m-%dT%H:%M:%S.%f") + f"{nanos:03d}Z"
+
     def _mach_time(self, host: HostContext | None, event_time: datetime) -> int:
-        """Derive mach_time: nanoseconds of monotonic uptime since host boot."""
+        """Derive mach_time: Apple Silicon mach_absolute_time() ticks since boot."""
         boot: datetime | None = None
         sm = getattr(self, "_state_manager", None)
         if sm is not None and host is not None:
@@ -851,12 +1006,38 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         if event_time.tzinfo is None:
             event_time = event_time.replace(tzinfo=UTC)
         delta_ns = int((event_time - boot).total_seconds() * 1_000_000_000)
-        return max(0, delta_ns)
+        numerator, denominator = _MACH_TICKS_PER_NS
+        return max(0, delta_ns * numerator // denominator)
 
     @staticmethod
-    def _addr_type(source_ip: str) -> str:
-        """Classify an SSH source address as ipv4/ipv6 (ES source_address_type)."""
-        return "ipv6" if source_ip and ":" in source_ip else "ipv4"
+    def _thread_id(host: HostContext | None, audit_token: dict[str, Any]) -> int:
+        """Return a stable 64-bit-style Mach thread id for the acting process."""
+        hostname = host.hostname if host is not None else ""
+        pid = audit_token.get("pid", 0)
+        pidversion = audit_token.get("pidversion", 0)
+        return 1_000_000 + _stable_seed(f"es_thread:{hostname}:{pid}:{pidversion}") % 90_000_000
+
+    @staticmethod
+    def _message_version(host: HostContext | None) -> int:
+        """Return the es_message_t version the host's macOS release emits."""
+        os_name = getattr(host, "os", "") or ""
+        digits = "".join(ch if ch.isdigit() or ch == "." else " " for ch in os_name).split()
+        major = int(digits[0].split(".")[0]) if digits and digits[0].split(".")[0] else 14
+        if major >= 15:
+            return 8
+        if major == 14:
+            return 7
+        return 6
+
+    @staticmethod
+    def _es_file(path: str) -> dict[str, Any]:
+        """Render an es_file_t (path + truncation flag; stat is not modeled)."""
+        return {"path": path, "path_truncated": False}
+
+    @staticmethod
+    def _addr_type(source_ip: str) -> int:
+        """Classify an SSH source address as an es_address_type_t value."""
+        return _ES_ADDRESS_TYPE_IPV6 if source_ip and ":" in source_ip else _ES_ADDRESS_TYPE_IPV4
 
     @staticmethod
     def _default_cwd(username: str) -> str:
