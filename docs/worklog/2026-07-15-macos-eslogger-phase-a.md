@@ -123,3 +123,56 @@ Durable decisions future agents should not need to rediscover:
   (code-signing identity loader), `src/evidenceforge/evaluation/parsers/eslogger.py`
   (evaluation parser), `config/activity/macos_signing.yaml`,
   `config/formats/eslogger.yaml`.
+
+## OBTS Readiness Pass (2026-09-26)
+
+A pre-talk review (OBTS v9, November 2026) found the Phase A output was not
+presentation-ready despite a green suite. Fixed on `macos-eslogger`:
+
+- **ES schema fidelity** — `event_type` integers were guessed; 9 of 17 were
+  wrong vs Apple's `ESTypes.h` (write rendered as `NOTIFY_IOKIT_OPEN`). Records
+  now follow `es_message_t`/`es_process_t`/`es_event_*_t` from the macOS SDK
+  headers: launched program in `event.exec.target`, pre-exec image as the exec
+  subject, no top-level `pid`, uint32 `codesigning_flags`, envelope
+  `version`/`thread`/`action`, nanosecond `time`, 24 MHz `mach_time`, BTM
+  reported by `backgroundtaskmanagementd` with an `instigator`.
+- **PIDs/pidversion** — macOS used the Linux allocator (PIDs like 582169);
+  now a time-derived allocator that wraps below 99999. `pidversion` follows
+  XNU's per-boot `nextpidversion` instead of a per-slot counter starting at 0.
+- **Code signing** — generator and YAML disagreed on daemon paths, so Apple
+  daemons rendered unsigned. Paths/identifiers verified with `codesign -dv` on
+  macOS 15.7; anything on the sealed system volume is a platform binary; the
+  default identity is ad-hoc linker-signed (what Apple Silicon runs).
+- **Process tree** — macOS fell into Linux parent fallbacks (persistent root
+  `sshd`/`zsh`). Apps now descend from launchd; shells come from
+  Terminal → `login -pf` → `zsh`; macOS parent chains nest strictly in time.
+- **Linux/Windows leaks on macOS** — `/home/<user>` cwd, Windows VS Code
+  project paths, `cat /etc/shadow` / AWS IMDS suspicious-noise commands.
+- **Demo storyline** — AMOS exfil was owned by a fabricated `curl` started
+  before the dropper. New `process_ref` on `file`/`connection` events and
+  `working_directory` on `process` events let the scenario run AMOS in its
+  real order (prompt → keychain → exfil by the dropper) and BeaverTail as
+  node-runs-npm → `sh -c` → node postinstall.
+- **Pre-existing leak** — generation wrote scenario host mappings into the
+  module-global `REVERSE_DNS`, so a prior run in the same process changed the
+  next run's output. Reset per generation.
+
+### Open items before the talk
+
+- Capture ~30 s of real `eslogger` on a Mac (`sudo eslogger exec fork open
+  create write btm_launch_item_add --format json`) and diff field-by-field;
+  the current shape is header-derived, not capture-verified. Unmodeled:
+  `es_file_t.stat`, exec `env`/`fds`.
+- coreSigma side: its collector only reads live `eslogger` (needs a replay
+  shim), its `ESF_EVENT_TYPE_MAP` disagrees with `ESTypes.h` (exit/write/
+  unlink/rename), its file-path extraction reads `event.target` rather than
+  `event.<name>.target`, and it has no rules for keychain access by
+  non-platform code, unsigned parent → `osascript`, BTM launch items, or
+  per-user LaunchAgents. Coordinate with its maintainers.
+- ES volume is still tiny (~100 events/host/day); real hosts emit thousands per
+  minute. Raise baseline ES density before presenting it as a hunt.
+- Latent cross-OS issue left in place: non-macOS `_ensure_parent_chain`
+  computes ancestor times from the original child, so an ancestor can start
+  after its child; macOS now nests correctly.
+- Validator still warns "no prior logon" for storyline actors whose sessions
+  come from baseline (visible in a live `eforge validate`).
