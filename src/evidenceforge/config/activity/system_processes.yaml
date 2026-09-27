@@ -637,13 +637,13 @@ system_binaries:
     - {exe: "syslogd",                   path: "/usr/sbin/syslogd"}
     - {exe: "UserEventAgent",            path: "/usr/libexec/UserEventAgent"}
     - {exe: "cfprefsd",                  path: "/usr/sbin/cfprefsd"}
-    - {exe: "mds",                       path: "/System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Support/mds"}
-    - {exe: "mdworker",                  path: "/System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Support/mdworker"}
+    - {exe: "mds",                       path: "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds"}
+    - {exe: "mdworker",                  path: "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared"}
     - {exe: "opendirectoryd",            path: "/usr/libexec/opendirectoryd"}
     - {exe: "coreaudiod",                path: "/usr/sbin/coreaudiod"}
     - {exe: "bluetoothd",                path: "/usr/sbin/bluetoothd"}
     - {exe: "locationd",                 path: "/usr/libexec/locationd"}
-    - {exe: "launchservicesd",           path: "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/launchservicesd"}
+    - {exe: "launchservicesd",           path: "/System/Library/CoreServices/launchservicesd"}
     - {exe: "sshd",                      path: "/usr/sbin/sshd"}
 
     # --- CLI / admin tools ---

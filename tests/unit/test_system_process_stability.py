@@ -421,7 +421,10 @@ class TestSystemProcessProtection:
             "opendirectoryd": "/usr/libexec/opendirectoryd",
             "notifyd": "/usr/libexec/notifyd",
             "mdnsresponder": "/usr/sbin/mDNSResponder",
-            "mds": "/usr/sbin/mds",
+            "mds": (
+                "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/"
+                "Metadata.framework/Versions/A/Support/mds"
+            ),
             "sshd": "/usr/sbin/sshd",
             "zsh": "/bin/zsh",
         }

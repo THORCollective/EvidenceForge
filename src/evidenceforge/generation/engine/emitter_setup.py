@@ -1034,13 +1034,18 @@ class EmitterSetupMixin:
 
         # Spotlight: mds is the metadata server; mdworker instances are its
         # on-demand indexing workers.
-        pids["mds"] = _c(pids["launchd"], "/usr/sbin/mds", "/usr/sbin/mds", "root")
+        pids["mds"] = _c(
+            pids["launchd"],
+            "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds",
+            "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds",
+            "root",
+        )
         pids["mdworker"] = _c(
             pids["mds"],
-            "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
-            "Metadata.framework/Support/mdworker_shared",
-            "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
-            "Metadata.framework/Support/mdworker_shared -s mdworker",
+            "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/"
+            "Metadata.framework/Versions/A/Support/mdworker_shared",
+            "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/"
+            "Metadata.framework/Versions/A/Support/mdworker_shared -s mdworker",
             "_spotlight",
         )
 

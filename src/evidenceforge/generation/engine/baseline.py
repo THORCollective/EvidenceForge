@@ -4346,8 +4346,8 @@ class BaselineMixin:
 
         hn = system.hostname
         image = (
-            "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
-            "Metadata.framework/Support/mdworker_shared"
+            "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/"
+            "Metadata.framework/Versions/A/Support/mdworker_shared"
         )
         phase = _stable_seed(f"macos_spotlight_phase:{hn}") % 3600
         base_offset = max(0.0, min(3599.0, phase + rng.gauss(0, 180)))
@@ -4392,7 +4392,7 @@ class BaselineMixin:
             return
 
         hn = system.hostname
-        image = "/System/Library/PrivateFrameworks/Backup.framework/Resources/backupd"
+        image = "/System/Library/CoreServices/TimeMachine/backupd"
         phase = _stable_seed(f"macos_backupd_phase:{hn}") % 3600
         offset = max(0.0, min(3599.0, phase + rng.gauss(0, 120)))
         ts = current_hour + timedelta(seconds=offset)
@@ -4433,7 +4433,7 @@ class BaselineMixin:
 
         hn = system.hostname
         image = (
-            "/System/Library/PrivateFrameworks/SoftwareUpdate.framework/Resources/softwareupdated"
+            "/System/Library/CoreServices/Software Update.app/Contents/Resources/softwareupdated"
         )
         phase = _stable_seed(f"macos_softwareupdated_phase:{hn}") % 3600
         offset = max(0.0, min(3599.0, phase + rng.gauss(0, 300)))
@@ -4541,8 +4541,14 @@ class BaselineMixin:
         hn = system.hostname
         username = system.assigned_user
         for image, phase_key in (
-            ("/usr/libexec/cloudd", "macos_cloudd_phase"),
-            ("/usr/libexec/bird", "macos_bird_phase"),
+            (
+                "/System/Library/PrivateFrameworks/CloudKitDaemon.framework/Support/cloudd",
+                "macos_cloudd_phase",
+            ),
+            (
+                "/System/Library/PrivateFrameworks/iCloudDriveCore.framework/Versions/A/Support/bird",
+                "macos_bird_phase",
+            ),
         ):
             if rng.random() >= _MACOS_ICLOUD_DAEMON_PROBABILITY:
                 continue

@@ -12,21 +12,18 @@
 # same CDHash across a run and across separate runs with the same seed,
 # without duplicating a fake hash value in this file for every entry.
 #
-# binary_path is the full executable path as it appears on a `process` audit
-# token / executable.path field. Paths for common Apple command-line tools
-# and app-bundle executables follow documented macOS filesystem layout
-# (Apple's own developer docs, `man` pages, and public `codesign -dv` output
-# widely referenced in macOS security research). A handful of private
-# framework daemon paths (mds, WindowServer, cloudd, bird) are illustrative/
-# approximate since they were not verified against a live macOS system —
-# their exact private-framework path is not load-bearing for synthetic
-# training data, only a plausible macOS-shaped path is. Likewise, third-party
-# vendor Team IDs for Google and Microsoft reflect commonly-cited real Apple
-# Developer Team IDs; other vendors' Team IDs are plausible format-correct
-# (10-character alphanumeric) placeholders rather than verified real values.
+# binary_path is the full executable path as Endpoint Security reports it on
+# a process `executable.path` -- the vnode-resolved path, so framework
+# binaries appear under their real `Versions/A/...` location rather than the
+# symlinked short path. System paths and signing identifiers were verified
+# with `codesign -dv` on macOS 15.7. Third-party vendor Team IDs for Google,
+# Microsoft, Mozilla and the Node.js Foundation reflect their real Apple
+# Developer Team IDs.
 #
-# Depended on by: eslogger emitter (Task 9, not yet landed) via
-#                 get_signing_identity()
+# codesigning_flags are cs_blobs.h flag names; the loader folds them into the
+# uint32 bitmask ES actually reports.
+#
+# Depended on by: eslogger emitter via get_signing_identity()
 # Depends on: nothing — standalone
 #
 # Full schema: see docs/plans/2026-07-11-macos-eslogger-design.md
@@ -39,283 +36,283 @@ binaries:
   # ---------------------------------------------------------------------
   - binary_path: "/sbin/launchd"
     category: "system"
-    signing_id: "com.apple.launchd"
+    signing_id: "com.apple.xpc.launchd"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow"
     category: "system"
     signing_id: "com.apple.loginwindow"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock"
     category: "system"
     signing_id: "com.apple.dock"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer"
     category: "system"
     signing_id: "com.apple.systemuiserver"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"
     category: "system"
     signing_id: "com.apple.finder"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
     category: "system"
     signing_id: "com.apple.Terminal"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/Applications/Safari.app/Contents/MacOS/Safari"
     category: "system"
     signing_id: "com.apple.Safari"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/sbin/sshd"
     category: "system"
     signing_id: "com.apple.sshd"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/bin/ssh"
     category: "system"
     signing_id: "com.apple.ssh"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/bin/zsh"
     category: "system"
     signing_id: "com.apple.zsh"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/bin/bash"
     category: "system"
     signing_id: "com.apple.bash"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/bin/sh"
     category: "system"
     signing_id: "com.apple.sh"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/bin/curl"
     category: "system"
     signing_id: "com.apple.curl"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/bin/python3"
     category: "system"
-    signing_id: "com.apple.python3"
+    signing_id: "com.apple.dt.xcode_select.tool-shim"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/bin/git"
     category: "system"
-    signing_id: "com.apple.git"
+    signing_id: "com.apple.dt.xcode_select.tool-shim"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/bin/osascript"
     category: "system"
     signing_id: "com.apple.osascript"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/bin/security"
     category: "system"
     signing_id: "com.apple.security"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/bin/codesign"
     category: "system"
-    signing_id: "com.apple.codesign"
+    signing_id: "com.apple.security.codesign"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/bin/plutil"
     category: "system"
-    signing_id: "com.apple.plutil"
+    signing_id: "com.apple.Foundation.plutil"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/bin/defaults"
     category: "system"
     signing_id: "com.apple.defaults"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/bin/launchctl"
     category: "system"
-    signing_id: "com.apple.launchctl"
+    signing_id: "com.apple.xpc.launchctl"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/bin/sw_vers"
     category: "system"
     signing_id: "com.apple.sw_vers"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/bin/log"
     category: "system"
     signing_id: "com.apple.log"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/bin/sudo"
     category: "system"
     signing_id: "com.apple.sudo"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/sbin/syslogd"
     category: "system"
     signing_id: "com.apple.syslogd"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/libexec/UserEventAgent"
     category: "system"
     signing_id: "com.apple.UserEventAgent"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/sbin/cfprefsd"
     category: "system"
     signing_id: "com.apple.cfprefsd"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
-  - binary_path: "/System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Versions/A/Support/mds"
+  - binary_path: "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds"
     category: "system"
-    signing_id: "com.apple.metadata.mds"
+    signing_id: "com.apple.mds"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
-  - binary_path: "/System/Library/Frameworks/CoreServices.framework/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared"
+  - binary_path: "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared"
     category: "system"
-    signing_id: "com.apple.metadata.mdworker"
+    signing_id: "com.apple.mdworker_shared"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer"
     category: "system"
     signing_id: "com.apple.WindowServer"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/libexec/opendirectoryd"
     category: "system"
     signing_id: "com.apple.opendirectoryd"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/sbin/coreaudiod"
     category: "system"
     signing_id: "com.apple.audio.coreaudiod"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/sbin/bluetoothd"
     category: "system"
     signing_id: "com.apple.bluetoothd"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/libexec/locationd"
     category: "system"
     signing_id: "com.apple.locationd"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/System/Library/CoreServices/launchservicesd"
     category: "system"
     signing_id: "com.apple.launchservicesd"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
-  - binary_path: "/System/Library/CoreServices/backupd.bundle/Contents/MacOS/backupd"
+  - binary_path: "/System/Library/CoreServices/TimeMachine/backupd"
     category: "system"
     signing_id: "com.apple.backupd"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
-  - binary_path: "/usr/libexec/softwareupdated"
+  - binary_path: "/System/Library/CoreServices/Software Update.app/Contents/Resources/softwareupdated"
     category: "system"
     signing_id: "com.apple.softwareupdated"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
-  - binary_path: "/System/Library/PrivateFrameworks/CloudKit.framework/Versions/A/Support/cloudd"
+  - binary_path: "/System/Library/PrivateFrameworks/CloudKitDaemon.framework/Support/cloudd"
     category: "system"
     signing_id: "com.apple.cloudd"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
-  - binary_path: "/System/Library/PrivateFrameworks/CloudDocs.framework/Versions/A/Support/bird"
+  - binary_path: "/System/Library/PrivateFrameworks/iCloudDriveCore.framework/Versions/A/Support/bird"
     category: "system"
     signing_id: "com.apple.bird"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   - binary_path: "/usr/libexec/trustd"
     category: "system"
     signing_id: "com.apple.trustd"
     team_id: null
     is_platform_binary: true
-    codesigning_flags: ["CS_VALID", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
 
   # ---------------------------------------------------------------------
   # Third-party apps — is_platform_binary: false, real notarization gets a
@@ -326,39 +323,32 @@ binaries:
     signing_id: "com.google.Chrome"
     team_id: "EQHXZ8M8AV"
     is_platform_binary: false
-    codesigning_flags: ["CS_VALID", "CS_HARD", "CS_KILL", "CS_ENFORCEMENT", "CS_REQUIRE_LV", "CS_RUNTIME"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_HARD", "CS_KILL", "CS_ENFORCEMENT", "CS_REQUIRE_LV", "CS_RUNTIME"]
 
   - binary_path: "/Applications/Firefox.app/Contents/MacOS/firefox"
     category: "third_party"
     signing_id: "org.mozilla.firefox"
     team_id: "43AQ936H96"
     is_platform_binary: false
-    codesigning_flags: ["CS_VALID", "CS_HARD", "CS_KILL", "CS_ENFORCEMENT", "CS_REQUIRE_LV", "CS_RUNTIME"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_HARD", "CS_KILL", "CS_ENFORCEMENT", "CS_REQUIRE_LV", "CS_RUNTIME"]
 
   - binary_path: "/Applications/Visual Studio Code.app/Contents/MacOS/Electron"
     category: "third_party"
     signing_id: "com.microsoft.VSCode"
     team_id: "UBF8T346G9"
     is_platform_binary: false
-    codesigning_flags: ["CS_VALID", "CS_HARD", "CS_KILL", "CS_ENFORCEMENT", "CS_REQUIRE_LV", "CS_RUNTIME"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_HARD", "CS_KILL", "CS_ENFORCEMENT", "CS_REQUIRE_LV", "CS_RUNTIME"]
 
-  # node/npm default to unsigned/ad-hoc: real-world nvm/Homebrew-built Node.js
-  # installs are typically not Team-ID-signed. This is also the identity
-  # BeaverTail's node-based payload presents — no special-casing needed, it
-  # inherits this baseline-realistic identity by construction.
+  # Node.js from the official nodejs.org installer (/usr/local/bin/node) is
+  # Developer ID-signed by the Node.js Foundation. npm is not listed: it is a
+  # `#!/usr/bin/env node` script, so ES reports the exec of the interpreter
+  # (node) with the npm script path in argv, never an "npm" Mach-O image.
   - binary_path: "/usr/local/bin/node"
     category: "third_party"
-    signing_id: ""
-    team_id: null
+    signing_id: "node"
+    team_id: "HX7739G8FX"
     is_platform_binary: false
-    codesigning_flags: []
-
-  - binary_path: "/usr/bin/npm"
-    category: "third_party"
-    signing_id: ""
-    team_id: null
-    is_platform_binary: false
-    codesigning_flags: []
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_HARD", "CS_KILL", "CS_ENFORCEMENT", "CS_RUNTIME"]
 
   # ---------------------------------------------------------------------
   # Storyline malware — unsigned/ad-hoc by default. Illustrative entry for
@@ -400,16 +390,38 @@ binaries:
   # ---------------------------------------------------------------------
   - binary_path: "/Applications/CleanMyMacX Helper.app/Contents/MacOS/CleanMyMacX Helper"
     category: "malware"
-    signing_id: ""
+    signing_id: "CleanMyMacX Helper"
     team_id: null
     is_platform_binary: false
-    codesigning_flags: ["CS_ADHOC"]
+    codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_ADHOC"]
 
-# Fallback identity for any binary_path not found in the `binaries` table
-# above (unknown/unsigned/ad-hoc — the common case for storyline malware
-# dropped under attacker-chosen paths).
+# Anything under these prefixes lives on the sealed, read-only system volume
+# (SSV), so it can only be an Apple platform binary. Unlisted paths here get
+# `platform_default`, with `{basename}` replaced by the executable name --
+# e.g. /usr/libexec/foo -> com.apple.foo. /usr/local is NOT on the SSV.
+platform_path_prefixes:
+  - "/System/"
+  - "/bin/"
+  - "/sbin/"
+  - "/usr/bin/"
+  - "/usr/sbin/"
+  - "/usr/libexec/"
+  - "/usr/lib/"
+
+platform_default:
+  signing_id: "com.apple.{basename}"
+  team_id: null
+  is_platform_binary: true
+  codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY", "CS_HARD", "CS_KILL", "CS_RESTRICT", "CS_ENFORCEMENT", "CS_REQUIRE_LV"]
+
+# Fallback identity for any other binary_path (unknown third-party code and
+# storyline malware dropped under attacker-chosen paths). Apple Silicon will
+# not execute unsigned arm64 code, so the realistic default is an ad-hoc,
+# linker-signed binary: a signing identifier (the file name) and a CDHash, but
+# no Team ID and no platform bit. That combination -- not an empty
+# signing_id -- is what hunters pivot on.
 default:
-  signing_id: ""
+  signing_id: "{basename}"
   team_id: null
   is_platform_binary: false
-  codesigning_flags: []
+  codesigning_flags: ["CS_VALID", "CS_SIGNED", "CS_ADHOC", "CS_LINKER_SIGNED"]

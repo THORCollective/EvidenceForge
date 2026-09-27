@@ -101,11 +101,11 @@ MACOS_HOSTS = {
 # record's process.executable.path.
 _DAEMON_IMAGE_MARKERS = {
     "mds/mdworker_shared (Spotlight)": "mdworker_shared",
-    "backupd (Time Machine)": "Backup.framework/Resources/backupd",
-    "softwareupdated": "SoftwareUpdate.framework/Resources/softwareupdated",
+    "backupd (Time Machine)": "CoreServices/TimeMachine/backupd",
+    "softwareupdated": "Software Update.app/Contents/Resources/softwareupdated",
     "cfprefsd": "/usr/sbin/cfprefsd",
-    "cloudd (iCloud)": "/usr/libexec/cloudd",
-    "bird (iCloud)": "/usr/libexec/bird",
+    "cloudd (iCloud)": "/System/Library/PrivateFrameworks/CloudKitDaemon.framework/Support/cloudd",
+    "bird (iCloud)": "/System/Library/PrivateFrameworks/iCloudDriveCore.framework/Versions/A/Support/bird",
     "trustd": "/usr/libexec/trustd",
 }
 

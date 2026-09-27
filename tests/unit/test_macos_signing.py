@@ -5,10 +5,15 @@
 
 Covers `config/activity/macos_signing.yaml` + `generation/activity/macos_signing.py`:
 loader caching, known-binary lookups (system/third-party/malware), the
-unsigned/ad-hoc fallback default, and CDHash determinism.
+sealed-system-volume platform fallback, the ad-hoc fallback default, the
+cs_blobs.h flag bitmask, and CDHash determinism.
 """
 
+import pytest
+
 from evidenceforge.generation.activity.macos_signing import (
+    CS_FLAG_BITS,
+    codesigning_flags_value,
     get_signing_identity,
     load_macos_signing,
 )
@@ -68,7 +73,7 @@ class TestGetSigningIdentity:
     def test_known_system_binary_is_platform_binary_with_realistic_signing_id(self):
         identity = get_signing_identity("/sbin/launchd")
         assert identity["is_platform_binary"] is True
-        assert identity["signing_id"] == "com.apple.launchd"
+        assert identity["signing_id"] == "com.apple.xpc.launchd"
         assert identity["team_id"] is None
         assert identity["cdhash"]
 
@@ -87,11 +92,11 @@ class TestGetSigningIdentity:
         assert identity["signing_id"] == "com.google.Chrome"
         assert identity["team_id"] == "EQHXZ8M8AV"
 
-    def test_known_malware_process_returns_unsigned_ad_hoc_defaults(self):
+    def test_known_malware_process_returns_ad_hoc_identity_without_team_id(self):
         identity = get_signing_identity(
             "/Applications/CleanMyMacX Helper.app/Contents/MacOS/CleanMyMacX Helper"
         )
-        assert identity["signing_id"] == ""
+        assert identity["signing_id"] == "CleanMyMacX Helper"
         assert identity["team_id"] is None
         assert identity["is_platform_binary"] is False
 
@@ -109,46 +114,88 @@ class TestGetSigningIdentity:
         assert identity["signing_id"] == "com.apple.osascript"
         assert identity["team_id"] is None
 
-    def test_amos_dropper_payload_defaults_to_unsigned_ad_hoc(self):
-        """The AMOS/Atomic Stealer payload's own unsigned/ad-hoc identity
-        belongs to the trojanized dropper process (e.g. a fake cracked-app
-        installer), not to osascript. Task 12's AMOS storyline scenario must
-        model its malicious payload process at this binary_path (see the
-        AMOS convention comment in macos_signing.yaml) so it spawns osascript
-        as a signed child while the dropper itself resolves unsigned/ad-hoc.
+    def test_amos_dropper_payload_is_ad_hoc_signed(self):
+        """The AMOS payload's ad-hoc identity belongs to the trojanized dropper
+        process, not to osascript: a signing identifier and CS_ADHOC, but no
+        Team ID and no platform bit (see the AMOS convention in
+        macos_signing.yaml).
         """
         identity = get_signing_identity(
             "/Applications/CleanMyMacX Helper.app/Contents/MacOS/CleanMyMacX Helper"
         )
-        assert identity["signing_id"] == ""
         assert identity["team_id"] is None
         assert identity["is_platform_binary"] is False
-        assert identity["codesigning_flags"] == ["CS_ADHOC"]
+        assert identity["codesigning_flags"] & CS_FLAG_BITS["CS_ADHOC"]
+        assert not identity["codesigning_flags"] & CS_FLAG_BITS["CS_PLATFORM_BINARY"]
 
-    def test_beavertail_node_payload_defaults_to_unsigned(self):
-        """node/npm default to unsigned — matches real nvm/Homebrew installs
-        and gives BeaverTail's node-based payload an unsigned identity by
-        construction, without a malware-specific special case."""
+    def test_official_node_install_is_developer_id_signed(self):
+        """nodejs.org's installer ships a Node.js Foundation Developer ID-signed
+        node; BeaverTail's signal is ancestry and egress, not node's signature."""
         identity = get_signing_identity("/usr/local/bin/node")
-        assert identity["signing_id"] == ""
-        assert identity["team_id"] is None
+        assert identity["signing_id"] == "node"
+        assert identity["team_id"] == "HX7739G8FX"
         assert identity["is_platform_binary"] is False
 
-    def test_unknown_path_returns_fallback_default_without_raising(self):
+    def test_unknown_path_returns_ad_hoc_default_named_after_binary(self):
         identity = get_signing_identity("/private/tmp/totally-unknown-attacker-binary")
-        assert identity["signing_id"] == ""
+        assert identity["signing_id"] == "totally-unknown-attacker-binary"
         assert identity["team_id"] is None
         assert identity["is_platform_binary"] is False
-        assert identity["codesigning_flags"] == []
+        assert identity["codesigning_flags"] == codesigning_flags_value(
+            ["CS_VALID", "CS_SIGNED", "CS_ADHOC", "CS_LINKER_SIGNED"]
+        )
         assert identity["cdhash"]
 
-    def test_identity_dict_is_a_fresh_copy_each_call(self):
-        """Mutating one call's result must not corrupt the cached YAML data
-        or a subsequent call's result."""
-        first = get_signing_identity("/sbin/launchd")
-        first["codesigning_flags"].append("INJECTED")
-        second = get_signing_identity("/sbin/launchd")
-        assert "INJECTED" not in second["codesigning_flags"]
+    @pytest.mark.parametrize(
+        ("path", "signing_id"),
+        [
+            ("/usr/libexec/sharingd", "com.apple.sharingd"),
+            ("/System/Library/CoreServices/NotificationCenter", "com.apple.NotificationCenter"),
+            ("/usr/bin/zip", "com.apple.zip"),
+        ],
+    )
+    def test_unlisted_system_volume_path_is_apple_platform_binary(self, path, signing_id):
+        identity = get_signing_identity(path)
+        assert identity["is_platform_binary"] is True
+        assert identity["team_id"] is None
+        assert identity["signing_id"] == signing_id
+        assert identity["codesigning_flags"] & CS_FLAG_BITS["CS_PLATFORM_BINARY"]
+
+    def test_usr_local_is_not_treated_as_system_volume(self):
+        identity = get_signing_identity("/usr/local/bin/some-tool")
+        assert identity["is_platform_binary"] is False
+
+    def test_baseline_macos_daemons_resolve_as_platform_binaries(self):
+        """Regression: Spotlight/iCloud daemons used to render unsigned."""
+        for path in (
+            "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/"
+            "Metadata.framework/Versions/A/Support/mdworker_shared",
+            "/System/Library/PrivateFrameworks/CloudKitDaemon.framework/Support/cloudd",
+            "/System/Library/PrivateFrameworks/iCloudDriveCore.framework/Versions/A/Support/bird",
+        ):
+            assert get_signing_identity(path)["is_platform_binary"] is True, path
+
+
+class TestCodesigningFlagsValue:
+    """cs_blobs.h flag names fold into the uint32 bitmask ES reports."""
+
+    def test_apple_platform_flags_fold_to_expected_bitmask(self):
+        assert codesigning_flags_value(["CS_VALID", "CS_SIGNED", "CS_PLATFORM_BINARY"]) == (
+            0x20000000 | 0x04000000 | 0x00000001
+        )
+
+    def test_empty_flag_list_is_zero(self):
+        assert codesigning_flags_value([]) == 0
+
+    def test_unknown_flag_name_raises_actionable_error(self):
+        with pytest.raises(ValueError, match="CS_BOGUS"):
+            codesigning_flags_value(["CS_BOGUS"])
+
+    def test_every_yaml_flag_name_is_known(self):
+        data = load_macos_signing()
+        entries = [*data["binaries"], data["default"], data["platform_default"]]
+        for entry in entries:
+            codesigning_flags_value(entry["codesigning_flags"])
 
 
 class TestCdhashDeterminism:
