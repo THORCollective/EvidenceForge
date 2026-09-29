@@ -26,6 +26,7 @@ Each parser reads generated log output and yields structured ParsedRecord object
 """
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from datetime import datetime
@@ -37,6 +38,34 @@ from pydantic import BaseModel, Field
 from evidenceforge.events.artifacts_manifest import ARTIFACTS_MANIFEST_FILENAME
 
 logger = logging.getLogger(__name__)
+MAX_EVALUATION_RECORD_BYTES = 16 * 1024 * 1024
+
+
+def iter_bounded_text_lines(
+    path: Path,
+    *,
+    max_record_bytes: int = MAX_EVALUATION_RECORD_BYTES,
+) -> Iterator[tuple[int, str]]:
+    """Yield UTF-8 lines while rejecting an oversized record before parser work."""
+
+    from evidenceforge.models.exceptions import EvaluationLimitError
+
+    with path.open("rb") as handle:
+        line_number = 0
+        while raw := handle.readline(max_record_bytes + 1):
+            line_number += 1
+            if len(raw) > max_record_bytes:
+                raise EvaluationLimitError(
+                    f"Evaluation record exceeds {max_record_bytes} bytes: {path}:{line_number}"
+                )
+            try:
+                if os.name == "nt" and raw.endswith(b"\r\n"):
+                    raw = raw[:-2] + b"\n"
+                yield line_number, raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise EvaluationLimitError(
+                    f"Evaluation record is not valid UTF-8: {path}:{line_number}"
+                ) from exc
 
 
 class ParsedRecord(BaseModel):
@@ -49,6 +78,9 @@ class ParsedRecord(BaseModel):
     parse_errors: list[str] = Field(default_factory=list)
     line_number: int | None = None
     source_host: str | None = None
+    source_instance: str | None = None
+    representation: str | None = None
+    source_fields: list[tuple[str, str]] = Field(default_factory=list)
 
 
 class LogParser(ABC):
@@ -77,6 +109,8 @@ _PARSER_CLASSES: dict[str, type[LogParser]] = {}
 
 def register_parser(cls: type[LogParser]) -> type[LogParser]:
     """Decorator to register a parser class."""
+    if cls.format_name in _PARSER_CLASSES:
+        raise ValueError(f"Duplicate parser registration: {cls.format_name}")
     _PARSER_CLASSES[cls.format_name] = cls
     return cls
 
@@ -195,7 +229,10 @@ def discover_log_files(output_dir: Path, output_target: Any = None) -> dict[str,
             if parser.can_parse(candidate):
                 result.setdefault(format_name, []).append(candidate)
 
-    return result
+    return {
+        format_name: sorted(paths, key=lambda path: path.as_posix())
+        for format_name, paths in sorted(result.items())
+    }
 
 
 # Import parsers to trigger registration
@@ -224,6 +261,10 @@ from evidenceforge.evaluation.parsers.zeek_packet_filter import (  # noqa: E402
 )
 from evidenceforge.evaluation.parsers.zeek_pe import ZeekPeParser  # noqa: E402,F401
 from evidenceforge.evaluation.parsers.zeek_reporter import ZeekReporterParser  # noqa: E402,F401
+from evidenceforge.evaluation.parsers.zeek_smb import (  # noqa: E402
+    ZeekSmbFilesParser,  # noqa: F401
+    ZeekSmbMappingParser,  # noqa: F401
+)
 from evidenceforge.evaluation.parsers.zeek_smtp import ZeekSmtpParser  # noqa: E402,F401
 from evidenceforge.evaluation.parsers.zeek_ssl import ZeekSslParser  # noqa: E402,F401
 from evidenceforge.evaluation.parsers.zeek_weird import ZeekWeirdParser  # noqa: E402,F401

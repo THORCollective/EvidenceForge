@@ -3,17 +3,45 @@
 
 """Regression test: eforge validate-config must ship 100% clean."""
 
+import copy
 import random
+
+import pytest
 
 from evidenceforge.cli.validate_config import validate_config
 
 
+@pytest.mark.slow
+def test_validate_config_clean() -> None:
+    """The packaged effective configuration must remain clean in the release gate."""
+
+    result = validate_config()
+    assert result.issues == [], f"validate-config has {len(result.issues)} issues:\n" + "\n".join(
+        f"  [{i.severity}] {i.file}: {i.message}" for i in result.issues
+    )
+
+
+@pytest.mark.soak
 class TestValidateConfig:
-    def test_validate_config_clean(self):
+    """Exhaustive mutation diagnostics for individual configuration families."""
+
+    def test_validate_config_accepts_proxy_dns_query_after_decision_timing(self, monkeypatch):
+        from evidenceforge.generation.activity import proxy_phase_profiles
+
+        profiles = copy.deepcopy(proxy_phase_profiles.load_proxy_phase_profiles())
+        profiles["phase_timing"]["dns_query_after_decision_ms"] = {"min": 7, "max": 47}
+        monkeypatch.setattr(
+            proxy_phase_profiles,
+            "load_proxy_phase_profiles",
+            lambda: profiles,
+        )
+
         result = validate_config()
-        assert result.issues == [], (
-            f"validate-config has {len(result.issues)} issues:\n"
-            + "\n".join(f"  [{i.severity}] {i.file}: {i.message}" for i in result.issues)
+
+        assert not any(
+            issue.file == "proxy_phase_profiles.yaml"
+            and "dns_query_after_decision_ms" in issue.message
+            for issue in result.issues
         )
 
     def test_validate_config_rejects_invalid_beacon_profile(self, monkeypatch):
@@ -41,6 +69,32 @@ class TestValidateConfig:
             issue.severity == "ERROR"
             and issue.file == "beacon_profiles.yaml"
             and "uri must start with '/'" in issue.message
+            for issue in result.issues
+        )
+
+    def test_validate_config_rejects_invalid_http_file_mime(self, monkeypatch):
+        from evidenceforge.generation.activity import http_file_profiles
+
+        monkeypatch.setattr(
+            http_file_profiles,
+            "load_http_file_profiles",
+            lambda: {
+                "extension_mime_types": {".rar": "not-a-mime"},
+                "request_profiles": {
+                    "browser_form": "application/x-www-form-urlencoded",
+                    "json_api": "application/json",
+                    "binary": "application/octet-stream",
+                    "json_uri_tokens": ["/api/"],
+                },
+            },
+        )
+
+        result = validate_config()
+
+        assert any(
+            issue.severity == "ERROR"
+            and issue.file == "http_file_profiles.yaml"
+            and "invalid MIME type" in issue.message
             for issue in result.issues
         )
 
@@ -211,6 +265,43 @@ class TestValidateConfig:
             issue.severity == "ERROR"
             and issue.file == "ids_signatures.yaml"
             and "priority must be a positive integer" in issue.message
+            for issue in result.issues
+        )
+
+    def test_validate_config_rejects_contradictory_ids_predicate(self, monkeypatch):
+        from evidenceforge.generation.activity import ids_signatures
+
+        def load_invalid_ids_signatures():
+            return {
+                "signatures": [
+                    {
+                        "sid": 900001,
+                        "rev": 1,
+                        "message": "response without response evidence",
+                        "classification": "misc-activity",
+                        "priority": 2,
+                        "proto": "tcp",
+                        "dst_port": 80,
+                        "direction": "in",
+                        "predicate": {
+                            "phase": "response",
+                            "payload_direction": "resp",
+                            "minimum_payload_bytes": 1,
+                            "application_protocol": "http",
+                        },
+                    }
+                ]
+            }
+
+        monkeypatch.setattr(ids_signatures, "load_ids_signatures", load_invalid_ids_signatures)
+
+        result = validate_config()
+
+        assert any(
+            issue.severity == "ERROR"
+            and issue.file == "ids_signatures.yaml"
+            and "invalid predicate" in issue.message
+            and "requires_response" in issue.message
             for issue in result.issues
         )
 
@@ -407,6 +498,7 @@ class TestValidateConfig:
 
         def load_invalid_observation_profiles():
             return {
+                "schema_version": 2,
                 "profiles": {
                     "complete": {
                         "description": "bad",
@@ -417,7 +509,7 @@ class TestValidateConfig:
                         },
                         "sources": {"zeek_http": {"missingness": 0.1}},
                     }
-                }
+                },
             }
 
         monkeypatch.setattr(
@@ -440,6 +532,7 @@ class TestValidateConfig:
 
         def load_invalid_observation_profiles():
             return {
+                "schema_version": 2,
                 "profiles": {
                     "complete": {
                         "description": "bad",
@@ -455,7 +548,7 @@ class TestValidateConfig:
                             }
                         },
                     }
-                }
+                },
             }
 
         monkeypatch.setattr(
@@ -581,6 +674,7 @@ class TestValidateConfig:
             windows["loaded_modules"] = [
                 {
                     "path": r"C:\Program Files\Google\Chrome\Application\chrome_elf.dll",
+                    "release_policy": "owner_release",
                     "signature": "Microsoft Windows",
                 }
             ]
@@ -1126,6 +1220,34 @@ class TestValidateConfig:
             for issue in result.issues
         )
 
+    def test_validate_config_rejects_invalid_ssh_authentication_profile(self, monkeypatch):
+        from copy import deepcopy
+
+        from evidenceforge.generation.activity import timing_profiles
+
+        real_loader = timing_profiles.load_timing_profiles
+
+        def load_invalid_timing_profiles():
+            data = deepcopy(real_loader())
+            data["ssh_authentication"]["profiles"]["publickey"]["tail_probability"] = 1.2
+            data["ssh_authentication"]["route_rtt_ms"]["public"] = {
+                "min": 400,
+                "max": 20,
+            }
+            return data
+
+        monkeypatch.setattr(timing_profiles, "load_timing_profiles", load_invalid_timing_profiles)
+
+        result = validate_config()
+
+        messages = [
+            issue.message
+            for issue in result.issues
+            if issue.severity == "ERROR" and issue.file == "timing_profiles.yaml"
+        ]
+        assert any("publickey.tail_probability" in message for message in messages)
+        assert any("route_rtt_ms.public.max must be >= min" in message for message in messages)
+
     def test_validate_config_rejects_invalid_endpoint_clock_range(self, monkeypatch):
         from evidenceforge.generation.activity import timing_profiles
 
@@ -1166,8 +1288,8 @@ class TestValidateConfig:
                     "default_profile": "well_synced",
                     "profiles": {
                         "well_synced": {
-                            "clock_skew_us": {"min": -4000, "max": 4000},
-                            "path_delay_us": {"min": 250, "max": 8000},
+                            "clock_offset_us": {"min": -4000, "max": 4000},
+                            "route_delay_us": {"min": 250, "max": 8000},
                         }
                     },
                 },
@@ -1182,6 +1304,37 @@ class TestValidateConfig:
             and issue.file == "timing_profiles.yaml"
             and "endpoint_clock.profiles.complete.windows.host_offset_ms.max must be >= min"
             in issue.message
+            for issue in result.issues
+        )
+
+    def test_validate_config_rejects_invalid_startup_module_timing(self, monkeypatch):
+        from evidenceforge.generation.activity import timing_profiles
+
+        real_loader = timing_profiles.load_timing_profiles
+
+        def load_invalid_timing_profiles():
+            data = real_loader()
+            startup = dict(data.get("windows_startup_modules", {}))
+            gaps = dict(startup.get("inter_load_gap_us", {}))
+            gaps["sigma"] = 0
+            gaps["median"] = gaps.get("max", 1) + 1
+            startup["inter_load_gap_us"] = gaps
+            return {**data, "windows_startup_modules": startup}
+
+        monkeypatch.setattr(timing_profiles, "load_timing_profiles", load_invalid_timing_profiles)
+
+        result = validate_config()
+
+        assert any(
+            issue.severity == "ERROR"
+            and issue.file == "timing_profiles.yaml"
+            and "inter_load_gap_us.sigma" in issue.message
+            for issue in result.issues
+        )
+        assert any(
+            issue.severity == "ERROR"
+            and issue.file == "timing_profiles.yaml"
+            and "inter_load_gap_us.median must be within min/max" in issue.message
             for issue in result.issues
         )
 
@@ -1268,6 +1421,35 @@ class TestValidateConfig:
             and "apache2 systemd-private" in issue.message
             for issue in result.issues
         )
+
+    def test_validate_config_rejects_invalid_registry_mru_filenames(self, monkeypatch):
+        from evidenceforge.generation.activity import edr_pools
+
+        real_loader = edr_pools.load_edr_pools
+
+        def load_invalid_edr_pools():
+            return {
+                **real_loader(),
+                "registry_mru_filenames": [
+                    r"C:\Users\alice\Documents\report.docx",
+                    "briefing.pdf",
+                    "BRIEFING.PDF",
+                    "extensionless",
+                ],
+            }
+
+        monkeypatch.setattr(edr_pools, "load_edr_pools", load_invalid_edr_pools)
+
+        result = validate_config()
+        errors = [
+            issue
+            for issue in result.issues
+            if issue.severity == "ERROR" and issue.file == "edr_pools.yaml (registry_mru_filenames)"
+        ]
+
+        assert len(errors) == 3
+        assert any("filename with an extension" in issue.message for issue in errors)
+        assert any("duplicate" in issue.message for issue in errors)
 
     def test_validate_config_rejects_invalid_windows_collision_spacing(self, monkeypatch):
         from evidenceforge.generation.activity import timing_profiles
@@ -1511,6 +1693,33 @@ class TestValidateConfig:
             issue.severity == "ERROR"
             and issue.file == "network_params.yaml (external_scanner_port_profiles)"
             and "less than or equal to 65535" in issue.message
+            for issue in result.issues
+        )
+
+    def test_validate_config_rejects_inverted_nmap_timing_bounds(self, monkeypatch):
+        from evidenceforge.generation.activity import network_params
+
+        real_loader = network_params.load_network_params
+
+        def load_invalid_network_params():
+            data = real_loader()
+            return {
+                **data,
+                "nmap_command_probe": {
+                    **data["nmap_command_probe"],
+                    "connect_window_seconds_min": 12.0,
+                    "connect_window_seconds_max": 8.0,
+                },
+            }
+
+        monkeypatch.setattr(network_params, "load_network_params", load_invalid_network_params)
+
+        result = validate_config()
+
+        assert any(
+            issue.severity == "ERROR"
+            and issue.file == "network_params.yaml (nmap_command_probe)"
+            and "connect_window_seconds_max" in issue.message
             for issue in result.issues
         )
 
@@ -1788,6 +1997,34 @@ class TestValidateConfig:
             for issue in result.issues
         )
 
+    def test_validate_config_rejects_unknown_remote_auth_duration_profile(self, monkeypatch):
+        from evidenceforge.generation.activity import windows_auth_realism
+
+        real_loader = windows_auth_realism.load_windows_auth_realism
+
+        def load_invalid_windows_auth_realism():
+            data = real_loader()
+            remote_auth = dict(data["remote_auth_transport"])
+            defaults = dict(remote_auth["defaults"])
+            defaults["success"] = "missing-profile"
+            remote_auth["defaults"] = defaults
+            return {**data, "remote_auth_transport": remote_auth}
+
+        monkeypatch.setattr(
+            windows_auth_realism,
+            "load_windows_auth_realism",
+            load_invalid_windows_auth_realism,
+        )
+
+        result = validate_config()
+
+        assert any(
+            issue.severity == "ERROR"
+            and issue.file == "windows_auth_realism.yaml"
+            and "unknown duration profiles" in issue.message
+            for issue in result.issues
+        )
+
     def test_validate_config_rejects_empty_failed_auth_validation_path(self, monkeypatch):
         from evidenceforge.generation.activity import windows_auth_realism
 
@@ -1969,6 +2206,43 @@ class TestValidateConfig:
             issue.severity == "ERROR"
             and issue.file == "ids_signatures.yaml"
             and "may only reference {token}" in issue.message
+            for issue in result.issues
+        )
+
+    def test_validate_config_rejects_malformed_ids_alert_policy(self, monkeypatch):
+        from evidenceforge.generation.activity import ids_signatures
+
+        def load_invalid_ids_signatures():
+            return {
+                "signatures": [
+                    {
+                        "sid": 999004,
+                        "rev": 1,
+                        "message": "ET TEST Invalid Policy",
+                        "classification": "misc-activity",
+                        "priority": 3,
+                        "proto": "tcp",
+                        "dst_port": 443,
+                        "direction": "out",
+                        "alert_policy": {
+                            "event_filter": {
+                                "type": "limit",
+                                "track": "by_src",
+                                "count": True,
+                                "seconds": 0,
+                                "unknown": "field",
+                            }
+                        },
+                    }
+                ]
+            }
+
+        monkeypatch.setattr(ids_signatures, "load_ids_signatures", load_invalid_ids_signatures)
+        result = validate_config()
+        assert any(
+            issue.severity == "ERROR"
+            and issue.file == "ids_signatures.yaml"
+            and "invalid alert_policy" in issue.message
             for issue in result.issues
         )
 
@@ -2469,6 +2743,8 @@ class TestValidateConfig:
             if app == "irqbalance":
                 assert all("{}" not in message and "{0}" not in message for message in messages)
                 assert all("from CPU" not in message for message in messages)
+                assert entry.get("parameter_profiles")
+                assert not {"irq", "device", "cpu"}.intersection(entry.get("params") or {})
             if app == "polkitd":
                 assert any("action {action_id}" in message for message in messages)
                 assert all(
@@ -2488,6 +2764,21 @@ class TestValidateConfig:
                     assert "UDP+EDNS0 instead of UDP+EDNS0" not in rendered
 
         assert checked_apps == high_volume_apps
+
+    def test_irqbalance_uses_atomic_irq_device_cpu_profiles(self):
+        """IRQ/device/CPU values should be selected as one coherent configured unit."""
+        from evidenceforge.generation.activity.extra_syslog import load_extra_syslog_messages
+
+        irqbalance = next(
+            entry for entry in load_extra_syslog_messages() if entry["app"] == "irqbalance"
+        )
+        profiles = irqbalance["parameter_profiles"]
+
+        assert profiles
+        assert all(set(profile) == {"irq", "device", "cpu"} for profile in profiles)
+        irq_to_device = {profile["irq"]: profile["device"] for profile in profiles}
+        assert len(irq_to_device) == len(profiles)
+        assert len(set(irq_to_device.values())) == len(profiles)
 
     def test_extra_syslog_linux_maintenance_texture_excludes_schedule_native_cron(self):
         from evidenceforge.generation.activity.extra_syslog import load_extra_syslog_messages

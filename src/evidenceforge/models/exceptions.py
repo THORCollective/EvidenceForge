@@ -26,6 +26,8 @@ This module defines the exception hierarchy used throughout the application
 for clear, structured error handling.
 """
 
+from datetime import datetime
+
 
 class EvidenceForgeError(Exception):
     """Base exception for all EvidenceForge errors."""
@@ -66,12 +68,20 @@ class ConfigurationError(EvidenceForgeError):
     """
 
 
+class PathSafetyError(EvidenceForgeError):
+    """An untrusted filesystem reference violated the declared path boundary."""
+
+
 class ScenarioIncludeError(ConfigurationError):
     """Scenario include expansion failed.
 
     Raised when a scenario YAML file references invalid include syntax,
     missing include files, circular includes, or conflicting included fields.
     """
+
+
+class PackError(ConfigurationError):
+    """A scenario pack could not be discovered, validated, or composed."""
 
 
 class FormatDefinitionError(ConfigurationError):
@@ -89,6 +99,18 @@ class GenerationError(EvidenceForgeError):
     """
 
 
+class EventContractError(GenerationError):
+    """A canonical occurrence violated its registered dispatch contract."""
+
+
+class WorkloadLimitError(GenerationError):
+    """Projected generation or evaluation work exceeds the supported envelope."""
+
+
+class EvaluationLimitError(EvidenceForgeError):
+    """An evaluation corpus or record exceeds the supported capacity envelope."""
+
+
 class StateError(GenerationError):
     """Invalid state during generation.
 
@@ -97,9 +119,79 @@ class StateError(GenerationError):
     """
 
 
+class TransportPortExhaustionError(StateError):
+    """No source port can satisfy one canonical transport interval."""
+
+    def __init__(
+        self,
+        *,
+        endpoint_key: tuple[str, str, int, str],
+        opened_at: datetime,
+        closed_at: datetime,
+        port_range: tuple[int, int],
+        active_count: int,
+        automatic: bool,
+        requested_source_port: int | None = None,
+    ) -> None:
+        self.endpoint_key = endpoint_key
+        self.opened_at = opened_at
+        self.closed_at = closed_at
+        self.port_range = port_range
+        self.active_count = active_count
+        self.automatic = automatic
+        self.requested_source_port = requested_source_port
+        mode = "automatic" if automatic else "exact"
+        requested = (
+            ""
+            if requested_source_port is None
+            else f", requested_source_port={requested_source_port}"
+        )
+        super().__init__(
+            "Canonical transport source-port exhaustion: "
+            f"endpoint={endpoint_key!r}, interval=[{opened_at}, {closed_at}), "
+            f"range={port_range[0]}-{port_range[1]}, active={active_count}, "
+            f"mode={mode}{requested}"
+        )
+
+
+class SmbActivityWindowError(StateError):
+    """One exact SMB activity plan extends beyond the runtime window."""
+
+    def __init__(
+        self,
+        *,
+        action_id: str,
+        share: str,
+        file_ids: tuple[str, ...],
+        operation: str,
+        size_bytes: int,
+        opened_at: datetime,
+        closed_at: datetime,
+        window_end: datetime,
+    ) -> None:
+        self.action_id = action_id
+        self.share = share
+        self.file_ids = file_ids
+        self.operation = operation
+        self.size_bytes = size_bytes
+        self.opened_at = opened_at
+        self.closed_at = closed_at
+        self.window_end = window_end
+        super().__init__(
+            "SMB activity closes after the runtime window: "
+            f"action={action_id!r}, share={share!r}, files={file_ids!r}, "
+            f"operation={operation!r}, size_bytes={size_bytes}, "
+            f"interval=[{opened_at}, {closed_at}), window_end={window_end}"
+        )
+
+
 class InsufficientDiskSpaceError(GenerationError):
     """Insufficient disk space for output.
 
     Raised when the output directory lacks the required disk space
     for the estimated log dataset size.
     """
+
+
+class EvaluationError(EvidenceForgeError):
+    """An evaluation component failed; no completed quality report is available."""

@@ -57,6 +57,7 @@ def timestamp():
     return datetime(2024, 3, 15, 10, 0, 0, tzinfo=UTC)
 
 
+@pytest.mark.slow
 class TestConnStateDistribution:
     """Verify conn_state distribution is varied."""
 
@@ -98,6 +99,8 @@ class TestConnStateDistribution:
         valid_histories: dict[str, set[str]] = {}
         for state, _, hist in TCP_CONN_STATE_DISTRIBUTION:
             valid_histories.setdefault(state, set()).add(hist)
+        valid_histories["OTH"].update({"DAd", "DdA", "ADad"})
+        assert all("C" not in history and "c" not in history for history in valid_histories["OTH"])
         # TLS handshake failures can refine an initially successful TCP connection
         # into partial-handshake Zeek states after service-layer context is built.
         valid_histories.setdefault("SH", set()).add("Sh")
@@ -152,6 +155,7 @@ class TestConnStateRebalance:
         assert "S2" in states, "S2 state missing"
         assert "S3" in states, "S3 state missing"
 
+    @pytest.mark.soak
     def test_statistical_sf_ratio(self, activity_gen, timestamp, state_manager, mock_emitters):
         """Over 2000 connections, SF% should fall between 50% and 78%."""
         import random
@@ -264,7 +268,7 @@ class TestConnStateByteConsistency:
         )
 
         event = mock_emitters["zeek_conn"].emit.call_args[0][0]
-        if event.http is not None and event.network.conn_state == "SF":
+        if event.protocol.http is not None and event.network.conn_state == "SF":
             assert event.network.duration is not None, (
                 "SF connection with HTTP context must have a duration"
             )

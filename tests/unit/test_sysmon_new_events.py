@@ -4,27 +4,34 @@
 """Unit tests for new Sysmon events: 3, 7, 11, 12/13, 22."""
 
 import re
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
 
-from evidenceforge.events.base import SecurityEvent
+from evidenceforge.events.base import OccurrenceBuilder
+from evidenceforge.events.content_identity import (
+    BinaryReleaseIdentity,
+    BinaryReleaseKey,
+    PeVersionInfo,
+)
 from evidenceforge.events.contexts import (
     AuthContext,
     DnsContext,
     FileContext,
     HostContext,
     ImageLoadContext,
-    NetworkContext,
     ProcessAccessContext,
     ProcessContext,
     RegistryContext,
 )
+from evidenceforge.events.identity import EventIdentityPlan, ProcessIdentity
+from evidenceforge.events.network import NetworkEndpointObservationPlan
 from evidenceforge.formats import load_format
 from evidenceforge.generation.activity.dll_load_profiles import get_module_pe_metadata
-from evidenceforge.generation.activity.timing_profiles import sample_timing_delta
 from evidenceforge.generation.emitters import SysmonEventEmitter
+from tests.network_factories import network_plan
 
 
 def _win_host():
@@ -52,6 +59,68 @@ def _linux_host():
     )
 
 
+def _responder_wfp_event(*, application_only: bool = False):
+    timestamp = datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC)
+    host = HostContext(
+        hostname="DC-01",
+        ip="10.0.2.20",
+        os="Windows Server 2022",
+        os_category="windows",
+        system_type="domain_controller",
+        domain="corp.local",
+        fqdn="DC-01.corp.local",
+        netbios_domain="CORP",
+    )
+    identity = ProcessIdentity(
+        hostname=host.hostname,
+        object_id="process:dc-01:684",
+        pid=684,
+        parent_pid=500,
+        image=r"C:\Windows\System32\lsass.exe",
+        command_line="lsass.exe",
+        principal="SYSTEM",
+        logon_id="0x3e7",
+        started_at=timestamp - timedelta(minutes=30),
+        lifecycle_group_id="process-lsass",
+    )
+    network = network_plan(
+        src_ip="10.0.1.10",
+        src_port=49152,
+        dst_ip=host.ip,
+        dst_port=88,
+        protocol="tcp",
+        conn_state="SF",
+        initiating_pid=4567,
+        responding_pid=identity.pid,
+        application_layer_only=application_only,
+    )
+    return OccurrenceBuilder(
+        timestamp=timestamp,
+        event_type="wfp_connection",
+        src_host=host,
+        process=ProcessContext(
+            pid=identity.pid,
+            parent_pid=identity.parent_pid,
+            image=identity.image,
+            command_line=identity.command_line,
+            username=identity.principal,
+            logon_id=identity.logon_id,
+            start_time=identity.started_at,
+        ),
+        identity_plan=EventIdentityPlan(actor=identity),
+        network=network,
+        network_endpoint=NetworkEndpointObservationPlan(
+            role="responder",
+            local_hostname=host.hostname,
+            local_ip=host.ip,
+            process=identity,
+            initiated=False,
+            observed_at=timestamp,
+            transaction_id=network.stable_id,
+        ),
+    )
+
+
 @pytest.fixture
 def format_def():
     return load_format("windows_event_sysmon")
@@ -66,29 +135,47 @@ class TestCanHandle:
     """Test can_handle for new event types."""
 
     def test_connection_on_windows(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="connection",
             src_host=_win_host(),
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10", dst_ip="10.0.2.20", src_port=49152, dst_port=443, protocol="tcp"
             ),
         )
         assert emitter.can_handle(event) is True
 
     def test_connection_on_linux_rejected(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="connection",
             src_host=_linux_host(),
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.2.10", dst_ip="10.0.1.10", src_port=49152, dst_port=22, protocol="tcp"
             ),
         )
         assert emitter.can_handle(event) is False
 
+    def test_responder_wfp_on_windows(self, emitter):
+        assert emitter.can_handle(_responder_wfp_event()) is True
+
+    def test_responder_wfp_rejects_denied_or_application_only_traffic(self, emitter):
+        denied = _responder_wfp_event()
+        denied.network = replace(denied.network, outcome="denied")
+        assert emitter.can_handle(denied) is False
+        assert emitter.can_handle(_responder_wfp_event(application_only=True)) is False
+
+    def test_initiator_wfp_does_not_duplicate_connection_event3(self, emitter):
+        event = _responder_wfp_event()
+        event.network_endpoint = replace(
+            event.network_endpoint,
+            role="initiator",
+            initiated=True,
+        )
+        assert emitter.can_handle(event) is False
+
     def test_file_create_on_windows(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="file_create",
             src_host=_win_host(),
@@ -97,7 +184,7 @@ class TestCanHandle:
         assert emitter.can_handle(event) is True
 
     def test_image_load_on_windows(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="image_load",
             src_host=_win_host(),
@@ -111,7 +198,7 @@ class TestCanHandle:
         assert emitter.can_handle(event) is True
 
     def test_registry_modify_on_windows(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="registry_modify",
             src_host=_win_host(),
@@ -128,7 +215,7 @@ class TestEvent3Filter:
     """Test Event 3 (NetworkConnect) filtering."""
 
     def test_lolbin_passes_filter(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="connection",
             src_host=_win_host(),
@@ -139,7 +226,7 @@ class TestEvent3Filter:
                 command_line="powershell",
                 username="user",
             ),
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10", dst_ip="10.0.2.20", src_port=49152, dst_port=443, protocol="tcp"
             ),
         )
@@ -158,7 +245,7 @@ class TestEvent3Filter:
                 "exclude_dest_ips": [],
             }
         }
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="connection",
             src_host=_win_host(),
@@ -169,7 +256,7 @@ class TestEvent3Filter:
                 command_line="chrome",
                 username="user",
             ),
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10",
                 dst_ip="93.184.216.34",
                 src_port=49200,
@@ -192,7 +279,7 @@ class TestEvent3Filter:
                 "exclude_dest_ips": [],
             }
         }
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="connection",
             src_host=_win_host(),
@@ -203,7 +290,7 @@ class TestEvent3Filter:
                 command_line="chrome",
                 username="user",
             ),
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10",
                 dst_ip="93.184.216.34",
                 src_port=49200,
@@ -215,7 +302,7 @@ class TestEvent3Filter:
 
     def test_suspicious_port_passes_filter(self, emitter):
         """Any process connecting to a suspicious port should pass."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="connection",
             src_host=_win_host(),
@@ -226,7 +313,7 @@ class TestEvent3Filter:
                 command_line="chrome",
                 username="user",
             ),
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10",
                 dst_ip="192.168.1.100",
                 src_port=49200,
@@ -237,7 +324,7 @@ class TestEvent3Filter:
         assert emitter._passes_event3_filter(event) is True
 
     def test_loopback_excluded(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="connection",
             src_host=_win_host(),
@@ -248,7 +335,7 @@ class TestEvent3Filter:
                 command_line="powershell",
                 username="user",
             ),
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10", dst_ip="127.0.0.1", src_port=49152, dst_port=80, protocol="tcp"
             ),
         )
@@ -260,7 +347,7 @@ class TestEvent7Filter:
 
     def test_system32_dll_filtered(self, emitter):
         """Microsoft-signed DLLs from System32 should be excluded."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="image_load",
             src_host=_win_host(),
@@ -282,7 +369,7 @@ class TestEvent7Filter:
 
     def test_unsigned_thirdparty_dll_passes(self, emitter):
         """Unsigned DLLs from non-system paths should pass."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="image_load",
             src_host=_win_host(),
@@ -311,7 +398,7 @@ class TestEvent7Filter:
                 "image_loaded": {"enabled": False},
             },
         ):
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
                 event_type="image_load",
                 src_host=_win_host(),
@@ -329,7 +416,7 @@ class TestEvent11Filter:
     """Test Event 11 (FileCreate) filtering."""
 
     def test_exe_in_temp_passes(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="file_create",
             src_host=_win_host(),
@@ -338,7 +425,7 @@ class TestEvent11Filter:
         assert emitter._passes_event11_filter(event) is True
 
     def test_txt_file_filtered(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="file_create",
             src_host=_win_host(),
@@ -347,7 +434,7 @@ class TestEvent11Filter:
         assert emitter._passes_event11_filter(event) is False
 
     def test_startup_folder_passes(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="file_create",
             src_host=_win_host(),
@@ -363,7 +450,7 @@ class TestEventRegistryFilter:
     """Test Events 12/13 (Registry) filtering."""
 
     def test_run_key_modify_passes(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="registry_modify",
             src_host=_win_host(),
@@ -377,7 +464,7 @@ class TestEventRegistryFilter:
 
     def test_create_key_filtered_by_default(self, emitter):
         """CreateKey actions are filtered by default (log_create_key: false)."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="registry_modify",
             src_host=_win_host(),
@@ -389,7 +476,7 @@ class TestEventRegistryFilter:
         assert emitter._passes_event12_13_filter(event) is False
 
     def test_non_matching_key_filtered(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="registry_modify",
             src_host=_win_host(),
@@ -406,7 +493,7 @@ class TestEvent22Filter:
     """Test Event 22 (DNSQuery) filtering."""
 
     def test_dns_query_passes_by_default(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="connection",
             src_host=_win_host(),
@@ -422,7 +509,7 @@ class TestEvent22Filter:
                 "dns_query": {"enabled": False},
             },
         ):
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
                 event_type="connection",
                 src_host=_win_host(),
@@ -435,7 +522,7 @@ class TestRenderEvent3:
     """Test Event 3 (NetworkConnect) rendering."""
 
     def test_renders_valid_event3(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="connection",
             src_host=_win_host(),
@@ -447,7 +534,7 @@ class TestRenderEvent3:
                 username="admin",
             ),
             auth=AuthContext(username="admin"),
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10",
                 dst_ip="10.0.2.20",
                 src_port=49152,
@@ -466,9 +553,26 @@ class TestRenderEvent3:
         assert "4444" in content
         assert "tcp" in content
 
+    def test_renders_responder_event3_with_local_process_and_inbound_direction(self, emitter):
+        event = _responder_wfp_event()
+
+        emitter.emit(event)
+
+        assert len(emitter._event_dicts) == 1
+        rendered = emitter._event_dicts[0]
+        assert rendered["EventID"] == 3
+        assert rendered["Initiated"] == "false"
+        assert rendered["ProcessId"] == 684
+        assert rendered["Image"].endswith("lsass.exe")
+        assert rendered["SourceIp"] == "10.0.1.10"
+        assert rendered["SourcePort"] == 49152
+        assert rendered["DestinationIp"] == "10.0.2.20"
+        assert rendered["DestinationPort"] == 88
+        assert rendered["DestinationHostname"] == "DC-01.corp.local"
+
     def test_event3_uses_source_native_timestamp_offset(self, emitter):
         event_time = datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=event_time,
             event_type="connection",
             src_host=_win_host(),
@@ -479,7 +583,7 @@ class TestRenderEvent3:
                 command_line="cmd",
                 username="admin",
             ),
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10",
                 dst_ip="10.0.2.20",
                 src_port=49152,
@@ -491,19 +595,17 @@ class TestRenderEvent3:
 
         emitter.emit(event)
 
-        expected_delta = sample_timing_delta(
-            "source.sysmon_network_connection",
-            seed_parts=("WKS-01", 4567, "10.0.1.10", 49152, "10.0.2.20", 4444, event_time),
-        )
-        expected_time = event_time + expected_delta
-        assert emitter._event_dicts[0]["TimeCreated"] == expected_time
+        native_time = emitter._event_dicts[0]["_SysmonNativeTime"]
+        assert event_time + timedelta(milliseconds=35) <= native_time
+        assert native_time <= event_time + timedelta(milliseconds=750)
+        assert native_time.microsecond % 1_000 != 0
+        assert emitter._event_dicts[0]["TimeCreated"] > native_time
         assert (
-            emitter._event_dicts[0]["UtcTime"]
-            == expected_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            emitter._event_dicts[0]["UtcTime"] == native_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         )
 
     def test_event3_normalizes_mail_hostname_to_port_family(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="connection",
             src_host=_win_host(),
@@ -514,7 +616,7 @@ class TestRenderEvent3:
                 command_line="svchost.exe",
                 username="NETWORK SERVICE",
             ),
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10",
                 dst_ip="74.125.200.27",
                 src_port=49152,
@@ -537,7 +639,7 @@ class TestRenderEvent7:
     """Test Event 7 (ImageLoaded) rendering."""
 
     def test_renders_valid_event7(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="image_load",
             src_host=_win_host(),
@@ -564,10 +666,11 @@ class TestRenderEvent7:
         assert "plugin.dll" in content
         assert "Unavailable" in content
         assert '<Data Name="Signed">false</Data>' in content
+        assert '<Data Name="User">CORP\\user</Data>' in content
 
     def test_event7_system_dll_renders_windows_metadata(self, emitter):
         """System DLL image loads should not render application PE metadata."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="image_load",
             src_host=_win_host(),
@@ -596,7 +699,7 @@ class TestRenderEvent7:
 
     def test_unsigned_event7_overrides_valid_signature_status(self, emitter):
         """Unsigned image loads should not render a contradictory Valid signature status."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="image_load",
             src_host=_win_host(),
@@ -626,7 +729,7 @@ class TestRenderEvent7:
 
     def test_signed_event7_populates_vendor_metadata_when_catalog_missing(self, emitter):
         """Signed DLL loads should not render all PE metadata fields as '-'."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="image_load",
             src_host=_win_host(),
@@ -654,7 +757,7 @@ class TestRenderEvent7:
 
     def test_program_files_module_metadata_is_not_windows_os_fallback(self, emitter):
         """Application DLLs should inherit package metadata instead of Windows OS fields."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="image_load",
             src_host=_win_host(),
@@ -684,7 +787,7 @@ class TestRenderEvent7:
 
     def test_third_party_shell_extension_metadata_is_consistent(self, emitter):
         """7-Zip shell extension loads should render stable third-party metadata."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="image_load",
             src_host=_win_host(),
@@ -713,12 +816,60 @@ class TestRenderEvent7:
         assert '<Data Name="Signed">false</Data>' in content
         assert '<Data Name="Product">Microsoft Windows Operating System</Data>' not in content
 
+    def test_image_load_hashes_follow_attached_release_not_install_path(self, emitter):
+        """Event 7 renders exact module content independently of user placement."""
+        release = BinaryReleaseIdentity(
+            key=BinaryReleaseKey(
+                product_id="slack",
+                version="4.38.125",
+                build="4.38.125",
+                architecture="x64",
+                platform="windows",
+                artifact_name="slack_elf.dll",
+            ),
+            pe_version_info=PeVersionInfo(
+                file_version="4.38.125",
+                description="Slack ELF module",
+                product="Slack",
+                company="Slack Technologies, LLC",
+                original_filename="slack_elf.dll",
+            ),
+        )
+        for ordinal, username in enumerate(("alice", "bob")):
+            event = OccurrenceBuilder(
+                timestamp=datetime(2024, 1, 15, 10, 30, ordinal, tzinfo=UTC),
+                event_type="image_load",
+                src_host=_win_host(),
+                process=ProcessContext(
+                    pid=1234 + ordinal,
+                    parent_pid=1,
+                    image=rf"C:\Users\{username}\AppData\Local\slack\slack.exe",
+                    command_line="slack.exe",
+                    username=username,
+                ),
+                image_load=ImageLoadContext(
+                    image_loaded=(rf"C:\Users\{username}\AppData\Local\slack\slack_elf.dll"),
+                    signed=True,
+                    signature="Slack Technologies, LLC",
+                    binary_identity=release,
+                ),
+            )
+            emitter._render_sysmon_image_loaded(event)
+
+        assert len(emitter._event_dicts) == 2
+        assert emitter._event_dicts[0]["Hashes"] == emitter._event_dicts[1]["Hashes"]
+        assert emitter._event_dicts[0]["Hashes"] == (
+            f"SHA1={release.digests.sha1},MD5={release.digests.md5},"
+            f"SHA256={release.digests.sha256},IMPHASH={release.digests.imphash}"
+        )
+        assert emitter._event_dicts[0]["FileVersion"] == "4.38.125"
+
 
 class TestRenderEvent11:
     """Test Event 11 (FileCreate) rendering."""
 
     def test_renders_valid_event11(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="file_create",
             src_host=_win_host(),
@@ -752,14 +903,14 @@ class TestRenderEvent11:
             username="admin",
             start_time=start_time,
         )
-        process_event = SecurityEvent(
+        process_event = OccurrenceBuilder(
             timestamp=start_time,
             event_type="process_create",
             src_host=_win_host(),
             process=process,
             auth=AuthContext(username="admin"),
         )
-        file_event = SecurityEvent(
+        file_event = OccurrenceBuilder(
             timestamp=start_time,
             event_type="file_create",
             src_host=_win_host(),
@@ -793,7 +944,7 @@ class TestRenderEventRegistry:
     """Test Events 12/13 (Registry) rendering."""
 
     def test_modify_renders_event13(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="registry_modify",
             src_host=_win_host(),
@@ -820,8 +971,38 @@ class TestRenderEventRegistry:
         assert "evil.exe" in content
         assert "CurrentVersion\\Run" in content
 
+    def test_binary_value_renders_source_native_opaque_details(self, emitter):
+        event = OccurrenceBuilder(
+            timestamp=datetime(2027, 8, 15, 10, 30, 0, tzinfo=UTC),
+            event_type="registry_modify",
+            src_host=_win_host(),
+            process=ProcessContext(
+                pid=4567,
+                parent_pid=1,
+                image=r"C:\Windows\explorer.exe",
+                command_line="explorer.exe",
+                username="admin",
+            ),
+            registry=RegistryContext(
+                key=(
+                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist"
+                    r"\{CEBFF5CD-ACE2-4F4F-9178-9926F41749EA}\Count\HRZR_EHACNGU"
+                ),
+                value="00 01 02 03",
+                value_type="binary",
+                action="modify",
+            ),
+        )
+        emitter.emit(event)
+        emitter.flush()
+
+        output_path = list(emitter._host_writers.values())[0].output_path
+        content = output_path.read_text()
+        assert '<Data Name="Details">Binary Data</Data>' in content
+        assert "00 01 02 03" not in content
+
     def test_delete_renders_event12(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="registry_modify",
             src_host=_win_host(),
@@ -846,7 +1027,7 @@ class TestRenderEventRegistry:
         assert "DeleteKey" in content
 
     def test_value_delete_context_renders_event13(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="registry_modify",
             src_host=_win_host(),
@@ -882,7 +1063,7 @@ class TestProcessCreateMetadata:
 
     def test_windows_os_binary_versions_are_consistent_per_host(self, emitter):
         host = _win_host()
-        first = SecurityEvent(
+        first = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="process_create",
             src_host=host,
@@ -897,7 +1078,7 @@ class TestProcessCreateMetadata:
                 start_time=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             ),
         )
-        second = SecurityEvent(
+        second = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 1, tzinfo=UTC),
             event_type="process_create",
             src_host=host,
@@ -978,6 +1159,100 @@ class TestProcessCreateMetadata:
         assert SysmonEventEmitter._generate_hashes(
             image, workstation
         ) == SysmonEventEmitter._generate_hashes(image, server)
+
+    def test_process_hashes_follow_attached_release_not_user_install_path(self, emitter):
+        """One installed release keeps one hash set across user-scoped placements."""
+        release = BinaryReleaseIdentity(
+            key=BinaryReleaseKey(
+                product_id="slack",
+                version="4.38.125",
+                build="4.38.125",
+                architecture="x64",
+                platform="windows",
+                artifact_name="slack.exe",
+            ),
+            pe_version_info=PeVersionInfo(
+                file_version="4.38.125",
+                description="Slack",
+                product="Slack",
+                company="Slack Technologies, LLC",
+                original_filename="slack.exe",
+            ),
+        )
+        paths = (
+            r"C:\Users\alice\AppData\Local\slack\slack.exe",
+            r"C:\Users\bob\AppData\Local\slack\slack.exe",
+        )
+        for ordinal, path in enumerate(paths):
+            event = OccurrenceBuilder(
+                timestamp=datetime(2024, 1, 15, 10, 30, ordinal, tzinfo=UTC),
+                event_type="process_create",
+                src_host=_win_host(),
+                process=ProcessContext(
+                    pid=4100 + ordinal,
+                    parent_pid=500,
+                    image=path,
+                    command_line=path,
+                    username=("alice", "bob")[ordinal],
+                    start_time=datetime(2024, 1, 15, 10, 30, ordinal, tzinfo=UTC),
+                    binary_identity=release,
+                ),
+            )
+            emitter._render_sysmon_process_create(event)
+
+        assert len(emitter._event_dicts) == 2
+        assert emitter._event_dicts[0]["Hashes"] == emitter._event_dicts[1]["Hashes"]
+        assert emitter._event_dicts[0]["Hashes"] == (
+            f"SHA1={release.digests.sha1},MD5={release.digests.md5},"
+            f"SHA256={release.digests.sha256},IMPHASH={release.digests.imphash}"
+        )
+        assert emitter._event_dicts[0]["FileVersion"] == "4.38.125"
+
+    def test_process_hashes_and_metadata_separate_os_build_releases(self, emitter):
+        """Build-distinct Windows binaries retain distinct canonical content truth."""
+        releases = tuple(
+            BinaryReleaseIdentity(
+                key=BinaryReleaseKey(
+                    product_id="microsoft-windows",
+                    version=build,
+                    build=build,
+                    architecture="x64",
+                    platform="windows",
+                    artifact_name="winlogon.exe",
+                ),
+                pe_version_info=PeVersionInfo(
+                    file_version=build,
+                    description="Windows Logon Application",
+                    product="Microsoft Windows Operating System",
+                    company="Microsoft Corporation",
+                    original_filename="winlogon.exe",
+                ),
+            )
+            for build in ("10.0.19041.1", "10.0.20348.1")
+        )
+        for ordinal, release in enumerate(releases):
+            event = OccurrenceBuilder(
+                timestamp=datetime(2024, 1, 15, 10, 31, ordinal, tzinfo=UTC),
+                event_type="process_create",
+                src_host=_win_host(),
+                process=ProcessContext(
+                    pid=4200 + ordinal,
+                    parent_pid=500,
+                    image=r"C:\Windows\System32\winlogon.exe",
+                    command_line="winlogon.exe",
+                    username="SYSTEM",
+                    start_time=datetime(2024, 1, 15, 10, 31, ordinal, tzinfo=UTC),
+                    binary_identity=release,
+                ),
+            )
+            emitter._render_sysmon_process_create(event)
+
+        assert len(emitter._event_dicts) == 2
+        assert emitter._event_dicts[0]["Hashes"] != emitter._event_dicts[1]["Hashes"]
+        assert [row["FileVersion"] for row in emitter._event_dicts] == [
+            "10.0.19041.1",
+            "10.0.20348.1",
+        ]
 
     def test_tiworker_metadata_uses_servicing_stack_component_version(self):
         """WinSxS TiWorker metadata should match the rendered component path."""
@@ -1118,11 +1393,11 @@ class TestRenderEvent22:
     """Test Event 22 (DNSQuery) rendering."""
 
     def test_renders_valid_event22(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="connection",
             src_host=_win_host(),
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10", dst_ip="10.0.0.1", src_port=49152, dst_port=53, protocol="udp"
             ),
             dns=DnsContext(query="evil-c2.com", rcode="NOERROR", answers=["1.2.3.4"]),
@@ -1138,14 +1413,54 @@ class TestRenderEvent22:
         assert "1.2.3.4;" in content
         assert "svchost.exe" in content
 
+    def test_dns_query_uses_canonical_initiating_process(self, emitter):
+        """Event 22 should preserve the application that initiated the lookup."""
+        process_start = datetime(2024, 1, 15, 10, 29, 55, tzinfo=UTC)
+        event = OccurrenceBuilder(
+            timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
+            event_type="connection",
+            src_host=_win_host(),
+            network=network_plan(
+                src_ip="10.0.1.10",
+                dst_ip="10.0.0.1",
+                src_port=49152,
+                dst_port=53,
+                protocol="udp",
+            ),
+            dns=DnsContext(
+                query="evil-c2.com",
+                rcode="NOERROR",
+                answers=["1.2.3.4"],
+                query_process=ProcessContext(
+                    pid=4568,
+                    parent_pid=4000,
+                    image=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                    command_line="powershell.exe Invoke-WebRequest https://evil-c2.com",
+                    username="alice",
+                    logon_id="0x1a2b3c",
+                    start_time=process_start,
+                ),
+            ),
+        )
+
+        emitter._render_sysmon_dns_query(event)
+        emitter.flush()
+
+        output_path = list(emitter._host_writers.values())[0].output_path
+        content = output_path.read_text()
+        assert '<Data Name="ProcessId">4568</Data>' in content
+        assert '<Data Name="Image">C:\\Windows\\System32\\WindowsPowerShell' in content
+        assert '<Data Name="User">CORP\\alice</Data>' in content
+        assert "LOCAL SERVICE" not in content
+
     def test_dns_query_uses_source_latency_offset(self, emitter):
         """Sysmon Event 22 should not render at the exact Zeek DNS packet timestamp."""
         event_time = datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=event_time,
             event_type="connection",
             src_host=_win_host(),
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10", dst_ip="10.0.0.1", src_port=49152, dst_port=53, protocol="udp"
             ),
             dns=DnsContext(
@@ -1155,18 +1470,18 @@ class TestRenderEvent22:
 
         emitter._render_sysmon_dns_query(event)
 
-        expected_delta = sample_timing_delta(
-            "source.sysmon_dns_query",
-            seed_parts=("WKS-01", "example.com", "A", event_time),
-        )
-        assert emitter._event_dicts[0]["TimeCreated"] == event_time + expected_delta
+        native_time = emitter._event_dicts[0]["_SysmonNativeTime"]
+        assert event_time + timedelta(milliseconds=25) <= native_time
+        assert native_time <= event_time + timedelta(milliseconds=420)
+        assert native_time.microsecond % 1_000 != 0
+        assert emitter._event_dicts[0]["TimeCreated"] > native_time
 
     def test_nxdomain_query_status(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="connection",
             src_host=_win_host(),
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10", dst_ip="10.0.0.1", src_port=49152, dst_port=53, protocol="udp"
             ),
             dns=DnsContext(query="doesnotexist.com", rcode="NXDOMAIN", answers=[]),
@@ -1180,11 +1495,11 @@ class TestRenderEvent22:
         assert '<Data Name="QueryResults">-</Data>' in content
 
     def test_servfail_query_status(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="connection",
             src_host=_win_host(),
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10", dst_ip="10.0.0.1", src_port=49152, dst_port=53, protocol="udp"
             ),
             dns=DnsContext(query="flaky.com", rcode="SERVFAIL", answers=[]),
@@ -1211,12 +1526,12 @@ class TestPidResolutionInFilter:
         mock_sm.get_process.return_value = mock_proc
         emitter._state_manager = mock_sm
 
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="connection",
             src_host=_win_host(),
-            # No ProcessContext — only initiating_pid on NetworkContext
-            network=NetworkContext(
+            # No ProcessContext — only initiating_pid on NetworkTransactionPlan
+            network=network_plan(
                 src_ip="10.0.1.10",
                 dst_ip="93.184.216.34",
                 src_port=49200,
@@ -1250,11 +1565,11 @@ class TestPidResolutionInFilter:
         mock_sm.get_process.return_value = mock_proc
         emitter._state_manager = mock_sm
 
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="connection",
             src_host=_win_host(),
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10",
                 dst_ip="93.184.216.34",
                 src_port=49200,
@@ -1279,7 +1594,7 @@ class TestTemplateCompleteness:
         return list(set(empty + whitespace))
 
     def test_event3_no_empty_required_fields(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="connection",
             src_host=_win_host(),
@@ -1291,7 +1606,7 @@ class TestTemplateCompleteness:
                 username="admin",
             ),
             auth=AuthContext(username="admin"),
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10",
                 dst_ip="10.0.2.20",
                 src_port=49152,
@@ -1309,7 +1624,7 @@ class TestTemplateCompleteness:
         assert required_empty == [], f"Empty required fields in Event 3: {required_empty}"
 
     def test_event7_no_empty_required_fields(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="image_load",
             src_host=_win_host(),
@@ -1336,7 +1651,7 @@ class TestTemplateCompleteness:
         assert required_empty == [], f"Empty required fields in Event 7: {required_empty}"
 
     def test_event11_no_empty_required_fields(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="file_create",
             src_host=_win_host(),
@@ -1358,7 +1673,7 @@ class TestTemplateCompleteness:
         assert required_empty == [], f"Empty required fields in Event 11: {required_empty}"
 
     def test_event13_no_empty_required_fields(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="registry_modify",
             src_host=_win_host(),
@@ -1385,11 +1700,11 @@ class TestTemplateCompleteness:
         assert '<Data Name="User">CORP\\admin</Data>' in content
 
     def test_event22_no_empty_required_fields(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="connection",
             src_host=_win_host(),
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10",
                 dst_ip="10.0.0.1",
                 src_port=49152,
@@ -1408,7 +1723,7 @@ class TestTemplateCompleteness:
 
     def test_sysmon_events_default_rule_name_to_dash(self, emitter):
         """Sysmon RuleName should be consistently populated when no rule matched."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="process_create",
             src_host=_win_host(),
@@ -1435,7 +1750,7 @@ class TestUserFieldFormatting:
     """Fix 1: NT AUTHORITY\\SYSTEM instead of DOMAIN\\SYSTEM."""
 
     def test_system_user_gets_nt_authority(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="process_create",
             src_host=_win_host(),
@@ -1455,7 +1770,7 @@ class TestUserFieldFormatting:
         assert "CORP\\SYSTEM" not in content
 
     def test_local_service_gets_nt_authority(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="process_create",
             src_host=_win_host(),
@@ -1475,7 +1790,7 @@ class TestUserFieldFormatting:
         assert "CORP\\LOCAL SERVICE" not in content
 
     def test_regular_user_gets_domain(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="process_create",
             src_host=_win_host(),
@@ -1494,7 +1809,7 @@ class TestUserFieldFormatting:
         assert "CORP\\jsmith" in content
 
     def test_event1_version5_includes_parent_user(self, emitter):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="process_create",
             src_host=_win_host(),
@@ -1518,9 +1833,34 @@ class TestUserFieldFormatting:
         assert "<Version>5</Version>" in content
         assert '<Data Name="ParentUser">CORP\\admin</Data>' in content
 
+    def test_event1_prefers_canonical_parent_principal(self, emitter):
+        """A retained parent identity overrides the child's security context."""
+        event = OccurrenceBuilder(
+            timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
+            event_type="process_create",
+            src_host=_win_host(),
+            auth=AuthContext(username="admin", logon_id="0x46a3f"),
+            process=ProcessContext(
+                pid=4101,
+                parent_pid=4001,
+                image=r"C:\Windows\System32\userinit.exe",
+                command_line="userinit.exe",
+                username="admin",
+                parent_image=r"C:\Windows\System32\winlogon.exe",
+                parent_command_line="winlogon.exe",
+                parent_username="SYSTEM",
+            ),
+        )
+
+        emitter._render_sysmon_process_create(event)
+        emitter.flush()
+        content = list(emitter._host_writers.values())[0].output_path.read_text()
+
+        assert '<Data Name="ParentUser">NT AUTHORITY\\SYSTEM</Data>' in content
+
     def test_process_access_target_user_gets_domain(self, emitter):
         """Sysmon Event 10 target user should use source-native domain formatting."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="process_access",
             src_host=_win_host(),
@@ -1614,7 +1954,7 @@ class TestEvent3PortProcessConstraints:
 
     def _make_conn_event(self, dst_port, image=None, initiating_pid=-1):
         host = _win_host()
-        net = NetworkContext(
+        net = network_plan(
             src_ip="10.0.1.10",
             dst_ip="10.0.2.20",
             src_port=49152,
@@ -1633,7 +1973,7 @@ class TestEvent3PortProcessConstraints:
             if image
             else None
         )
-        return SecurityEvent(
+        return OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, tzinfo=UTC),
             event_type="connection",
             src_host=host,

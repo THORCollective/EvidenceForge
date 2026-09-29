@@ -1,12 +1,12 @@
 # network_params.yaml — Network parameters for realistic DHCP and MAC address generation.
 #
-# Purpose: Defines OUI prefixes and public NTP server defaults for realistic
-#          DHCP, MAC address, and time synchronization evidence.
+# Purpose: Defines OUI prefixes and public infrastructure defaults for realistic
+#          DHCP, MAC address, DNS, and time synchronization evidence.
 #
 # Depended on by: generation engine (MAC address generation)
 # Depends on: nothing — standalone
 #
-# Full schema: see commands/eforge/references/config-network-params.md
+# Authoring reference: commands/eforge/references/config-dns-network.md
 
 oui_prefixes:
   - prefix: "D4:BE:D9"
@@ -31,49 +31,62 @@ oui_prefixes:
     vendor: "Intel"
     weight: 5
 
-public_ntp_servers:
-  - name: "time-a-g.nist.gov"
-    ip: "129.6.15.28"
-    operator: "NIST"
-    stratum: 1
-    ref_id: ".NIST."
-    weight: 20
-  - name: "time-b-g.nist.gov"
-    ip: "129.6.15.29"
-    operator: "NIST"
-    stratum: 1
-    ref_id: ".NIST."
-    weight: 15
-  - name: "time.cloudflare.com"
-    ip: "162.159.200.1"
-    operator: "Cloudflare"
-    stratum: 2
-    ref_id: ".GPS."
-    weight: 20
-  - name: "time.google.com"
-    ip: "216.239.35.0"
-    operator: "Google"
-    stratum: 2
-    ref_id: ".GOOG."
-    weight: 15
-  - name: "time.apple.com"
-    ip: "17.253.34.125"
-    operator: "Apple"
-    stratum: 2
-    ref_id: ".PPS."
-    weight: 10
-  - name: "ntp.ubuntu.com"
-    ip: "91.189.89.198"
-    operator: "Canonical"
-    stratum: 2
-    ref_id: ".GPS."
-    weight: 10
-  - name: "pool.ntp.org"
-    ip: "23.186.168.130"
-    operator: "NTP Pool"
-    stratum: 2
-    ref_id: ".PPS."
-    weight: 10
+# Globally assigned networks that are implausible as ordinary Internet visitors.
+# These US Department of Defense allocations may satisfy ipaddress.is_global,
+# but should not appear in the synthetic residential/business client population.
+external_client_excluded_cidrs:
+  - "6.0.0.0/8"
+  - "7.0.0.0/8"
+  - "11.0.0.0/8"
+  - "21.0.0.0/8"
+  - "22.0.0.0/8"
+  - "26.0.0.0/8"
+  - "28.0.0.0/8"
+  - "29.0.0.0/8"
+  - "30.0.0.0/8"
+  - "33.0.0.0/8"
+  - "55.0.0.0/8"
+  - "214.0.0.0/8"
+  - "215.0.0.0/8"
+
+# Long-lived service identities that plausibly originate SMB from Linux server
+# roles. Roles without a profile keep the endpoint FLOW unattributed instead of
+# inventing a root-owned smbclient process for every connection.
+linux_smb_connection_owners:
+  - role: app_server
+    key: document_sync
+    image: /opt/meridian/bin/document-sync
+    command_line: /opt/meridian/bin/document-sync --share smb://{target}/Integration --mode poll
+    username: meridian-app
+  - role: database
+    key: database_backup_agent
+    image: /usr/local/sbin/database-backup-agent
+    command_line: /usr/local/sbin/database-backup-agent --repository smb://{target}/DatabaseBackups
+    username: backup
+  - role: mail_server
+    key: attachment_archive
+    image: /usr/libexec/meridian/attachment-archive
+    command_line: /usr/libexec/meridian/attachment-archive --share smb://{target}/MailArchive
+    username: dovecot
+  - role: web_server
+    key: content_publisher
+    image: /opt/meridian/bin/content-publisher
+    command_line: /opt/meridian/bin/content-publisher --share smb://{target}/WebContent
+    username: www-data
+
+# Process-owned nmap commands fully expand bounded small CIDRs and use
+# stratified silent-address sampling for larger ranges.
+nmap_command_probe:
+  full_cidr_max_hosts: 256
+  max_expanded_targets: 256
+  large_cidr_connect_targets: 20
+  large_cidr_discovery_targets: 24
+  large_cidr_unmodeled_targets: 12
+  max_ports: 12
+  connect_window_seconds_min: 6.0
+  connect_window_seconds_max: 12.0
+  discovery_window_seconds_min: 2.0
+  discovery_window_seconds_max: 5.0
 
 dns_tunnel_rtt:
   min_seconds: 0.04

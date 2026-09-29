@@ -26,13 +26,13 @@ def _harness(os_name: str = "macOS 14"):
     state.set_current_time(START)
     events: list = []
     dispatcher = EventDispatcher(state_manager=state, emitters={})
-    original_dispatch = dispatcher.dispatch
+    original_prepare = dispatcher.prepare_builder
 
-    def capture(event):
+    def capture(event, *args, **kwargs):
         events.append(event)
-        original_dispatch(event)
+        return original_prepare(event, *args, **kwargs)
 
-    dispatcher.dispatch = capture
+    dispatcher.prepare_builder = capture
     generator = ActivityGenerator(state, {}, dispatcher=dispatcher)
     user = User(username="jappleseed", full_name="J Appleseed", email="j@example.local")
     system = System(

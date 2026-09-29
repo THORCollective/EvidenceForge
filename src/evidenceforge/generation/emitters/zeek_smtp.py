@@ -8,8 +8,12 @@ import json
 from datetime import datetime, timedelta
 from typing import Any
 
-from evidenceforge.events.base import SecurityEvent
-from evidenceforge.generation.emitters.zeek_base import SensorMultiplexEmitter, zeek_format_observed
+from evidenceforge.events.base import CanonicalOccurrence
+from evidenceforge.generation.emitters.zeek_base import (
+    SensorMultiplexEmitter,
+    planned_zeek_connection_interval,
+    zeek_format_observed,
+)
 from evidenceforge.generation.source_timing import SourceTimingPlanner
 
 _SOURCE_TIMING = SourceTimingPlanner()
@@ -22,7 +26,7 @@ class ZeekSmtpEmitter(SensorMultiplexEmitter):
     _flat_filename = "zeek_smtp.json"
     _supported_types: set[str] = {"connection"}
 
-    def can_handle(self, event: SecurityEvent) -> bool:
+    def can_handle(self, event: CanonicalOccurrence) -> bool:
         return (
             event.event_type in self._supported_types
             and event.network is not None
@@ -30,27 +34,34 @@ class ZeekSmtpEmitter(SensorMultiplexEmitter):
             and event.network.service == "smtp"
         )
 
-    def emit(self, event: SecurityEvent) -> None:
+    def emit(self, event: CanonicalOccurrence) -> None:
         net = event.network
         smtp = event.smtp
-        conn_ts = _SOURCE_TIMING.source_time(
-            event,
-            "source.zeek_conn_start",
-            seed_parts=(
-                net.zeek_uid,
-                net.src_ip,
-                net.src_port,
-                net.dst_ip,
-                net.dst_port,
-                event.timestamp,
-            ),
-            not_before=event.timestamp,
-        )
+        planned_interval = planned_zeek_connection_interval(event)
+        if planned_interval is not None:
+            conn_ts, planned_close = planned_interval
+        else:
+            planned_close = None
+            conn_ts = _SOURCE_TIMING.source_time(
+                event,
+                "source.zeek_conn_start",
+                seed_parts=(
+                    net.zeek_uid,
+                    net.src_ip,
+                    net.src_port,
+                    net.dst_ip,
+                    net.dst_port,
+                    event.timestamp,
+                ),
+                not_before=event.timestamp,
+            )
         within = None
-        if net.duration is not None and net.duration > 0:
+        if planned_close is not None:
+            within = (conn_ts, max(conn_ts, planned_close - timedelta(microseconds=1)))
+        elif net.duration is not None and net.duration > 0:
             latest = conn_ts + timedelta(seconds=max(0.0, net.duration)) - timedelta(microseconds=1)
             within = (conn_ts, max(conn_ts, latest))
-        smtp_ts = _SOURCE_TIMING.source_time(
+        smtp_ts = _SOURCE_TIMING.packet_child_time(
             event,
             "source.zeek_smtp_transaction",
             seed_parts=(
@@ -88,10 +99,8 @@ class ZeekSmtpEmitter(SensorMultiplexEmitter):
             "subject": "" if protected else smtp.subject,
             "user_agent": "" if protected else smtp.user_agent,
             "fuids": [] if protected or not fuids else fuids,
-            "_sensor_hostnames": event._sensor_hostnames_by_format.get(self.format_def.name, []),
+            **self._sensor_metadata(event, self.format_def.name),
         }
-        if event._nat_swaps_by_sensor:
-            event_data["_nat_swaps_by_sensor"] = event._nat_swaps_by_sensor
         self.emit_event(event_data)
 
     def _render_event(self, event_data: dict[str, Any]) -> str:

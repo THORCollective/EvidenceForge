@@ -23,20 +23,34 @@
 """Unit tests for generation engine."""
 
 import json
+import random
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 
+from evidenceforge.composition import compile_scenario, with_runtime_scenario
 from evidenceforge.events.collection_profile import COLLECTION_PROFILE_FILENAME
 from evidenceforge.events.observation_manifest import OBSERVATION_MANIFEST_FILENAME
+from evidenceforge.generation.checkpoints import (
+    GenerationEngineParticipant,
+    IncrementalCheckpointStore,
+)
+from evidenceforge.generation.checkpoints.runtime import IncrementalCheckpointController
 from evidenceforge.generation.engine import GenerationEngine
 from evidenceforge.generation.engine.storyline import _estimate_process_lifetime
+from evidenceforge.generation.storage_world import CompiledStorageFile
+from evidenceforge.generation.suspension import GenerationSuspendedError
 from evidenceforge.models import (
     BaselineActivity,
     Environment,
+    NetworkConfig,
+    NetworkSensor,
     OutputSpec,
     Scenario,
+    SourceObservationOverride,
     StorylineEvent,
     System,
     TimeWindow,
@@ -44,6 +58,33 @@ from evidenceforge.models import (
 )
 from evidenceforge.models.scenario import ConnectionEventSpec
 from evidenceforge.output_targets import OUTPUT_TARGET_FILENAME
+from evidenceforge.utils.timing import HawkesState
+
+
+def _mock_activity_generator_factory(mock_instance: Mock):
+    """Bind mocked generation to the bundle-owned session postcondition."""
+
+    mock_instance.timing_runtime = None
+
+    def factory(**kwargs):
+        state_manager = kwargs["state_manager"]
+
+        def generate_logon(**request):
+            state_manager.set_current_time(request["time"])
+            return state_manager.create_session(
+                username=request["user"].username,
+                system=request["system"].hostname,
+                logon_type=request.get("logon_type", 2),
+                source_ip=request.get("source_ip") or "-",
+                start_time=request["time"],
+                session_kind="interactive",
+                lifecycle_group_id="mock-logon-bundle",
+            )
+
+        mock_instance.generate_logon.side_effect = generate_logon
+        return mock_instance
+
+    return factory
 
 
 def test_service_wrapper_storyline_process_lifetimes_are_source_native():
@@ -61,7 +102,528 @@ def test_service_wrapper_storyline_process_lifetimes_are_source_native():
     )
 
 
+def test_engine_binds_canonical_binary_registry_before_process_generation(
+    tmp_path,
+):
+    """Production initialization enables exact process-binary identity resolution."""
+    scenario = Scenario(
+        version="1.0",
+        name="binary-registry-integration",
+        description="Binary registry integration",
+        environment=Environment(
+            description="Test environment",
+            users=[
+                User(
+                    username="testuser",
+                    full_name="Test User",
+                    email="test@example.com",
+                    primary_system="TEST-01",
+                )
+            ],
+            systems=[
+                System(
+                    hostname="TEST-01",
+                    ip="10.0.0.1",
+                    os="Windows 10",
+                    type="workstation",
+                )
+            ],
+        ),
+        time_window=TimeWindow(start="2024-01-15T10:00:00Z", duration="2h"),
+        baseline_activity=BaselineActivity(
+            description="Test baseline",
+            intensity="medium",
+            variation="low",
+        ),
+        output=OutputSpec(
+            logs=[{"format": "windows"}],
+            destination="./output",
+            compression=False,
+        ),
+        personas=[],
+    )
+    engine = GenerationEngine(scenario, tmp_path)
+
+    engine._initialize()
+
+    assert engine.dispatcher.deployment_registry is engine.deployment_registry
+    system = scenario.environment.systems[0]
+    identity = engine.dispatcher.resolve_process_binary_identity(
+        system.hostname,
+        "",
+        r"C:\Windows\System32\winlogon.exe",
+        "windows",
+    )
+    assert identity is not None
+    assert identity.identity_kind == "installed_release"
+
+
+@pytest.mark.slow
 class TestGenerationEngine:
+    def test_incremental_tail_resume_is_byte_identical_for_external_sorted_emitters(
+        self,
+        tmp_path,
+    ):
+        """A restored immutable-run set should produce identical final sensor evidence."""
+
+        scenario_path = Path("tests/fixtures/scenarios/minimal.yaml")
+        compiled = compile_scenario(scenario_path)
+        compiled.scenario.output.logs = [{"format": "zeek"}]
+        compiled = with_runtime_scenario(compiled, compiled.scenario)
+        source_root = tmp_path / "source"
+        store = IncrementalCheckpointStore(source_root)
+        controller = IncrementalCheckpointController(
+            store=store,
+            fingerprint="a" * 64,
+            checkpoint_hours=1,
+            resolved_scenario=b"resolved\n",
+        )
+        source = GenerationEngine(
+            compiled.scenario,
+            source_root / "data",
+            ground_truth_dir=source_root,
+            artifact_dir=source_root / "artifacts",
+            scenario_root=scenario_path.parent,
+            compiled_scenario=compiled,
+            checkpoint_hours=1,
+            checkpoint_controller=controller,
+        )
+        source.generate()
+        recovery = store.recover(expected_fingerprint="a" * 64)
+
+        resumed_root = tmp_path / "resumed"
+        resumed_controller = IncrementalCheckpointController.for_recovery(
+            store=store,
+            recovery=recovery,
+            fingerprint="a" * 64,
+            resolved_scenario=store.read_resolved_scenario(recovery),
+        )
+        resumed = GenerationEngine(
+            compiled.scenario,
+            resumed_root / "data",
+            ground_truth_dir=resumed_root,
+            artifact_dir=resumed_root / "artifacts",
+            scenario_root=scenario_path.parent,
+            compiled_scenario=compiled,
+            checkpoint_hours=1,
+            checkpoint_controller=resumed_controller,
+            checkpoint_recovery=recovery,
+        )
+        resumed.generate()
+
+        source_files = {
+            path.relative_to(source_root / "data"): path.read_bytes()
+            for path in (source_root / "data").rglob("*")
+            if path.is_file()
+        }
+        resumed_files = {
+            path.relative_to(resumed_root / "data"): path.read_bytes()
+            for path in (resumed_root / "data").rglob("*")
+            if path.is_file()
+        }
+        assert source_files
+        assert resumed_files == source_files
+
+    def test_incremental_controller_commits_real_production_participants(
+        self,
+        minimal_scenario,
+        tmp_path,
+    ):
+        """A real cadence barrier should publish every initialized mutable owner."""
+
+        controller = IncrementalCheckpointController(
+            store=IncrementalCheckpointStore(tmp_path),
+            fingerprint="a" * 64,
+            checkpoint_hours=1,
+            resolved_scenario=b"resolved\n",
+        )
+        engine = GenerationEngine(
+            minimal_scenario,
+            tmp_path / "data",
+            ground_truth_dir=tmp_path,
+            artifact_dir=tmp_path / "artifacts",
+            checkpoint_hours=1,
+            checkpoint_controller=controller,
+        )
+
+        engine.generate()
+
+        recovery = controller.store.recover(expected_fingerprint="a" * 64)
+        expected_hours = int((engine.end_time - engine.warmup_start_time).total_seconds() // 3600)
+        assert recovery.manifest.cursor.phase == "tail"
+        assert recovery.manifest.cursor.completed_simulated_hours == expected_hours
+        assert {head.owner for head in recovery.manifest.participant_heads} == {
+            participant.checkpoint_owner for participant in engine._checkpoint_participants
+        }
+        assert (
+            engine.lifecycle_registry.action_cohort_preparation_census().committed_receipt_authorities
+            == 0
+        )
+
+        resumed_controller = IncrementalCheckpointController.for_recovery(
+            store=controller.store,
+            recovery=recovery,
+            fingerprint="a" * 64,
+            resolved_scenario=controller.store.read_resolved_scenario(recovery),
+        )
+        resumed = GenerationEngine(
+            minimal_scenario,
+            tmp_path / "resumed" / "data",
+            ground_truth_dir=tmp_path / "resumed",
+            artifact_dir=tmp_path / "resumed" / "artifacts",
+            checkpoint_hours=1,
+            checkpoint_controller=resumed_controller,
+            checkpoint_recovery=recovery,
+        )
+
+        resumed.generate()
+
+        assert resumed._generation_complete is True
+        assert resumed.malicious_events == engine.malicious_events
+        assert resumed.red_herring_events == engine.red_herring_events
+        source_files = {
+            path.relative_to(tmp_path / "data"): path.read_bytes()
+            for path in (tmp_path / "data").rglob("*")
+            if path.is_file()
+        }
+        resumed_files = {
+            path.relative_to(tmp_path / "resumed" / "data"): path.read_bytes()
+            for path in (tmp_path / "resumed" / "data").rglob("*")
+            if path.is_file()
+        }
+        assert source_files
+        assert resumed_files == source_files
+
+    def test_checkpoint_hour_hook_is_cadence_only_and_uses_post_boundary_phase(
+        self,
+        minimal_scenario,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Checkpoint hooks should run only at exact continuous-hour multiples."""
+
+        observed: list[tuple[int, datetime, str]] = []
+        engine = GenerationEngine(
+            minimal_scenario,
+            tmp_path,
+            checkpoint_hour_callback=lambda hour, next_hour, phase: observed.append(
+                (hour, next_hour, phase)
+            ),
+            checkpoint_hours=6,
+        )
+        start = datetime(2026, 1, 2, tzinfo=UTC)
+        end = start + timedelta(hours=6)
+        engine.start_time = start
+        engine.end_time = end
+        barrier = Mock()
+        prepare_barrier = Mock()
+        monkeypatch.setattr(engine, "_barrier_flush_all_emitters", barrier)
+        monkeypatch.setattr(engine, "_prepare_incremental_checkpoint_barrier", prepare_barrier)
+
+        engine._checkpoint_after_completed_hour(
+            completed_simulated_hours=5,
+            next_hour=start - timedelta(hours=1),
+        )
+        engine._checkpoint_after_completed_hour(
+            completed_simulated_hours=6,
+            next_hour=start,
+        )
+        engine._checkpoint_after_completed_hour(
+            completed_simulated_hours=12,
+            next_hour=end,
+        )
+
+        assert observed == [(6, start, "collection"), (12, end, "tail")]
+        assert barrier.call_count == 4
+        assert prepare_barrier.call_count == 2
+
+    def test_graceful_interrupt_without_checkpoints_stops_after_hour_cleanup(
+        self,
+        minimal_scenario,
+        tmp_path,
+        monkeypatch,
+    ) -> None:
+        """A latched interrupt should enter normal cleanup only after a safe hour boundary."""
+
+        engine = GenerationEngine(
+            minimal_scenario,
+            tmp_path,
+            checkpoint_hours=0,
+            graceful_interrupt_requested=lambda: True,
+        )
+        start = datetime(2026, 1, 2, tzinfo=UTC)
+        engine.start_time = start
+        engine.end_time = start + timedelta(hours=1)
+        barrier = Mock()
+        monkeypatch.setattr(engine, "_barrier_flush_all_emitters", barrier)
+
+        with pytest.raises(KeyboardInterrupt):
+            engine._checkpoint_after_completed_hour(
+                completed_simulated_hours=1,
+                next_hour=start,
+            )
+
+        barrier.assert_called_once_with()
+
+    def test_signal_after_cadence_commit_marks_existing_recovery_suspended(
+        self,
+        minimal_scenario,
+        tmp_path,
+        monkeypatch,
+    ) -> None:
+        """A signal noticed after publication should not create a duplicate checkpoint."""
+
+        controller = Mock()
+        controller.cadence.hours = 1
+        controller.pending_suspension_request.return_value = None
+        interrupt_requested = iter((False, False, True))
+        engine = GenerationEngine(
+            minimal_scenario,
+            tmp_path,
+            checkpoint_hours=1,
+            checkpoint_controller=controller,
+            graceful_interrupt_requested=lambda: next(interrupt_requested),
+        )
+        start = datetime(2026, 1, 2, tzinfo=UTC)
+        engine.start_time = start
+        engine.end_time = start + timedelta(hours=1)
+        monkeypatch.setattr(engine, "_barrier_flush_all_emitters", Mock())
+        monkeypatch.setattr(engine, "_prepare_incremental_checkpoint_barrier", Mock())
+
+        with pytest.raises(GenerationSuspendedError) as raised:
+            engine._checkpoint_after_completed_hour(
+                completed_simulated_hours=1,
+                next_hour=start,
+            )
+
+        controller.commit.assert_called_once()
+        controller.commit_local_suspension.assert_not_called()
+        controller.acknowledge_local_suspension.assert_called_once_with(raised.value.cursor)
+        assert raised.value.requested_by_signal
+
+    def test_checkpoint_hour_hook_requires_a_nonnegative_exact_cadence(
+        self,
+        minimal_scenario,
+        tmp_path,
+    ):
+        """Internal engine cadence should reject disabled callbacks and invalid values."""
+
+        with pytest.raises(ValueError, match="requires a positive"):
+            GenerationEngine(
+                minimal_scenario,
+                tmp_path,
+                checkpoint_hour_callback=lambda *_args: None,
+            )
+        with pytest.raises(ValueError, match="non-negative integer"):
+            GenerationEngine(minimal_scenario, tmp_path, checkpoint_hours=-1)
+
+    def test_generation_engine_checkpoint_head_round_trips_bounded_progress(
+        self,
+        minimal_scenario,
+        tmp_path,
+    ):
+        """Engine progress and DHCP RNG state should restore without runtime identities."""
+
+        engine = GenerationEngine(minimal_scenario, tmp_path / "source")
+        source_profiler = Mock()
+        engine.profiler = source_profiler
+        system = engine.scenario.environment.systems[0]
+        moment = datetime(2024, 1, 15, 11, tzinfo=UTC)
+        renewal_rng = random.Random(91)
+        renewal_rng.random()
+        expected_rng = random.Random()
+        expected_rng.setstate(renewal_rng.getstate())
+        engine._ambient_registry_state = {"TEST-01": {"Run": "agent.exe"}}
+        engine._audit_serials = {"TEST-01": 1032}
+        engine._baseline_rdp_last_session = {("TEST-01", "DC-01", "testuser"): moment}
+        engine._baseline_startup_next_age_seconds = {("TEST-01", "0x1"): 93.5}
+        engine._dhcp_lease_state = {
+            "TEST-01": {
+                "system": system,
+                "renewal_rng": renewal_rng,
+                "next_renewal": moment,
+                "renewal_sequence": 2,
+            }
+        }
+        engine._extra_syslog_sudo_command_counts = {"testuser": 2}
+        engine._extra_syslog_sudo_command_host_counts = {("TEST-01", "testuser"): 1}
+        engine._extra_syslog_entry_counts = {"TEST-01:rsyslogd": 3}
+        engine._gpo_refresh_schedule_state = {
+            "TEST-01": {"scheduled_second": 7200.5, "sequence": 2}
+        }
+        engine._hawkes_states = {"testuser": HawkesState(12.5, 0.75)}
+        engine._last_tgt_time = {"testuser": moment}
+        engine._linux_dbus_bus_ids = {"TEST-01": 44}
+        engine._linux_polkit_agents = {
+            "TEST-01": [{"session_id": 19, "bus_id": 44, "process_path": "/usr/bin/agent"}]
+        }
+        engine._linux_polkit_session_pools = {"TEST-01": [19, 20, 24]}
+        engine._linux_resolved_feature_states = {"TEST-01": ("degraded", "10.0.0.2")}
+        engine._linux_rsyslog_health = {
+            "TEST-01": {"checkpoint": 12345, "pending": 3, "workers": 2}
+        }
+        engine._machine_ids = {"TEST-01": "a" * 32}
+        engine._ntp_schedule_state = {"TEST-01": (3, moment)}
+        engine._package_maintenance_windows = {"TEST-01": (moment, moment + timedelta(minutes=4))}
+        engine._pending_unlocks = {"testuser": (moment, "0x1")}
+        engine._red_herring_executed = {1}
+        engine._snapd_active_tasks = {"TEST-01": [(1001, 1, "core22")]}
+        engine._snapd_next_change_id = {"TEST-01": 1002}
+        engine._system_pids = {"TEST-01": {"systemd": 1, "sssd": 1_449_103}}
+        engine._storyline_executed = {0, 2}
+        storyline_file = CompiledStorageFile(
+            file_id="storyline-upload",
+            share="ADMIN$",
+            path=r"C:\Temp\payload.bin",
+            size_bytes=4096,
+            mime_type="application/octet-stream",
+            tags=("storyline", "transferred"),
+        )
+        engine._storyline_file_available_at = {("test-01", r"c:\temp\payload.bin"): moment}
+        engine._storyline_file_source_overrides = {
+            ("test-01", r"c:\temp\payload.bin"): storyline_file
+        }
+        engine._storyline_staged_archives = [
+            SimpleNamespace(
+                actor=engine.scenario.environment.users[0],
+                staging_host="TEST-01",
+                staging_ip="10.0.0.10",
+                source_ip="10.0.0.20",
+                archive_path=r"C:\Temp\evidence.zip",
+                smb_filename="evidence.zip",
+                staged_at=moment,
+                consumed=False,
+            ),
+            SimpleNamespace(
+                actor=engine.scenario.environment.users[0],
+                staging_host="TEST-01",
+                staging_ip="10.0.0.10",
+                source_ip="10.0.0.20",
+                archive_path=r"C:\Temp\old.zip",
+                smb_filename="old.zip",
+                staged_at=moment - timedelta(hours=1),
+                consumed=True,
+            ),
+        ]
+        engine._windows_scheduled_task_counts = {"TEST-01": 4}
+        engine._windows_scheduled_task_last_seen = {"TEST-01": moment}
+        engine._pending_story_process_terminations = [
+            {
+                "actor": "testuser",
+                "system": "TEST-01",
+                "time": moment + timedelta(minutes=15),
+                "pid": 4242,
+                "process_name": r"C:\Windows\Temp\stager.exe",
+                "logon_id": "0x12345",
+                "release_storyline_index": 3,
+            }
+        ]
+        engine.malicious_events = [{"event": "process", "time": moment}]
+        engine.red_herring_events = [{"event": "dns", "time": moment}]
+
+        seal = GenerationEngineParticipant(engine).prepare_checkpoint(0)
+        assert not seal.segments
+
+        restored_scenario = Scenario.model_validate(minimal_scenario.model_dump(mode="python"))
+        restored = GenerationEngine(restored_scenario, tmp_path / "restored")
+        restored_profiler = Mock()
+        restored.profiler = restored_profiler
+        restored._system_pids = {"TEST-01": {"systemd": 1}}
+        rebuilt_system_pids = restored._system_pids
+        GenerationEngineParticipant(restored).restore_checkpoint(seal.head.payload, ())
+
+        assert restored._ambient_registry_state == engine._ambient_registry_state
+        assert restored._linux_resolved_feature_states == engine._linux_resolved_feature_states
+        assert restored._baseline_rdp_last_session == engine._baseline_rdp_last_session
+        assert restored._hawkes_states == engine._hawkes_states
+        assert restored._linux_polkit_agents == engine._linux_polkit_agents
+        assert restored._package_maintenance_windows == engine._package_maintenance_windows
+        assert restored._snapd_active_tasks == engine._snapd_active_tasks
+        assert restored._system_pids == engine._system_pids
+        assert restored._system_pids is rebuilt_system_pids
+        assert restored.profiler is restored_profiler
+        assert len(restored._storyline_staged_archives) == 1
+        restored_archive = restored._storyline_staged_archives[0]
+        assert restored_archive.actor is restored.scenario.environment.users[0]
+        assert restored_archive.archive_path == r"C:\Temp\evidence.zip"
+        assert restored._pending_unlocks == engine._pending_unlocks
+        assert (
+            restored._pending_story_process_terminations
+            == engine._pending_story_process_terminations
+        )
+        assert restored._storyline_executed == engine._storyline_executed
+        assert restored._storyline_file_available_at == engine._storyline_file_available_at
+        assert restored._storyline_file_source_overrides == engine._storyline_file_source_overrides
+        assert restored.malicious_events == engine.malicious_events
+        restored_lease = restored._dhcp_lease_state["TEST-01"]
+        assert restored_lease["system"] is restored.scenario.environment.systems[0]
+        assert restored_lease["system"] is not system
+        assert restored_lease["renewal_rng"].random() == expected_rng.random()
+
+        # Older evidence may already name a resolver outside the corrected pool.
+        # Finish that recorded pair, then start the next pair with current truth.
+        entry = {
+            "messages": ["Degraded {dns_server}", "Recovered {dns_server}"],
+        }
+        resolver_rng = random.Random(42)
+        assert (
+            restored._render_systemd_resolved_message(entry, "TEST-01", ["10.0.0.53"], resolver_rng)
+            == "Recovered 10.0.0.2"
+        )
+        assert (
+            restored._render_systemd_resolved_message(entry, "TEST-01", ["10.0.0.53"], resolver_rng)
+            == "Degraded 10.0.0.53"
+        )
+        assert (
+            restored._render_systemd_resolved_message(entry, "TEST-01", ["10.0.0.53"], resolver_rng)
+            == "Recovered 10.0.0.53"
+        )
+        assert engine._linux_resolved_feature_states == {"TEST-01": ("degraded", "10.0.0.2")}
+
+    def test_warmup_boundary_checkpoint_contains_post_transition_state(self):
+        """A cadence point at collection start should follow reset and sensor startup."""
+
+        engine = object.__new__(GenerationEngine)
+        start = datetime(2026, 1, 2, tzinfo=UTC)
+        engine.start_time = start
+        engine.end_time = start + timedelta(hours=1)
+        engine.warmup_start_time = start - timedelta(hours=1)
+        engine.warmup_duration = timedelta(hours=1)
+        engine.scenario = Mock(environment=Mock(users=[]))
+        engine.state_manager = Mock()
+        engine.activity_generator = Mock()
+        engine._report_progress = Mock()
+        engine._emit_dhcp_leases = Mock()
+        engine._generate_hour = Mock()
+        order: list[str] = []
+        engine.activity_generator.advance_application_channel_watermark.side_effect = (
+            lambda _cutoff: order.append("application-watermark")
+        )
+        engine.activity_generator.finalize_foreground_process_lifetimes.side_effect = (
+            lambda _cutoff: order.append("foreground-finalize")
+        )
+        engine.activity_generator.finalize_ssh_session_lifecycles.side_effect = lambda _cutoff: (
+            order.append("ssh-finalize")
+        )
+        engine._emit_sensor_startup = lambda: order.append("sensor-startup")
+        engine._checkpoint_after_completed_hour = lambda **_kwargs: order.append("checkpoint")
+
+        engine._generate_baseline()
+
+        assert order[:5] == [
+            "foreground-finalize",
+            "application-watermark",
+            "ssh-finalize",
+            "sensor-startup",
+            "checkpoint",
+        ]
+        assert order[5:] == [
+            "foreground-finalize",
+            "application-watermark",
+            "ssh-finalize",
+            "checkpoint",
+        ]
+
     """Tests for GenerationEngine class."""
 
     @pytest.fixture(autouse=True)
@@ -79,8 +641,10 @@ class TestGenerationEngine:
             patch("evidenceforge.generation.engine.emitter_setup.SnortEmitter") as m4,
             patch("evidenceforge.generation.engine.emitter_setup.WebEmitter") as m5,
             patch("evidenceforge.generation.engine.emitter_setup.ZeekSmtpEmitter") as m6,
+            patch("evidenceforge.generation.engine.emitter_setup.ZeekSmbFilesEmitter") as m7,
+            patch("evidenceforge.generation.engine.emitter_setup.ZeekSmbMappingEmitter") as m8,
         ):
-            yield m1, m2, m3, m4, m5, m6
+            yield m1, m2, m3, m4, m5, m6, m7, m8
 
     @pytest.fixture
     def minimal_scenario(self):
@@ -115,6 +679,83 @@ class TestGenerationEngine:
             ),
             personas=[],
         )
+
+    def test_system_seeding_does_not_mutate_packaged_reverse_dns(self, minimal_scenario, tmp_path):
+        """Scenario identities must remain local to their generation engine."""
+        from evidenceforge.generation.activity.network import REVERSE_DNS
+
+        scenario_ip = "10.255.254.253"
+        scenario_system = System(
+            hostname="SCENARIO-ONLY",
+            ip=scenario_ip,
+            os="Windows 11",
+            type="workstation",
+        )
+        scenario = minimal_scenario.model_copy(
+            update={
+                "environment": minimal_scenario.environment.model_copy(
+                    update={"systems": [scenario_system]}
+                )
+            }
+        )
+        engine = GenerationEngine(scenario, tmp_path)
+        engine.start_time = None
+        engine._kernel_boot_uptimes = {}
+        engine._system_pids = {}
+        engine._infra_ips = {"db_servers": [], "dns": [], "dc_hostnames": [], "dc": []}
+        engine.activity_generator = Mock()
+
+        prior = REVERSE_DNS.pop(scenario_ip, None)
+        try:
+            with (
+                patch.object(engine, "_seed_windows_process_tree"),
+                patch.object(engine, "_generate_external_client_ip", return_value="198.51.100.10"),
+            ):
+                engine._seed_system_process_trees()
+            assert scenario_ip not in REVERSE_DNS
+        finally:
+            if prior is not None:
+                REVERSE_DNS[scenario_ip] = prior
+
+    def test_sensor_emitter_routes_use_canonical_source_hostname(
+        self,
+        minimal_scenario,
+        tmp_path,
+        mock_new_emitters,
+    ):
+        """Emitter routes must use the same case-normalized identity as source deployment."""
+        minimal_scenario.environment.network = NetworkConfig.model_validate(
+            {
+                "segments": [
+                    {
+                        "name": "workstations",
+                        "cidr": "10.0.0.0/24",
+                        "exposure": "internal",
+                        "systems": ["TEST-01"],
+                    }
+                ],
+                "sensors": [
+                    NetworkSensor(
+                        type="ids",
+                        name="ng-edge-ids",
+                        hostname="IDS-NG-EDGE",
+                        monitoring_segments=["workstations"],
+                        log_formats=["snort_alert"],
+                    ).model_dump(mode="python")
+                ],
+            }
+        )
+        minimal_scenario.output = OutputSpec(
+            logs=[{"format": "snort_alert"}],
+            destination="./output",
+            compression=False,
+        )
+        engine = GenerationEngine(minimal_scenario, tmp_path)
+
+        engine._init_emitters()
+
+        snort_class = mock_new_emitters[3]
+        assert snort_class.call_args.kwargs["sensor_hostnames"] == ["ids-ng-edge"]
 
     @pytest.fixture
     def scenario_with_storyline(self):
@@ -211,18 +852,86 @@ class TestGenerationEngine:
         mock_format_def.output.file_extension = ".log"
         mock_load_format.return_value = mock_format_def
 
+        minimal_scenario.environment.network = NetworkConfig.model_validate(
+            {
+                "segments": [
+                    {
+                        "name": "workstations",
+                        "cidr": "10.0.0.0/24",
+                        "exposure": "internal",
+                        "systems": ["TEST-01"],
+                    }
+                ],
+                "sensors": [],
+            }
+        )
+
         engine = GenerationEngine(minimal_scenario, tmp_path)
         engine._initialize()
 
-        # Verify emitters created: windows (2: security + sysmon) + zeek (14) = 16
+        # Verify emitters created: windows (2: security + sysmon) + zeek (16) = 18
         assert mock_windows.called
         assert mock_zeek.called
-        assert len(engine.emitters) == 16
+        assert len(engine.emitters) == 18
         assert "windows_event_security" in engine.emitters
         assert "zeek_conn" in engine.emitters
         assert "zeek_http" in engine.emitters
         assert "zeek_ssl" in engine.emitters
         assert "zeek_files" in engine.emitters
+        assert "zeek_smb_mapping" in engine.emitters
+        assert "zeek_smb_files" in engine.emitters
+        assert engine.source_deployment_compilation.census.sensor_sources == 0
+        assert engine.source_deployment_compilation.source_instances == (
+            "sysmon:test-01",
+            "windows_security:test-01",
+        )
+        assert (
+            engine.dispatcher.collection_deployment
+            is engine.source_deployment_compilation.deployment
+        )
+
+    @patch("evidenceforge.generation.engine.core.ActivityGenerator")
+    def test_initialize_compiles_and_injects_sensor_deployment(
+        self,
+        mock_activity_gen,
+        minimal_scenario,
+        tmp_path,
+    ):
+        """Engine should retain and inject the exact sensor-backed compilation."""
+        scenario_data = minimal_scenario.model_dump(mode="json")
+        scenario_data["environment"]["network"] = {
+            "segments": [
+                {
+                    "name": "workstations",
+                    "cidr": "10.0.0.0/24",
+                    "exposure": "internal",
+                    "systems": ["TEST-01"],
+                }
+            ],
+            "sensors": [
+                {
+                    "type": "network",
+                    "name": "core-zeek",
+                    "monitoring_segments": ["workstations"],
+                    "log_formats": ["zeek_conn"],
+                }
+            ],
+        }
+        scenario = Scenario.model_validate(scenario_data)
+        engine = GenerationEngine(scenario, tmp_path)
+
+        def initialize_fake_emitter() -> None:
+            engine.emitters = {"zeek_conn": Mock()}
+
+        with patch.object(engine, "_init_emitters", side_effect=initialize_fake_emitter):
+            engine._initialize()
+
+        compilation = engine.source_deployment_compilation
+        assert compilation.census.sensor_sources == 1
+        assert compilation.source_instances == ("zeek:core-zeek",)
+        assert engine.dispatcher.collection_deployment is compilation.deployment
+        assert len(compilation.digest) == 64
+        assert mock_activity_gen.called
 
     @patch("evidenceforge.generation.engine.core.ActivityGenerator")
     @patch("evidenceforge.generation.engine.emitter_setup.ZeekReporterEmitter")
@@ -619,7 +1328,7 @@ class TestGenerationEngine:
 
         mock_activity_instance = Mock()
         mock_activity_instance.get_baseline_pattern.return_value = []
-        mock_activity_gen.return_value = mock_activity_instance
+        mock_activity_gen.side_effect = _mock_activity_generator_factory(mock_activity_instance)
 
         engine = GenerationEngine(minimal_scenario, tmp_path)
         engine._initialize()
@@ -675,7 +1384,7 @@ class TestGenerationEngine:
 
         mock_activity_instance = Mock()
         mock_activity_instance.get_baseline_pattern.return_value = []
-        mock_activity_gen.return_value = mock_activity_instance
+        mock_activity_gen.side_effect = _mock_activity_generator_factory(mock_activity_instance)
 
         engine = GenerationEngine(minimal_scenario, tmp_path)
         engine._initialize()
@@ -783,7 +1492,7 @@ class TestGenerationEngine:
         mock_activity_instance.get_baseline_pattern.return_value = []
         mock_activity_instance.generate_process.return_value = 1234
         mock_activity_instance.generate_logon.return_value = "0x12345"
-        mock_activity_gen.return_value = mock_activity_instance
+        mock_activity_gen.side_effect = _mock_activity_generator_factory(mock_activity_instance)
 
         engine = GenerationEngine(scenario_with_storyline, tmp_path)
         engine._initialize()
@@ -844,7 +1553,7 @@ class TestGenerationEngine:
         mock_activity_instance.get_baseline_pattern.return_value = []
         mock_activity_instance.generate_process.return_value = 1234
         mock_activity_instance.generate_logon.return_value = "0x12345"
-        mock_activity_gen.return_value = mock_activity_instance
+        mock_activity_gen.side_effect = _mock_activity_generator_factory(mock_activity_instance)
 
         mock_gt_instance = Mock()
         mock_gt_gen.return_value = mock_gt_instance
@@ -904,7 +1613,7 @@ class TestGenerationEngine:
 
         mock_activity_instance = Mock()
         mock_activity_instance.get_baseline_pattern.return_value = []
-        mock_activity_gen.return_value = mock_activity_instance
+        mock_activity_gen.side_effect = _mock_activity_generator_factory(mock_activity_instance)
 
         mock_gt_instance = Mock()
         mock_gt_gen.return_value = mock_gt_instance
@@ -917,6 +1626,8 @@ class TestGenerationEngine:
         assert mock_gt_gen.call_args.kwargs["red_herring_events"] == []
         assert mock_gt_instance.generate.called
         assert (tmp_path / OBSERVATION_MANIFEST_FILENAME).exists()
+        payload = json.loads((tmp_path / OBSERVATION_MANIFEST_FILENAME).read_text(encoding="utf-8"))
+        assert "source_deployment_digest" not in payload
 
     @patch("evidenceforge.generation.engine.core.ActivityGenerator")
     @patch("evidenceforge.generation.engine.emitter_setup.ZeekReporterEmitter")
@@ -964,9 +1675,21 @@ class TestGenerationEngine:
 
         mock_activity_instance = Mock()
         mock_activity_instance.get_baseline_pattern.return_value = []
-        mock_activity_gen.return_value = mock_activity_instance
+        mock_activity_gen.side_effect = _mock_activity_generator_factory(mock_activity_instance)
 
-        engine = GenerationEngine(minimal_scenario, tmp_path)
+        minimal_scenario.environment.observation_overrides = [
+            SourceObservationOverride(
+                source_instance="windows_security:test-01",
+                enabled=False,
+            )
+        ]
+
+        data_dir = tmp_path / "data"
+        engine = GenerationEngine(
+            minimal_scenario,
+            data_dir,
+            ground_truth_dir=tmp_path,
+        )
         engine.generate()
 
         ground_truth = tmp_path / "GROUND_TRUTH.md"
@@ -976,6 +1699,7 @@ class TestGenerationEngine:
         assert ground_truth.exists()
         assert manifest.exists()
         assert collection_profile.exists()
+        assert not (data_dir / COLLECTION_PROFILE_FILENAME).exists()
         assert target_marker.read_text(encoding="utf-8") == "default\n"
         assert "No malicious activities" in ground_truth.read_text()
         assert "No malicious events were generated" in ground_truth.read_text()
@@ -987,12 +1711,16 @@ class TestGenerationEngine:
         assert "storyline" not in profile_text.lower()
         assert "verdict" not in profile_text.lower()
         assert profile["output_target"] == "default"
+        observation = json.loads(manifest.read_text(encoding="utf-8"))
+        assert (
+            observation["source_deployment_digest"] == engine.source_deployment_compilation.digest
+        )
         endpoint_family = next(
             family
             for family in profile["source_families"]
             if family["family"] == "endpoint_telemetry"
         )
-        assert "lifecycle closure rows after the primary window" in endpoint_family["tail_policy"]
+        assert "still active at the end remains open" in endpoint_family["tail_policy"]
 
     @patch("evidenceforge.generation.engine.core.ActivityGenerator")
     @patch("evidenceforge.generation.engine.emitter_setup.ZeekReporterEmitter")
@@ -1097,7 +1825,7 @@ class TestGenerationEngine:
 
         mock_activity_instance = Mock()
         mock_activity_instance.get_baseline_pattern.return_value = []
-        mock_activity_gen.return_value = mock_activity_instance
+        mock_activity_gen.side_effect = _mock_activity_generator_factory(mock_activity_instance)
 
         callback = Mock()
         engine = GenerationEngine(minimal_scenario, tmp_path, progress_callback=callback)
@@ -1159,24 +1887,13 @@ class TestGenerationEngine:
 
         mock_activity_instance = Mock()
         mock_activity_instance.get_baseline_pattern.return_value = []
-        mock_activity_gen.return_value = mock_activity_instance
+        mock_activity_gen.side_effect = _mock_activity_generator_factory(mock_activity_instance)
 
         # No progress_callback provided
         engine = GenerationEngine(minimal_scenario, tmp_path)
 
         # Should not raise exception
         engine.generate()
-
-    def test_get_next_event_record_id_increments(self, minimal_scenario, tmp_path):
-        """Event record IDs should increment sequentially."""
-        engine = GenerationEngine(minimal_scenario, tmp_path)
-
-        id1 = engine._get_next_event_record_id()
-        id2 = engine._get_next_event_record_id()
-        id3 = engine._get_next_event_record_id()
-
-        assert id2 == id1 + 1
-        assert id3 == id2 + 1
 
     @patch("evidenceforge.generation.engine.core.ActivityGenerator")
     @patch("evidenceforge.generation.engine.emitter_setup.ZeekReporterEmitter")
@@ -1224,7 +1941,7 @@ class TestGenerationEngine:
 
         mock_activity_instance = Mock()
         mock_activity_instance.generate_logon.return_value = "0x12345"
-        mock_activity_gen.return_value = mock_activity_instance
+        mock_activity_gen.side_effect = _mock_activity_generator_factory(mock_activity_instance)
 
         engine = GenerationEngine(scenario_with_storyline, tmp_path)
         engine._initialize()
@@ -1288,7 +2005,7 @@ class TestGenerationEngine:
         mock_activity_instance = Mock()
         mock_activity_instance.generate_connection.return_value = "UID123"
         mock_activity_instance.generate_logon.return_value = "0x12345"
-        mock_activity_gen.return_value = mock_activity_instance
+        mock_activity_gen.side_effect = _mock_activity_generator_factory(mock_activity_instance)
 
         engine = GenerationEngine(scenario_with_storyline, tmp_path)
         engine._initialize()
@@ -1359,7 +2076,7 @@ class TestGenerationEngine:
         mock_activity_instance = Mock()
         mock_activity_instance.get_baseline_pattern.return_value = [("logon", 1.0)]
         mock_activity_instance.execute_baseline_activity.return_value = None
-        mock_activity_gen.return_value = mock_activity_instance
+        mock_activity_gen.side_effect = _mock_activity_generator_factory(mock_activity_instance)
 
         engine = GenerationEngine(minimal_scenario, tmp_path)
         engine._initialize()
@@ -1428,7 +2145,7 @@ class TestGenerationEngine:
         mock_load_format.return_value = mock_format_def
 
         mock_activity_instance = Mock()
-        mock_activity_gen.return_value = mock_activity_instance
+        mock_activity_gen.side_effect = _mock_activity_generator_factory(mock_activity_instance)
 
         engine = GenerationEngine(scenario_with_storyline, tmp_path)
         engine._initialize()

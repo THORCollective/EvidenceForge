@@ -22,7 +22,7 @@
 
 [project]
 name = "evidence-forge"
-version = "1.12.0"
+version = "2.1.2"
 description = "Generate realistic synthetic security logs for cybersecurity threat hunting training and research"
 readme = "README.md"
 license = "MIT"
@@ -30,17 +30,19 @@ license-files = ["LICENSE"]
 authors = [
     { name = "Cisco Talos" }
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "click>=8.4.2",
     "pydantic>=2.13.4",
-    "typer>=0.26.8",
+    "typer>=0.27.1",
     "rich>=15.0.0",
     "pyyaml>=6.0",
-    "pytz>=2026.2",
+    "pytz>=2026.3.post1",
     "jinja2>=3.1.0",
-    "json-logic-qubit>=0.9.1",
     "python-dotenv>=1.2.2",
+    "cryptography>=50.0.0",
+    "psutil>=7.0.0",
+    "tzdata>=2026.4 ; sys_platform == 'win32'",
 ]
 
 [project.scripts]
@@ -59,8 +61,8 @@ dev = [
     "pytest-asyncio>=1.4.0",
     "pytest-mock>=3.12.0",
     "pytest-benchmark>=4.0.0",
-    "ruff>=0.15.20",
-    "pre-commit>=4.6.0",
+    "ruff>=0.16.2",
+    "pre-commit>=4.6.1",
 ]
 
 [build-system]
@@ -81,13 +83,16 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 markers = [
-    "slow: Tests requiring large dataset generation (100+ users, minutes to run)",
+    "slow: Extended release-gate tests excluded from the routine inner-loop suite",
+    "soak: Exceptional scale, duration, exhaustive-matrix, or full-demo diagnostics",
     "external_parser: Tests that run third-party parser containers",
 ]
 addopts = [
     "-v",
     "--strict-markers",
     "--tb=short",
+    "-m",
+    "not slow and not soak",
 ]
 filterwarnings = [
     "error",
@@ -117,8 +122,9 @@ fail_under = 70
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 src = ["src", "tests"]
+extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = [

@@ -27,11 +27,11 @@ from __future__ import annotations
 import random
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
-from evidenceforge.events.contexts import HttpContext
+from evidenceforge.events.contexts import HttpContext, HttpRequestEntityContext
 from evidenceforge.generation.actions.base import ActionAnchor
 from evidenceforge.generation.activity import browsing_session
 from evidenceforge.generation.activity.http_content import (
@@ -39,7 +39,9 @@ from evidenceforge.generation.activity.http_content import (
     is_stable_resource_path,
     response_mime_types_for_status,
 )
+from evidenceforge.generation.baseline_timing import BaselineTimingPlanner
 from evidenceforge.generation.state_manager import StateManager
+from evidenceforge.generation.timing import TimingRuntime
 from evidenceforge.utils.rng import _stable_seed
 from evidenceforge.utils.time import ensure_utc
 
@@ -124,6 +126,25 @@ class BrowserSessionActionBundle:
     executor: BrowserSessionExecutor
     rng: random.Random
     static_cache_seen: dict[tuple[str, str, str], int] | None = None
+    timing_runtime: TimingRuntime | None = None
+
+    @property
+    def resolved_timing_runtime(self) -> TimingRuntime | None:
+        """Return a real injected runtime without accepting mock-like adapters."""
+
+        if isinstance(self.timing_runtime, TimingRuntime):
+            return self.timing_runtime
+        candidate = getattr(self.executor, "timing_runtime", None)
+        return candidate if isinstance(candidate, TimingRuntime) else None
+
+    @property
+    def timing(self) -> BaselineTimingPlanner:
+        """Return the engine timing runtime or an isolated direct-call adapter."""
+
+        runtime = self.resolved_timing_runtime
+        if runtime is not None:
+            return BaselineTimingPlanner(runtime)
+        return BaselineTimingPlanner.compatibility(self.request.time)
 
     @property
     def anchor(self) -> ActionAnchor:
@@ -157,6 +178,8 @@ class BrowserSessionActionBundle:
                 require_browser_like_domain=request.require_browser_like_domain,
                 transfer_variant_key=request.transfer_variant_key,
                 request_time=request.time,
+                timing_runtime=self.resolved_timing_runtime,
+                timing_stable_id=request.stable_id,
             )
         visible_requests, page_load_count = self._visible_requests(session_requests)
         visible_requests = self._requests_before_deadline(visible_requests)
@@ -167,23 +190,24 @@ class BrowserSessionActionBundle:
         request_plan, request_groups = _plan_http_request_groups(
             visible_requests,
             request_body_floor=request.request_body_floor,
+            timing=self.timing,
+            stable_id=request.stable_id,
         )
         planned_requests = sorted(
             enumerate(visible_requests),
             key=lambda item: (request_plan[item[0]][3], item[0]),
         )
-
         first_uid = ""
         request_count = 0
         for req_index, req in planned_requests:
-            group_key, trans_depth, first_in_group, emit_offset_ms = request_plan[req_index]
+            group_key, trans_depth, first_in_group, emit_offset_us = request_plan[req_index]
             group = request_groups[group_key]
             uid = self._emit_request(
                 req=req,
                 group=group,
                 trans_depth=trans_depth,
                 first_in_group=first_in_group,
-                emit_offset_ms=emit_offset_ms,
+                emit_offset_us=emit_offset_us,
             )
             if uid and not first_uid:
                 first_uid = uid
@@ -207,14 +231,16 @@ class BrowserSessionActionBundle:
         request_plan, _request_groups = _plan_http_request_groups(
             requests,
             request_body_floor=self.request.request_body_floor,
+            timing=self.timing,
+            stable_id=self.request.stable_id,
         )
         base_time = ensure_utc(self.request.time)
         deadline = ensure_utc(self.request.latest_request_time)
         visible: list[browsing_session.BrowsingRequest] = []
         current_page_allowed = False
         for index, req in enumerate(requests):
-            _group_key, _trans_depth, _first_in_group, emit_offset_ms = request_plan[index]
-            req_ts = base_time + timedelta(milliseconds=emit_offset_ms)
+            _group_key, _trans_depth, _first_in_group, emit_offset_us = request_plan[index]
+            req_ts = base_time + timedelta(microseconds=emit_offset_us)
             if req_ts >= deadline:
                 if req.is_page_load:
                     current_page_allowed = False
@@ -241,6 +267,8 @@ class BrowserSessionActionBundle:
                 require_browser_like_domain=self.request.require_browser_like_domain,
                 transfer_variant_key=self.request.transfer_variant_key,
                 request_time=self.request.time,
+                timing_runtime=self.resolved_timing_runtime,
+                timing_stable_id=self.request.stable_id,
             )
 
         page_bounds = {
@@ -251,7 +279,7 @@ class BrowserSessionActionBundle:
         request_count = self.rng.randint(*page_bounds)
         route_weights = [float(getattr(route, "weight", 1.0)) for route in routes]
         requests: list[browsing_session.BrowsingRequest] = []
-        elapsed_ms = 0
+        elapsed_us = 0
         referrer = ""
         for index in range(request_count):
             route = self.rng.choices(routes, weights=route_weights, k=1)[0]
@@ -270,6 +298,18 @@ class BrowserSessionActionBundle:
             path = self._render_route_path(str(getattr(route, "path", "/")))
             content_type = (
                 str(getattr(profile, "content_type", "text/html")) if profile else "text/html"
+            )
+            request_content_type = (
+                str(getattr(profile, "request_content_type", "") or "") if profile else ""
+            )
+            request_wire_filename = (
+                str(getattr(profile, "request_wire_filename", "") or "") if profile else ""
+            )
+            request_multipart_spec = (
+                getattr(profile, "request_multipart", None) if profile else None
+            )
+            response_multipart_spec = (
+                getattr(profile, "response_multipart", None) if profile else None
             )
             req_range = getattr(profile, "request_body_bytes", None) if profile else None
             resp_range = getattr(profile, "response_body_bytes", None) if profile else None
@@ -290,10 +330,88 @@ class BrowserSessionActionBundle:
                     transfer_variant_key=self.request.transfer_variant_key,
                 )
             )
-            elapsed_ms += self.rng.randint(250, 2400) if index else 0
+            request_multipart = None
+            response_multipart = None
+            legacy_wire_filename = bool(request_wire_filename and request_multipart_spec is None)
+            if legacy_wire_filename:
+                from evidenceforge.models.http import HttpMultipartEntitySpec
+
+                request_multipart_spec = HttpMultipartEntitySpec.model_validate(
+                    {
+                        "media_type": "multipart/form-data",
+                        "parts": [
+                            {
+                                "name": "file",
+                                "body_len": 0,
+                                "filename": request_wire_filename,
+                                "content_type": request_content_type or "application/octet-stream",
+                            }
+                        ],
+                    }
+                )
+            if request_multipart_spec is not None or response_multipart_spec is not None:
+                from evidenceforge.generation.activity.http_multipart import (
+                    build_http_multipart_context,
+                )
+
+                stable_key = f"{self.request.stable_id}:route:{index}:{method}:{path}"
+                if request_multipart_spec is not None:
+                    if legacy_wire_filename:
+                        envelope = build_http_multipart_context(
+                            request_multipart_spec,
+                            stable_key=f"{stable_key}:request",
+                            user_agent=self.request.user_agent or "Mozilla/5.0",
+                        )
+                        if request_body_len > envelope.body_len:
+                            request_multipart_spec = request_multipart_spec.model_copy(
+                                update={
+                                    "parts": [
+                                        request_multipart_spec.parts[0].model_copy(
+                                            update={
+                                                "body_len": request_body_len - envelope.body_len
+                                            }
+                                        )
+                                    ]
+                                }
+                            )
+                        else:
+                            request_multipart_spec = None
+                    if request_multipart_spec is not None:
+                        request_multipart = build_http_multipart_context(
+                            request_multipart_spec,
+                            stable_key=f"{stable_key}:request",
+                            user_agent=self.request.user_agent or "Mozilla/5.0",
+                        )
+                        request_body_len = request_multipart.body_len
+                        request_content_type = (
+                            f"{request_multipart.media_type}; boundary={request_multipart.boundary}"
+                        )
+                if response_multipart_spec is not None:
+                    response_multipart = build_http_multipart_context(
+                        response_multipart_spec,
+                        stable_key=f"{stable_key}:response",
+                        client_family="generic",
+                    )
+                    response_body_len = response_multipart.body_len
+            if index:
+                elapsed_us += round(
+                    self.timing.right_skew_seconds(
+                        relationship_key="browser.route.request_gap",
+                        stable_id=self.request.stable_id,
+                        minimum=0.250,
+                        median=0.680,
+                        maximum=2.400,
+                        sigma=0.78,
+                        host=getattr(self.request.source_system, "hostname", ""),
+                        lifecycle_id=self.request.stable_id,
+                        ordinal=index,
+                    )
+                    * 1_000_000
+                )
             requests.append(
                 browsing_session.BrowsingRequest(
-                    time_offset_ms=elapsed_ms,
+                    time_offset_ms=elapsed_us // 1_000,
+                    time_offset_remainder_us=elapsed_us % 1_000,
                     hostname=self.request.hostname,
                     path=path,
                     method=method,
@@ -304,6 +422,10 @@ class BrowserSessionActionBundle:
                     response_body_len=response_body_len,
                     request_body_len=request_body_len,
                     status_code=status,
+                    request_content_type=request_content_type,
+                    request_wire_filename=request_wire_filename,
+                    request_multipart=request_multipart,
+                    response_multipart=response_multipart,
                 )
             )
             referrer = browsing_session._make_referrer(  # noqa: SLF001
@@ -382,12 +504,12 @@ class BrowserSessionActionBundle:
         group: dict[str, int],
         trans_depth: int,
         first_in_group: bool,
-        emit_offset_ms: int,
+        emit_offset_us: int,
     ) -> str:
         """Emit one browser request as canonical connection/HTTP evidence."""
 
         request = self.request
-        req_ts = request.time + timedelta(milliseconds=emit_offset_ms)
+        req_ts = request.time + timedelta(microseconds=emit_offset_us)
         if request.set_current_time:
             self.executor.state_manager.set_current_time(req_ts)
 
@@ -395,7 +517,7 @@ class BrowserSessionActionBundle:
         conn_duration = self._connection_duration(
             group=group,
             first_in_group=first_in_group,
-            emit_offset_ms=emit_offset_ms,
+            emit_offset_us=emit_offset_us,
         )
         conn_orig_bytes = self._connection_orig_bytes(
             req=req,
@@ -409,6 +531,13 @@ class BrowserSessionActionBundle:
         )
         emit_dns = (request.emit_dns_on_page_load and req.is_page_load) or (
             req_hostname != request.hostname
+        )
+        http_context = self._http_context(
+            req=req,
+            req_hostname=req_hostname,
+            group=group,
+            trans_depth=trans_depth,
+            first_in_group=first_in_group,
         )
 
         generate_kwargs: dict[str, Any] = {
@@ -425,13 +554,7 @@ class BrowserSessionActionBundle:
             "suppress_prereq_dns": not emit_dns,
             "source_system": request.source_system,
             "hostname": req_hostname,
-            "http": self._http_context(
-                req=req,
-                req_hostname=req_hostname,
-                group=group,
-                trans_depth=trans_depth,
-                first_in_group=first_in_group,
-            ),
+            "http": http_context,
         }
         if request.pid != -1:
             generate_kwargs["pid"] = request.pid
@@ -477,14 +600,36 @@ class BrowserSessionActionBundle:
         *,
         group: dict[str, int],
         first_in_group: bool,
-        emit_offset_ms: int,
+        emit_offset_us: int,
     ) -> float:
         """Return a source-native duration for the parent TCP flow."""
 
+        host = getattr(self.request.source_system, "hostname", "")
+        stable_id = f"{self.request.stable_id}:{emit_offset_us}"
+
         if first_in_group:
-            remaining_ms = max(0, group["last_offset_ms"] - emit_offset_ms)
-            return (remaining_ms / 1000) + self.rng.uniform(1.25, 3.0)
-        return self.rng.uniform(self.request.secondary_duration_min, 2.0)
+            remaining_us = max(0, group["last_offset_us"] - emit_offset_us)
+            return (remaining_us / 1_000_000) + self.timing.right_skew_seconds(
+                relationship_key="browser.connection.primary_tail",
+                stable_id=stable_id,
+                minimum=1.250,
+                median=1.620,
+                maximum=3.000,
+                sigma=0.48,
+                host=host,
+                lifecycle_id=self.request.stable_id,
+            )
+        minimum = max(0.000001, self.request.secondary_duration_min)
+        return self.timing.right_skew_seconds(
+            relationship_key="browser.connection.secondary_duration",
+            stable_id=stable_id,
+            minimum=minimum,
+            median=min(2.0, max(minimum + 0.000001, minimum * 2.6)),
+            maximum=max(2.0, minimum + 0.000002),
+            sigma=0.72,
+            host=host,
+            lifecycle_id=self.request.stable_id,
+        )
 
     def _connection_orig_bytes(
         self,
@@ -536,6 +681,23 @@ class BrowserSessionActionBundle:
                     referrer = ""
             except ValueError:
                 referrer = ""
+        request_entity = None
+        if (
+            req.request_multipart is None
+            and req.request_body_len > 0
+            and (req.request_content_type or req.request_wire_filename)
+        ):
+            request_mime = req.request_content_type or "application/octet-stream"
+            request_entity = HttpRequestEntityContext(
+                size=req.request_body_len,
+                mime_type=request_mime,
+                content_identity=(
+                    f"application-request:{req_hostname}:{req.path}:{req.method}:"
+                    f"{req.request_body_len}:{request_mime}:{req.request_wire_filename}"
+                ),
+                encoding="multipart" if req.request_wire_filename else "raw",
+                wire_filename=req.request_wire_filename,
+            )
         return HttpContext(
             method=req.method,
             host=req_hostname,
@@ -543,7 +705,11 @@ class BrowserSessionActionBundle:
             version="1.1",
             user_agent=request.user_agent or "",
             request_body_len=req.request_body_len,
+            request_content_type=req.request_content_type,
+            request_entity=request_entity,
+            request_multipart=req.request_multipart,
             response_body_len=req.response_body_len,
+            response_multipart=req.response_multipart,
             flow_request_body_len=(
                 group["request_body_len"]
                 if request.include_flow_context and first_in_group
@@ -575,6 +741,8 @@ def _plan_http_request_groups(
     requests: list[browsing_session.BrowsingRequest],
     *,
     request_body_floor: int = 0,
+    timing: BaselineTimingPlanner | None = None,
+    stable_id: str = "",
 ) -> tuple[dict[int, _HttpPlanValue], dict[_HttpGroupKey, dict[str, int]]]:
     """Plan source-native HTTP transaction depth and parent flow accounting."""
 
@@ -582,6 +750,7 @@ def _plan_http_request_groups(
     active_group: dict[str, _HttpGroupKey] = {}
     depths: dict[_HttpGroupKey, int] = {}
     last_emit_offset: dict[_HttpGroupKey, int] = {}
+    previous_request: dict[_HttpGroupKey, browsing_session.BrowsingRequest] = {}
     plan: dict[int, _HttpPlanValue] = {}
     groups: dict[_HttpGroupKey, dict[str, int]] = {}
 
@@ -595,24 +764,40 @@ def _plan_http_request_groups(
         group_key = active_group[hostname]
         depths[group_key] += 1
         trans_depth = depths[group_key]
-        emit_offset_ms = req.time_offset_ms
+        emit_offset_us = (req.time_offset_ms * 1_000) + req.time_offset_remainder_us
         if group_key in last_emit_offset:
-            emit_offset_ms = max(emit_offset_ms, last_emit_offset[group_key] + 600)
-        last_emit_offset[group_key] = emit_offset_ms
-        plan[index] = (group_key, trans_depth, trans_depth == 1, emit_offset_ms)
+            prior = previous_request[group_key]
+            planner = timing or BaselineTimingPlanner.compatibility(
+                datetime(1970, 1, 1, tzinfo=UTC)
+            )
+            lifecycle_id = stable_id or f"http-group:{group_key[0]}:{group_key[1]}"
+            minimum_gap_us = round(
+                planner.http_persistent_request_gap_seconds(
+                    stable_id=lifecycle_id,
+                    host=group_key[0],
+                    lifecycle_id=lifecycle_id,
+                    ordinal=trans_depth,
+                    response_body_bytes=prior.response_body_len,
+                )
+                * 1_000_000
+            )
+            emit_offset_us = max(emit_offset_us, last_emit_offset[group_key] + minimum_gap_us)
+        last_emit_offset[group_key] = emit_offset_us
+        previous_request[group_key] = req
+        plan[index] = (group_key, trans_depth, trans_depth == 1, emit_offset_us)
 
         group = groups.setdefault(
             group_key,
             {
-                "first_offset_ms": emit_offset_ms,
-                "last_offset_ms": emit_offset_ms,
+                "first_offset_us": emit_offset_us,
+                "last_offset_us": emit_offset_us,
                 "request_body_len": 0,
                 "response_body_len": 0,
                 "request_count": 0,
             },
         )
-        group["first_offset_ms"] = min(group["first_offset_ms"], emit_offset_ms)
-        group["last_offset_ms"] = max(group["last_offset_ms"], emit_offset_ms)
+        group["first_offset_us"] = min(group["first_offset_us"], emit_offset_us)
+        group["last_offset_us"] = max(group["last_offset_us"], emit_offset_us)
         group["request_body_len"] += max(request_body_floor, req.request_body_len)
         group["response_body_len"] += req.response_body_len
         group["request_count"] += 1

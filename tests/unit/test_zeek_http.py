@@ -24,14 +24,16 @@
 
 import json
 import tempfile
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from evidenceforge.events.base import SecurityEvent
-from evidenceforge.events.contexts import HttpContext, NetworkContext
+from evidenceforge.events.base import OccurrenceBuilder
+from evidenceforge.events.contexts import FileTransferContext, HttpContext
 from evidenceforge.formats import load_format
 from evidenceforge.generation.emitters.zeek import ZeekEmitter
 from evidenceforge.generation.emitters.zeek_http import ZeekHttpEmitter
+from tests.network_factories import network_plan
 
 
 class TestHttpFormatAccuracy:
@@ -196,10 +198,10 @@ class TestHttpFormatAccuracy:
         with tempfile.TemporaryDirectory() as tmpdir:
             output = Path(tmpdir) / "http.json"
             emitter = ZeekHttpEmitter(fmt, output)
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.0.1",
                     src_port=50000,
                     dst_ip="10.0.0.10",
@@ -233,10 +235,10 @@ class TestHttpFormatAccuracy:
         with tempfile.TemporaryDirectory() as tmpdir:
             output = Path(tmpdir) / "http.json"
             emitter = ZeekHttpEmitter(fmt, output)
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.0.1",
                     src_port=50000,
                     dst_ip="93.184.216.34",
@@ -256,6 +258,13 @@ class TestHttpFormatAccuracy:
                     resp_fuids=["FHttpFileAbsent1"],
                     resp_mime_types=["text/html"],
                 ),
+                file_transfer=FileTransferContext(
+                    fuid="FHttpFileAbsent1",
+                    source="HTTP",
+                    mime_type="text/html",
+                    seen_bytes=2048,
+                    total_bytes=2048,
+                ),
                 _observed_formats={"zeek_conn", "zeek_http"},
             )
 
@@ -267,6 +276,53 @@ class TestHttpFormatAccuracy:
         assert "resp_fuids" not in data
         assert "resp_mime_types" not in data
 
+    def test_originator_file_vectors_include_mime_and_optional_filename(self):
+        """Request file vectors render with their request-side Zeek field names."""
+
+        fmt = load_format("zeek_http")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "http.json"
+            emitter = ZeekHttpEmitter(fmt, output)
+            event = OccurrenceBuilder(
+                timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
+                event_type="connection",
+                network=network_plan(
+                    src_ip="10.0.0.1",
+                    src_port=50000,
+                    dst_ip="93.184.216.34",
+                    dst_port=80,
+                    protocol="tcp",
+                    service="http",
+                    zeek_uid="CRequestFile12345",
+                    duration=1.0,
+                ),
+                http=HttpContext(
+                    method="POST",
+                    host="some.site",
+                    uri="/upload",
+                    request_body_len=42,
+                    orig_fuids=("FRequestFile12345",),
+                    orig_filenames=("payload.bin",),
+                    orig_mime_types=("application/octet-stream",),
+                ),
+                file_transfer=FileTransferContext(
+                    fuid="FRequestFile12345",
+                    source="HTTP",
+                    filename="payload.bin",
+                    mime_type="application/octet-stream",
+                    is_orig=True,
+                    seen_bytes=42,
+                    total_bytes=42,
+                ),
+            )
+            emitter.emit(event)
+            emitter.close()
+            data = json.loads(output.read_text().splitlines()[0])
+
+        assert data["orig_fuids"] == ["FRequestFile12345"]
+        assert data["orig_filenames"] == ["payload.bin"]
+        assert data["orig_mime_types"] == ["application/octet-stream"]
+
 
 class TestHttpCanHandle:
     """Verify can_handle() filtering."""
@@ -274,10 +330,10 @@ class TestHttpCanHandle:
     def test_accepts_connection_with_http(self):
         fmt = load_format("zeek_http")
         emitter = ZeekHttpEmitter(fmt, Path("/tmp/test.json"))
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.0.1", src_port=50000, dst_ip="8.8.8.8", dst_port=80, protocol="tcp"
             ),
             http=HttpContext(method="GET", host="example.com", uri="/"),
@@ -287,10 +343,10 @@ class TestHttpCanHandle:
     def test_rejects_without_http_context(self):
         fmt = load_format("zeek_http")
         emitter = ZeekHttpEmitter(fmt, Path("/tmp/test.json"))
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.0.1", src_port=50000, dst_ip="8.8.8.8", dst_port=80, protocol="tcp"
             ),
         )
@@ -299,10 +355,10 @@ class TestHttpCanHandle:
     def test_accepts_application_layer_transactions(self):
         fmt = load_format("zeek_http")
         emitter = ZeekHttpEmitter(fmt, Path("/tmp/test.json"))
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.0.1",
                 src_port=50000,
                 dst_ip="8.8.8.8",
@@ -318,10 +374,10 @@ class TestHttpCanHandle:
     def test_conn_emitter_rejects_application_layer_transactions(self):
         fmt = load_format("zeek_conn")
         emitter = ZeekEmitter(fmt, Path("/tmp/test.json"))
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.0.1",
                 src_port=50000,
                 dst_ip="8.8.8.8",
@@ -343,10 +399,10 @@ class TestHttpRenderTiming:
         output = tmp_path / "http.json"
         emitter = ZeekHttpEmitter(fmt, output, buffer_size=1)
         base_ts = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=base_ts,
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.0.1",
                 src_port=50000,
                 dst_ip="93.184.216.34",
@@ -366,29 +422,27 @@ class TestHttpRenderTiming:
         offset_us = round((data["ts"] - base_ts.timestamp()) * 1_000_000)
         assert offset_us % 1000 != 0
 
-    def test_emit_preserves_same_uid_transaction_timestamp_order(self, tmp_path, monkeypatch):
-        """Per-request analyzer jitter must not reorder same-UID transaction depths."""
+    def test_direct_calls_do_not_repair_same_uid_transaction_order(self, tmp_path, monkeypatch):
+        """Direct compatibility timing remains event-local instead of emitter-stateful."""
         fmt = load_format("zeek_http")
         output = tmp_path / "http.json"
         emitter = ZeekHttpEmitter(fmt, output, buffer_size=1)
         base_ts = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
         deltas = [timedelta(milliseconds=450), timedelta(milliseconds=1)]
 
-        def fake_source_time(event, source_key, **_kwargs):
-            if source_key == "source.zeek_conn_start":
-                return event.timestamp
+        def fake_source_time(event, _timing_key):
             return event.timestamp + deltas.pop(0)
 
         monkeypatch.setattr(
-            "evidenceforge.generation.emitters.zeek_http._SOURCE_TIMING.source_time",
+            "evidenceforge.generation.emitters.zeek_http.direct_zeek_source_time",
             fake_source_time,
         )
 
-        def make_event(timestamp: datetime, trans_depth: int, uri: str) -> SecurityEvent:
-            return SecurityEvent(
+        def make_event(timestamp: datetime, trans_depth: int, uri: str) -> OccurrenceBuilder:
+            return OccurrenceBuilder(
                 timestamp=timestamp,
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.0.1",
                     src_port=50000,
                     dst_ip="93.184.216.34",
@@ -410,33 +464,92 @@ class TestHttpRenderTiming:
         emitter.close()
 
         rows = [json.loads(line) for line in output.read_text().splitlines()]
-        assert [row["trans_depth"] for row in rows] == [1, 2]
-        assert rows[1]["ts"] > rows[0]["ts"]
+        assert [row["trans_depth"] for row in rows] == [2, 1]
+        assert rows[0]["ts"] < rows[1]["ts"]
 
-    def test_application_layer_transaction_stays_inside_first_parent_lifetime(
+    def test_direct_request_times_are_independent_of_emitter_call_order(self, tmp_path):
+        """Stateless compatibility timing is invariant to direct emitter call order."""
+        fmt = load_format("zeek_http")
+        reverse_output = tmp_path / "http-reverse.json"
+        forward_output = tmp_path / "http-forward.json"
+        reverse_emitter = ZeekHttpEmitter(fmt, reverse_output, buffer_size=10)
+        forward_emitter = ZeekHttpEmitter(fmt, forward_output, buffer_size=10)
+        base_ts = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+
+        def make_event(trans_depth: int, offset_ms: int) -> OccurrenceBuilder:
+            request_time = base_ts + timedelta(milliseconds=offset_ms)
+            network = network_plan(
+                src_ip="10.0.0.1",
+                src_port=50000,
+                dst_ip="93.184.216.34",
+                dst_port=80,
+                protocol="tcp",
+                service="http",
+                zeek_uid="ChttpCanonicalOrder",
+                duration=1.0,
+                source_visible_start_time=base_ts,
+                source_visible_close_time=base_ts + timedelta(seconds=1),
+                orig_bytes=500,
+                resp_bytes=1500,
+                conn_state="SF",
+                history="ShADadfF",
+            )
+            network = replace(
+                network,
+                stable_id="network:http-canonical-order",
+                hostname="example.com",
+                phase_times=(
+                    ("transport_start", base_ts),
+                    ("transport_close", base_ts + timedelta(seconds=1)),
+                ),
+            )
+            return OccurrenceBuilder(
+                timestamp=request_time,
+                event_type="connection",
+                network=network,
+                http=HttpContext(
+                    method="GET",
+                    host="example.com",
+                    uri=f"/asset-{trans_depth}",
+                    trans_depth=trans_depth,
+                    canonical_request_time=request_time,
+                ),
+            )
+
+        reverse_emitter.emit(make_event(2, 20))
+        reverse_emitter.emit(make_event(1, 10))
+        reverse_emitter.close()
+        forward_emitter.emit(make_event(1, 10))
+        forward_emitter.emit(make_event(2, 20))
+        forward_emitter.close()
+
+        reverse_rows = [json.loads(line) for line in reverse_output.read_text().splitlines()]
+        forward_rows = [json.loads(line) for line in forward_output.read_text().splitlines()]
+        assert reverse_rows == forward_rows
+        assert {row["trans_depth"] for row in reverse_rows} == {1, 2}
+
+    def test_application_layer_transaction_does_not_reuse_emitter_parent_bounds(
         self, tmp_path, monkeypatch
     ):
-        """Repeated same-UID transactions reuse the first observed parent-flow bounds."""
+        """Repeated same-UID transactions do not retain emitter-local flow bounds."""
         fmt = load_format("zeek_http")
         output = tmp_path / "http.json"
         emitter = ZeekHttpEmitter(fmt, output, buffer_size=1)
         base_ts = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
 
-        def fake_source_time(event, source_key, **_kwargs):
-            if source_key == "source.zeek_conn_start":
-                return event.timestamp
+        def fake_source_time(event, _timing_key):
             return event.timestamp + timedelta(milliseconds=250)
 
         monkeypatch.setattr(
-            "evidenceforge.generation.emitters.zeek_http._SOURCE_TIMING.source_time",
+            "evidenceforge.generation.emitters.zeek_http.direct_zeek_source_time",
             fake_source_time,
         )
 
-        def make_event(timestamp: datetime, trans_depth: int, uri: str) -> SecurityEvent:
-            return SecurityEvent(
+        def make_event(timestamp: datetime, trans_depth: int, uri: str) -> OccurrenceBuilder:
+            return OccurrenceBuilder(
                 timestamp=timestamp,
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.0.1",
                     src_port=50000,
                     dst_ip="93.184.216.34",
@@ -461,4 +574,4 @@ class TestHttpRenderTiming:
 
         rows = [json.loads(line) for line in output.read_text().splitlines()]
         parent_end = base_ts.timestamp() + 0.5
-        assert rows[1]["ts"] <= parent_end
+        assert rows[1]["ts"] > parent_end

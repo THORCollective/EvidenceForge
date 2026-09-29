@@ -22,8 +22,12 @@
 
 """Tests for shared syslog-family rendering helpers."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
+from evidenceforge.events.base import OccurrenceBuilder
+from evidenceforge.events.contexts import AuthContext, HostContext, SmbContext, SyslogContext
+from evidenceforge.formats import load_format
 from evidenceforge.generation.emitters.syslog import (
     SyslogEmitter,
     _fallback_linux_uid,
@@ -37,6 +41,94 @@ from evidenceforge.generation.emitters.syslog_family import (
     syslog_family_writer_path,
     syslog_priority,
 )
+from tests.network_factories import network_plan
+
+
+def _samba_event(
+    event_type: str,
+    timestamp: datetime,
+    *,
+    audit: str = "standard",
+    phase: str = "read",
+    result: str = "success",
+) -> OccurrenceBuilder:
+    """Return one source-native Samba occurrence for renderer tests."""
+    client = HostContext(
+        hostname="LNX-CLIENT-01",
+        ip="10.30.0.10",
+        os="Ubuntu 24.04",
+        os_category="linux",
+        system_type="workstation",
+        fqdn="lnx-client-01.example.test",
+    )
+    server = HostContext(
+        hostname="SAMBA-01",
+        ip="10.30.0.20",
+        os="Ubuntu Server 24.04",
+        os_category="linux",
+        system_type="server",
+        fqdn="samba-01.example.test",
+    )
+    auth = AuthContext(
+        username="finance-reader",
+        logon_id="0xinternal",
+        source_ip=client.ip,
+        source_port=51515,
+        session_kind="smb",
+        auth_protocol="kerberos",
+        smb_principal="CORP\\finance-reader",
+        auth_session_ref="smb-auth-1",
+        effective_uid=20041,
+        effective_gid=20010,
+    )
+    if event_type in {"logon", "logoff"}:
+        return OccurrenceBuilder(
+            timestamp=timestamp,
+            event_type=event_type,
+            src_host=client if event_type == "logon" else None,
+            dst_host=server,
+            auth=auth,
+        )
+    smb = SmbContext(
+        phase=phase,
+        operation="read",
+        purpose="unit test",
+        session_id="smb-session-1",
+        tree_id="tree-1",
+        share_ref="SAMBA-01.finance",
+        share_name="Finance",
+        result=result,
+        server_path="/srv/samba/data/Reports/forecast.xlsx",
+        share_local_path="/srv/samba/data",
+        file_id="file-1",
+        filesystem="xfs",
+        backing_filesystem="xfs",
+        advertised_filesystem="NTFS",
+        server_platform="linux",
+        provider="samba",
+        client_access="cifs_mount",
+        audit=audit,
+    )
+    return OccurrenceBuilder(
+        timestamp=timestamp,
+        event_type=event_type,
+        src_host=client,
+        dst_host=server,
+        auth=auth,
+        smb=smb,
+        network=network_plan(
+            src_ip=client.ip,
+            src_port=51515,
+            dst_ip=server.ip,
+            dst_port=445,
+            protocol="tcp",
+            service="smb",
+            zeek_uid="CSambaSyslog01",
+            initiating_pid=-1,
+            responding_pid=4242,
+            application_layer_only=True,
+        ),
+    )
 
 
 def test_render_rfc3164_syslog_uses_bsd_timestamp_and_pid() -> None:
@@ -111,35 +203,112 @@ def test_rfc3164_timestamp_sort_key_handles_single_digit_day() -> None:
     )
 
 
-def test_normalize_sshd_child_pids_preserves_session_mapping_and_monotonicity() -> None:
-    lines = [
-        "<86>1 2024-03-18T12:37:10.283139Z app sshd 839794 - - Connection from 10.0.1.10 port 50000 on 10.0.2.10 port 22",
-        "<86>1 2024-03-18T12:37:11.001000Z app sshd 839794 - - Accepted password for admin from 10.0.1.10 port 50000 ssh2",
-        "<86>1 2024-03-18T12:45:43.059582Z app sshd 838687 - - Connection from 10.0.1.11 port 50001 on 10.0.2.10 port 22",
-        "<86>1 2024-03-18T12:45:44.100000Z app sshd 838687 - - Accepted password for admin from 10.0.1.11 port 50001 ssh2",
+def test_syslog_close_preserves_canonical_sshd_child_pids(tmp_path) -> None:
+    """Source rendering must not rewrite canonical sshd process identities."""
+    emitter = SyslogEmitter(load_format("syslog"), tmp_path, threaded=False)
+    host = HostContext(
+        hostname="app",
+        ip="10.0.2.10",
+        os="Ubuntu 24.04",
+        os_category="linux",
+        system_type="server",
+        fqdn="app.example",
+    )
+    rows = [
+        (datetime(2024, 3, 18, 12, 37, 10, tzinfo=UTC), 839794, "10.0.1.10", 50000),
+        (datetime(2024, 3, 18, 12, 45, 43, tzinfo=UTC), 838687, "10.0.1.11", 50001),
     ]
+    for timestamp, pid, source_ip, source_port in rows:
+        emitter.emit(
+            OccurrenceBuilder(
+                timestamp=timestamp,
+                event_type="syslog",
+                src_host=host,
+                syslog=SyslogContext(
+                    app_name="sshd",
+                    pid=pid,
+                    facility=10,
+                    severity=6,
+                    message=(
+                        f"Connection from {source_ip} port {source_port} on 10.0.2.10 port 22"
+                    ),
+                ),
+            )
+        )
+    emitter.close()
 
-    normalized = SyslogEmitter._normalize_sshd_child_pids_for_lines(lines, "app.example")
-
-    pids = [int(line.split(" sshd ")[1].split(" ")[0]) for line in normalized]
-    assert pids[0] == pids[1]
-    assert pids[2] == pids[3]
-    assert pids[2] > pids[0]
+    lines = (tmp_path / "app.example" / "syslog.log").read_text().splitlines()
+    pids = [int(line.split(" sshd ")[1].split(" ")[0]) for line in lines]
+    assert pids == [839794, 838687]
 
 
-def test_normalize_sshd_child_pids_does_not_let_orphan_closes_rewrite_session_open() -> None:
-    lines = [
-        "<86>1 2024-03-18T15:51:34.963802Z app sshd 784323 - - Connection from 10.0.1.33 port 63690 on 10.0.2.10 port 22",
-        "<86>1 2024-03-18T15:51:35.491983Z app sshd 784323 - - Accepted publickey for user from 10.0.1.33 port 63690 ssh2",
-        "<86>1 2024-03-18T15:52:24.705921Z app sshd 784329 - - pam_unix(sshd:session): session closed for user other",
-        "<86>1 2024-03-18T15:54:22.189035Z app sshd 784327 - - Connection from 10.0.1.31 port 63843 on 10.0.2.10 port 22",
-        "<86>1 2024-03-18T15:54:23.876283Z app sshd 784327 - - Accepted password for user from 10.0.1.31 port 63843 ssh2",
+def test_samba_lifecycle_and_standard_audit_render_on_server(tmp_path) -> None:
+    """Samba lifecycle and selected VFS rows should remain server-local."""
+    emitter = SyslogEmitter(load_format("syslog"), tmp_path, threaded=False)
+    start = datetime(2024, 3, 18, 12, 0, 0, tzinfo=UTC)
+    events = [
+        _samba_event("logon", start),
+        _samba_event(
+            "smb_tree_connect",
+            start + timedelta(milliseconds=40),
+            phase="tree_connect",
+        ),
+        _samba_event("smb_file_open", start + timedelta(milliseconds=80), phase="open"),
+        _samba_event("smb_file_read", start + timedelta(milliseconds=100), phase="read"),
+        _samba_event("smb_file_close", start + timedelta(milliseconds=120), phase="close"),
+        _samba_event("logoff", start + timedelta(seconds=2)),
     ]
+    for event in events:
+        if emitter.can_handle(event):
+            emitter.emit(event)
+    emitter.close()
 
-    normalized = SyslogEmitter._normalize_sshd_child_pids_for_lines(lines, "app.example")
+    server_log = tmp_path / "samba-01.example.test" / "syslog.log"
+    assert server_log.exists()
+    assert not (tmp_path / "lnx-client-01.example.test" / "syslog.log").exists()
+    lines = server_log.read_text(encoding="utf-8").splitlines()
 
-    pids = [int(line.split(" sshd ")[1].split(" ")[0]) for line in normalized]
-    assert pids == [784323, 784323, 784329, 784327, 784327]
+    assert len(lines) == 5
+    assert " smbd - - - Authentication for user [CORP\\finance-reader]" in lines[0]
+    assert "smbd 4242 - - connect to service Finance" in lines[1]
+    assert "uid=20041, gid=20010" in lines[1]
+    assert "smbd_audit: CORP\\finance-reader|10.30.0.10|Finance|open|success|" in lines[2]
+    assert "smbd_audit: CORP\\finance-reader|10.30.0.10|Finance|close|success|" in lines[3]
+    assert "/srv/samba/data/Reports/forecast.xlsx" in lines[2]
+    assert not any("|read|success|" in line for line in lines)
+    assert "smbd 4242 - - closed connection to service Finance" in lines[4]
+
+
+def test_samba_audit_profiles_gate_routine_file_rows() -> None:
+    """Minimal, standard, and high profiles should expose increasing VFS depth."""
+    emitter = SyslogEmitter(load_format("syslog"), Path("unused.log"), threaded=False)
+    timestamp = datetime(2024, 3, 18, 12, 0, 0, tzinfo=UTC)
+
+    assert not emitter.can_handle(
+        _samba_event("smb_file_read", timestamp, audit="minimal", phase="read")
+    )
+    assert not emitter.can_handle(
+        _samba_event(
+            "smb_file_read",
+            timestamp,
+            audit="minimal",
+            phase="read",
+            result="access_denied",
+        )
+    )
+    assert not emitter.can_handle(
+        _samba_event("smb_file_read", timestamp, audit="standard", phase="read")
+    )
+    assert emitter.can_handle(_samba_event("smb_file_read", timestamp, audit="high", phase="read"))
+    assert emitter.can_handle(
+        _samba_event(
+            "smb_file_open",
+            timestamp,
+            audit="standard",
+            phase="open",
+            result="access_denied",
+        )
+    )
 
 
 def test_normalize_logind_session_ids_preserves_monotonic_canonical_ids() -> None:
@@ -182,6 +351,22 @@ def test_normalize_logind_session_ids_repairs_backward_new_session() -> None:
     assert new_sessions[0] == 7616
     assert new_sessions[1] > 7616
     assert removed_session == 7616
+
+
+def test_normalize_logind_session_ids_preserves_observation_orphaned_close() -> None:
+    """A dropped opener must not split a canonical SSH identity from eCAR."""
+    lines = [
+        "<86>1 2024-03-18T12:04:40.000000Z linux01 systemd-logind 22523 - - New session 7616 of user root.",
+        "<86>1 2024-03-18T12:12:00.000000Z linux01 systemd-logind 22523 - - Removed session 8124.",
+        "<86>1 2024-03-18T12:20:09.000000Z linux01 systemd-logind 22523 - - New session 8240 of user admin.",
+    ]
+
+    normalized = SyslogEmitter._normalize_logind_session_ids_for_lines(
+        lines,
+        "linux01.example.test",
+    )
+
+    assert normalized == lines
 
 
 def test_backfill_missing_logind_pam_openers_adds_native_opener() -> None:
@@ -261,16 +446,3 @@ def test_normalize_sudo_session_lifecycles_preserves_non_rfc5424_order() -> None
     normalized = SyslogEmitter._normalize_sudo_session_lifecycles_for_lines(lines)
 
     assert normalized == lines
-
-
-def test_normalize_sshd_child_pids_skips_oversized_pid_without_crashing() -> None:
-    huge_pid = "9" * 5000
-    lines = [
-        f"<86>1 2024-03-18T12:37:10.283139Z app sshd {huge_pid} - - Connection from 10.0.1.10 port 50000 on 10.0.2.10 port 22",
-        "<86>1 2024-03-18T12:37:11.001000Z app sshd 100 - - Accepted password for admin from 10.0.1.10 port 50000 ssh2",
-    ]
-
-    normalized = SyslogEmitter._normalize_sshd_child_pids_for_lines(lines, "app.example")
-
-    assert normalized[0] == lines[0]
-    assert " sshd 100 " in normalized[1]

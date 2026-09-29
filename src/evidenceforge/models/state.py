@@ -33,6 +33,9 @@ runtime state tracking.
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from evidenceforge.events.lifecycle import SessionEndPlan
+from evidenceforge.events.network import NetworkTrafficLedger
+
 
 @dataclass
 class ActiveSession:
@@ -50,6 +53,7 @@ class ActiveSession:
         source_ip: Source IP address for the logon
         session_id: Windows terminal/session ID rendered by Security/Sysmon sources
         explorer_pid: PID of explorer.exe instance for this interactive session
+        windows_shell_bootstrapped: Whether the initial Windows shell chain was created
         process_tree_root: Root PID for this session's process tree
         last_activity_time: Last baseline activity timestamp (for login cooldown)
         network_close_time: Close time for a transport connection backing the session
@@ -64,9 +68,12 @@ class ActiveSession:
     source_ip: str
     session_id: int = 0
     explorer_pid: int | None = None
+    windows_shell_bootstrapped: bool = False
+    initial_explorer_pid: int | None = None
     session_shell_pid: int | None = None  # Linux: per-session bash login shell
     session_user_manager_pid: int | None = None  # Linux: per-session systemd --user
     session_winlogon_pid: int | None = None  # Windows: per-RDP-session winlogon
+    login_occurrence_emitted: bool = False
     process_tree_root: int | None = None
     last_activity_time: datetime | None = None
     network_close_time: datetime | None = None
@@ -74,9 +81,19 @@ class ActiveSession:
     source_port: int = 0
     session_kind: str = "logon"
     transport_pid: int | None = None
+    closure_owned_by_bundle: bool = False
     ecar_object_id: str = ""
     storyline_protected: bool = False
-    logon_guid: str = ""
+    logon_guid: str = ""  # Final once first published; null/non-null policy is immutable
+    lifecycle_group_id: str = ""
+    parent_lifecycle_group_id: str = ""
+    end_plan: SessionEndPlan | None = None
+    auth_protocol: str = ""
+    smb_principal: str = ""
+    account_scope: str = ""
+    auth_session_ref: str = ""
+    effective_uid: int | None = None
+    effective_gid: int | None = None
 
 
 @dataclass
@@ -108,8 +125,36 @@ class RunningProcess:
     integrity_level: str
     last_activity_time: datetime | None = None
     logon_id: str = ""
+    token_logon_id: str = ""
+    auth_session_id: int | None = None
+    auth_logon_type: int | None = None
     ecar_object_id: str = ""
     story_created: bool = False
+    primary_tid: int = -1
+    lifecycle_group_id: str = ""
+    parent_lifecycle_group_id: str = ""
+    concurrency_group_id: str = ""
+    pid_logical_position: int = -1
+    end_time: datetime | None = None
+
+
+@dataclass
+class RunningThread:
+    """Durable state for one explicitly modeled host-native thread.
+
+    Thread identity is never keyed by PID or TID alone. The owning process
+    object's host- and start-scoped UUID is part of the canonical key, so
+    identical numeric identifiers across hosts and PID reuse cannot collide.
+    """
+
+    hostname: str
+    process_object_id: str
+    pid: int
+    tid: int
+    object_id: str
+    start_time: datetime
+    kind: str = "worker"
+    end_time: datetime | None = None
 
 
 @dataclass
@@ -150,6 +195,73 @@ class OpenConnection:
     close_time: datetime | None = None
     bytes_sent: int = 0
     bytes_received: int = 0
+    traffic_ledger: NetworkTrafficLedger = field(default_factory=NetworkTrafficLedger)
+    transaction_id: str = ""
+    conn_state: str = ""
+    history: str = ""
+    duration: float | None = None
+
+
+@dataclass
+class SmbSessionState:
+    """Active SMB application session attached to one authenticated transport."""
+
+    session_id: str
+    client_ip: str
+    principal: str
+    server: str
+    security_policy: str
+    logon_id: str
+    transport_uid: str
+    started_at: datetime
+    expires_at: datetime
+    auth_session_ref: str = ""
+    auth_protocol: str = ""
+    account_scope: str = ""
+    effective_uid: int | None = None
+    effective_gid: int | None = None
+    client_access: str = ""
+    closed_at: datetime | None = None
+
+
+@dataclass
+class SmbTreeState:
+    """Reusable tree connection to one share."""
+
+    tree_id: str
+    session_id: str
+    share: str
+    connected_at: datetime
+    last_activity_at: datetime
+    closed_at: datetime | None = None
+
+
+@dataclass
+class SmbHandleState:
+    """Minimal active file handle and share-mode state."""
+
+    handle_id: str
+    tree_id: str
+    file_id: str
+    opened_at: datetime
+    access: str
+    deny_write: bool = False
+    closed_at: datetime | None = None
+
+
+@dataclass
+class SmbFileState:
+    """Copy-on-write mutable view over one compiled storage file."""
+
+    file_id: str
+    share: str
+    path: str
+    version: int
+    size_bytes: int
+    mime_type: str
+    tags: tuple[str, ...] = ()
+    deleted: bool = False
+    prior_paths: tuple[str, ...] = ()
 
 
 @dataclass
@@ -172,6 +284,7 @@ class GeneratorState:
 
     active_sessions: dict[str, ActiveSession] = field(default_factory=dict)
     running_processes: dict[tuple[str, int], RunningProcess] = field(default_factory=dict)
+    running_threads: dict[tuple[str, str, int], RunningThread] = field(default_factory=dict)
     open_connections: dict[str, OpenConnection] = field(default_factory=dict)
     dns_cache: dict[str, str] = field(default_factory=dict)
     current_time: datetime | None = None

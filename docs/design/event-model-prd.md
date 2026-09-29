@@ -247,8 +247,13 @@ Each `event_type` string maps to which contexts must/may be populated. "required
 **Notes:**
 - `connection` and `dns_query` have no `host` context because the current `generate_connection()` works purely with IP addresses, not host objects. This is preserved as-is (not new behavior).
 - `system_process_create` uses the same contexts as `process_create` but is a distinct type so emitters can apply different logic (e.g., no syslog emission for Windows boot processes).
-- `image_load` carries canonical DLL/module-load data shared by Sysmon Event 7 and eCAR MODULE/LOAD. `process` is optional (module loads can be attributed to a process or standalone). `module_load` remains accepted by eCAR as a legacy compatibility alias.
-- This catalog predates several later-added canonical event types (e.g. `ssh_session`, `file_create`/`file_open`/`file_write`/`file_rename`/`file_unlink`, `workstation_locked`/`workstation_unlocked`, `btm_launch_item_add`) and is not an exhaustive list of every `event_type` string in the engine — see `src/evidenceforge/events/base.py` and the emitters' `_supported_types` for the authoritative set. Notably, `privilege_elevation` (macOS/eslogger-only: sudo/su elevation rendered as ES `sudo`/`su`) uses `host` + `process` + optional `auth` contexts and is not listed as its own row here for the same reason.
+- `image_load` carries canonical DLL/module-load data shared by Sysmon Event 7 and eCAR
+  MODULE/LOAD. `process` is optional (module loads can be attributed to a process or standalone).
+  The unreachable `module_load` compatibility alias has been removed.
+- macOS adds eslogger-only kinds: `file_open`/`file_write`/`file_rename`/`file_unlink`,
+  `privilege_elevation` (ES `sudo`/`su`), and `btm_launch_item_add` (causal consequent of a
+  LaunchAgents/LaunchDaemons plist create). `src/evidenceforge/events/contracts.py` is the
+  authoritative kind registry.
 
 ## 4. Dispatcher Design
 
@@ -396,7 +401,7 @@ class LogEmitter(ABC):
 | `SyslogEmitter` | `{logon, logon_failed, logoff, process_create, bash_command}` |
 | `ZeekEmitter` (conn) | `{connection}` |
 | `ZeekDnsEmitter` | `{dns_query}` |
-| `EcarEmitter` | `{logon, logoff, process_create, process_terminate, system_process_create, ssh_session, connection, file_create, file_modify, file_delete, registry_modify, image_load, module_load, create_remote_thread, process_access, service_installed}` |
+| `EcarEmitter` | `{logon, logoff, process_create, process_terminate, system_process_create, ssh_session, connection, file_create, file_modify, file_delete, registry_modify, image_load, create_remote_thread, process_access, service_installed}` |
 | `SnortEmitter` | `{connection}` (only when `event.ids` is populated) |
 | `BashHistoryEmitter` | `{bash_command}` |
 | `WebEmitter` | `{web_request}` |

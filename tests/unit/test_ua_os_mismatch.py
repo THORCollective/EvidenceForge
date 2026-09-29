@@ -7,6 +7,7 @@ import random
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
 
@@ -537,10 +538,10 @@ class TestProxyUriOsFiltering:
         event = next(
             call.args[0]
             for call in generator.dispatcher.emitters["proxy_access"].emit.call_args_list
-            if call.args[0].proxy is not None
+            if call.args[0].protocol.proxy is not None
         )
-        assert "Windows NT" not in event.proxy.user_agent
-        assert "Edg/" not in event.proxy.user_agent
+        assert "Windows NT" not in event.protocol.proxy.user_agent
+        assert "Edg/" not in event.protocol.proxy.user_agent
 
     def test_external_browser_context_preserves_existing_user_agent(self):
         """Anonymous public web clients should not collapse to one proxy UA scope."""
@@ -726,6 +727,7 @@ class TestProxyUriOsFiltering:
 
     def test_legacy_proxy_auth_policy_preserves_machine_context_username(self):
         """Legacy mode keeps prior machine-context User-Agent proxy attribution."""
+        from evidenceforge.config.compatibility import EvidenceForgeDeprecationWarning
         from evidenceforge.events.contexts import HttpContext
         from evidenceforge.generation.activity.generator import ActivityGenerator
         from evidenceforge.generation.state_manager import StateManager
@@ -748,7 +750,8 @@ class TestProxyUriOsFiltering:
         generator = ActivityGenerator(StateManager(), {})
         generator._ad_domain = "meridianhcs.local"
         generator._netbios_domain = "MERIDIAN"
-        generator._proxy_auth_policy = ProxyAuthPolicyConfig(mode="legacy")
+        with pytest.warns(EvidenceForgeDeprecationWarning, match="auth_policy.mode: realistic"):
+            generator._proxy_auth_policy = ProxyAuthPolicyConfig(mode="legacy")
         generator._users_by_username = {
             "alex.morgan": User(
                 username="alex.morgan",

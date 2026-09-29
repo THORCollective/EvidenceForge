@@ -22,27 +22,73 @@
 
 """Tests for EventDispatcher routing, visibility filtering, and StateManager.apply()."""
 
+import random
+from copy import copy
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from unittest.mock import MagicMock
 
 import pytest
 
 from evidenceforge.events import (
     AuthContext,
+    CanonicalOccurrence,
     HostContext,
-    NetworkContext,
+    NetworkTransactionPlan,
+    OccurrenceBuilder,
     ProcessContext,
-    RawLogEntry,
-    SecurityEvent,
+    RawProjectionRequest,
 )
-from evidenceforge.events.contexts import SslContext, SyslogContext, X509Context
-from evidenceforge.events.dispatcher import FORMAT_GROUPS, EventDispatcher
+from evidenceforge.events.contexts import (
+    FileContext,
+    FileTransferContext,
+    HttpContext,
+    OcspContext,
+    SmbContext,
+    SslContext,
+    SyslogContext,
+    X509Context,
+)
+from evidenceforge.events.contracts import (
+    EffectOccurrenceKind,
+    EffectOccurrenceProvenance,
+    OccurrenceRole,
+    SemanticOccurrenceKey,
+)
+from evidenceforge.events.dispatcher import (
+    FORMAT_GROUPS,
+    EventDispatcher,
+    PreparedDispatchStateIntent,
+)
+from evidenceforge.events.identity import EventIdentityPlan
+from evidenceforge.events.lifecycle import ActionLifecycleContext
 from evidenceforge.events.observation import (
     SOURCE_FAMILIES,
     ObservationPolicy,
     source_family_for_format,
 )
-from evidenceforge.generation.state_manager import StateManager
+from evidenceforge.generation.actions.command_effects import ExecutionEffectAuditCounter
+from evidenceforge.generation.intent_ledger import AuthoredIntentLedger, IntentExecutionLedger
+from evidenceforge.generation.lifecycle_authority import (
+    GeneratorLifecycleAuthority,
+    LifecycleMaterializationReceipt,
+)
+from evidenceforge.generation.lifecycle_production_adapters import LifecycleProductionAdapter
+from evidenceforge.generation.lifecycle_registry import LifecycleRegistry
+from evidenceforge.generation.lifecycle_shadow import LifecycleShadow
+from evidenceforge.generation.network_runtime import (
+    NetworkTransactionRuntime,
+    PreparedNetworkTransactionRoot,
+)
+from evidenceforge.generation.source_timing import SourceTimingPlanner
+from evidenceforge.generation.state_manager import ProcessMaterializationPlan, StateManager
+from evidenceforge.models.exceptions import EventContractError, StateError
+from tests.network_factories import network_plan
+from tests.unit.test_connection_lifecycle_authority import (
+    _prepared_authority,
+    _prepared_physical_root,
+)
 
 
 def _make_ts():
@@ -56,6 +102,174 @@ def _make_mock_emitter(name: str, handles: bool = False):
     return emitter
 
 
+def _assert_published_once(mock: MagicMock, builder: OccurrenceBuilder) -> CanonicalOccurrence:
+    """Assert one call received the sealed occurrence derived from ``builder``."""
+
+    mock.assert_called_once()
+    occurrence = mock.call_args.args[0]
+    assert isinstance(occurrence, CanonicalOccurrence)
+    assert occurrence.occurrence_id == builder.occurrence_id
+    assert occurrence.event_type == builder.event_type
+    return occurrence
+
+
+def _host() -> HostContext:
+    """Return a complete local host context for dispatcher contract tests."""
+
+    return HostContext(
+        hostname="HOST-01",
+        ip="10.0.0.10",
+        os="Ubuntu 22.04",
+        os_category="linux",
+        system_type="server",
+    )
+
+
+def _syslog_event(timestamp: datetime | None = None) -> OccurrenceBuilder:
+    """Return a minimal valid source-local occurrence."""
+
+    return OccurrenceBuilder(
+        timestamp=timestamp or _make_ts(),
+        event_type="syslog",
+        src_host=_host(),
+        syslog=SyslogContext(
+            app_name="systemd",
+            pid=1,
+            facility=3,
+            severity=6,
+            message="dispatcher contract test",
+        ),
+    )
+
+
+def _network() -> NetworkTransactionPlan:
+    """Return a minimal valid connection context."""
+
+    return network_plan(
+        src_ip="10.0.0.10",
+        src_port=51000,
+        dst_ip="198.51.100.20",
+        dst_port=443,
+        protocol="tcp",
+    )
+
+
+def _prepared_connection_builder(root: PreparedNetworkTransactionRoot) -> OccurrenceBuilder:
+    """Build the exact canonical connection occurrence carried by one prepared root."""
+
+    return OccurrenceBuilder(
+        timestamp=root.transaction.started_at,
+        event_type="connection",
+        src_host=_host(),
+        network=root.transaction,
+        http=root.result.http,
+        file_transfers=list(root.result.file_transfers),
+    )
+
+
+def _prepared_network_dispatch_environment() -> tuple[
+    StateManager,
+    GeneratorLifecycleAuthority,
+    LifecycleProductionAdapter,
+    NetworkTransactionRuntime,
+    SourceTimingPlanner,
+    EventDispatcher,
+    MagicMock,
+]:
+    """Return one exact shared runtime/timing/lifecycle dispatcher environment."""
+
+    authority, state, registry, adapter, runtime, _crypto, timing = _prepared_authority()
+    emitter = _make_mock_emitter("ecar", handles=True)
+    dispatcher = EventDispatcher(
+        state_manager=state,
+        emitters={"ecar": emitter},
+        lifecycle_shadow=LifecycleShadow(state, registry),
+        source_timing_planner=timing,
+        enforce_lifecycle_authority=True,
+    )
+    dispatcher.bind_lifecycle_authority(authority)
+    return state, authority, adapter, runtime, timing, dispatcher, emitter
+
+
+def _planned_process(
+    state: StateManager,
+    *,
+    started_at: datetime | None = None,
+) -> ProcessMaterializationPlan:
+    """Return one allocation-free Linux process materialization plan."""
+
+    timestamp = started_at or _make_ts()
+    state.set_current_time(timestamp)
+    return state.plan_process_materialization(
+        system="HOST-01",
+        parent_pid=0,
+        image="/usr/bin/bash",
+        command_line="/usr/bin/bash -lc true",
+        username="root",
+        integrity_level="Medium",
+        os_category="linux",
+        lifecycle_group_id="prepared-process-lifecycle",
+        start_time=timestamp,
+    )
+
+
+def _process_start_builder(plan: ProcessMaterializationPlan) -> OccurrenceBuilder:
+    """Build the exact canonical start row bound to a materialization plan."""
+
+    identity = plan.identity
+    return OccurrenceBuilder(
+        timestamp=identity.started_at,
+        event_type="process_create",
+        src_host=_host(),
+        process=ProcessContext(
+            pid=identity.pid,
+            parent_pid=identity.parent_pid,
+            image=identity.image,
+            command_line=identity.command_line,
+            username=identity.principal,
+            integrity_level=plan.integrity_level,
+            logon_id=identity.logon_id,
+            start_time=identity.started_at,
+        ),
+        identity_plan=EventIdentityPlan(subject=identity),
+        lifecycle=ActionLifecycleContext(
+            group_id=identity.lifecycle_group_id,
+            canonical_start=identity.started_at,
+            phase="start",
+            parent_group_id=identity.parent_lifecycle_group_id or None,
+        ),
+    )
+
+
+def _process_file_builder(plan: ProcessMaterializationPlan) -> OccurrenceBuilder:
+    """Build one dependent file occurrence bound to the planned process actor."""
+
+    identity = plan.identity
+    return OccurrenceBuilder(
+        timestamp=identity.started_at + timedelta(milliseconds=1),
+        event_type="file_create",
+        src_host=_host(),
+        process=ProcessContext(
+            pid=identity.pid,
+            parent_pid=identity.parent_pid,
+            image=identity.image,
+            command_line=identity.command_line,
+            username=identity.principal,
+            integrity_level=plan.integrity_level,
+            logon_id=identity.logon_id,
+            start_time=identity.started_at,
+        ),
+        file=FileContext(path="/tmp/prepared-output", action="create", pid=identity.pid),
+        identity_plan=EventIdentityPlan(actor=identity),
+        lifecycle=ActionLifecycleContext(
+            group_id=identity.lifecycle_group_id,
+            canonical_start=identity.started_at,
+            phase="dependent",
+            parent_group_id=identity.parent_lifecycle_group_id or None,
+        ),
+    )
+
+
 class TestDispatchRouting:
     """Tests for EventDispatcher event routing."""
 
@@ -65,11 +279,11 @@ class TestDispatchRouting:
         emitter = _make_mock_emitter("windows", handles=True)
         dispatcher = EventDispatcher(state_manager=sm, emitters={"windows": emitter})
 
-        event = SecurityEvent(timestamp=_make_ts(), event_type="logon")
-        dispatcher.dispatch(event)
+        event = _syslog_event()
+        dispatcher.dispatch_builder(event)
 
-        sm.apply.assert_called_once_with(event)
-        emitter.emit.assert_called_once_with(event)
+        _assert_published_once(sm.apply, event)
+        _assert_published_once(emitter.emit, event)
 
     def test_dispatch_skips_non_matching_emitters(self):
         """dispatch() skips emitters where can_handle() returns False."""
@@ -81,10 +295,10 @@ class TestDispatchRouting:
             emitters={"windows": matching, "zeek_conn": non_matching},
         )
 
-        event = SecurityEvent(timestamp=_make_ts(), event_type="logon")
-        dispatcher.dispatch(event)
+        event = _syslog_event()
+        dispatcher.dispatch_builder(event)
 
-        matching.emit.assert_called_once_with(event)
+        _assert_published_once(matching.emit, event)
         non_matching.emit.assert_not_called()
 
     def test_dispatch_no_matching_emitters(self):
@@ -93,11 +307,80 @@ class TestDispatchRouting:
         emitter = _make_mock_emitter("windows", handles=False)
         dispatcher = EventDispatcher(state_manager=sm, emitters={"windows": emitter})
 
-        event = SecurityEvent(timestamp=_make_ts(), event_type="logon")
-        dispatcher.dispatch(event)
+        event = _syslog_event()
+        dispatcher.dispatch_builder(event)
 
-        sm.apply.assert_called_once_with(event)
+        _assert_published_once(sm.apply, event)
         emitter.emit.assert_not_called()
+
+    def test_network_identifier_publication_retains_bounded_recent_connections(self):
+        """Composite correlation retains recent legs without connection-scale state."""
+        dispatcher = EventDispatcher(
+            state_manager=MagicMock(spec=StateManager),
+            emitters={},
+        )
+
+        for sequence in range(100_000):
+            dispatcher.publish_network_identifiers(
+                f"uid-{sequence}",
+                {
+                    "zeek_conn": f"sensor-uid-{sequence}",
+                    "zeek_http": "",
+                },
+            )
+
+        assert dispatcher.network_identifier_for_format("uid-99999", "zeek_conn") == (
+            "sensor-uid-99999"
+        )
+        assert dispatcher.network_identifier_for_format("uid-99998", "zeek_conn") == (
+            "sensor-uid-99998"
+        )
+        assert dispatcher.network_identifier_for_format("uid-99983", "zeek_conn") is None
+        assert len(dispatcher._latest_network_identifiers_by_format) == 2
+        assert len(dispatcher._recent_network_identifiers) == 16
+
+    def test_dispatch_preserves_action_relative_semantic_occurrence_ids(self):
+        """Peer ordinals remain stable without depending on unrelated dispatch order."""
+        first_dispatcher = EventDispatcher(state_manager=MagicMock(spec=StateManager), emitters={})
+        first_events = [
+            OccurrenceBuilder(
+                timestamp=_make_ts(),
+                event_type="failed_logon",
+                dst_host=_host(),
+                auth=AuthContext(username="alice", result="failure"),
+                occurrence_key=SemanticOccurrenceKey(
+                    action_id="failed-logon-action",
+                    role=OccurrenceRole.PRIMARY,
+                    instance_key=f"attempt:{ordinal}",
+                ),
+            )
+            for ordinal in range(2)
+        ]
+        for event in first_events:
+            first_dispatcher.dispatch_builder(event)
+
+        second_dispatcher = EventDispatcher(state_manager=MagicMock(spec=StateManager), emitters={})
+        second_events = [
+            OccurrenceBuilder(
+                timestamp=_make_ts(),
+                event_type="failed_logon",
+                dst_host=_host(),
+                auth=AuthContext(username="alice", result="failure"),
+                occurrence_key=SemanticOccurrenceKey(
+                    action_id="failed-logon-action",
+                    role=OccurrenceRole.PRIMARY,
+                    instance_key=f"attempt:{ordinal}",
+                ),
+            )
+            for ordinal in range(2)
+        ]
+        for event in second_events:
+            second_dispatcher.dispatch_builder(event)
+
+        first_ids = [event.occurrence_id for event in first_events]
+        second_ids = [event.occurrence_id for event in second_events]
+        assert len(set(first_ids)) == 2
+        assert first_ids == second_ids
 
     def test_dispatch_applies_storyline_cluster_provenance_only(self):
         """storyline_cluster_id marks context provenance without changing origin flag."""
@@ -106,8 +389,8 @@ class TestDispatchRouting:
         dispatcher = EventDispatcher(state_manager=sm, emitters={"windows": emitter})
         dispatcher.storyline_cluster_id = "story-001"
 
-        event = SecurityEvent(timestamp=_make_ts(), event_type="process_create")
-        dispatcher.dispatch(event)
+        event = _syslog_event()
+        dispatcher.dispatch_builder(event)
 
         assert event.storyline_cluster_id == "story-001"
         assert event.storyline_origin is False
@@ -126,10 +409,10 @@ class TestObservationProfiles:
         )
         dispatcher.storyline_cluster_id = "story-001"
 
-        event = SecurityEvent(timestamp=_make_ts(), event_type="process_create")
-        dispatcher.dispatch(event)
+        event = _syslog_event()
+        dispatcher.dispatch_builder(event)
 
-        emitter.emit.assert_called_once_with(event)
+        _assert_published_once(emitter.emit, event)
         assert dispatcher.source_evidence_status["story-001"]["sysmon"] == {"visible": 1}
 
     def test_empty_configured_profile_uses_default_visible_policy(self, monkeypatch):
@@ -143,7 +426,7 @@ class TestObservationProfiles:
         )
 
         policy = ObservationPolicy("empty_profile")
-        event = SecurityEvent(timestamp=_make_ts(), event_type="process_create")
+        event = OccurrenceBuilder(timestamp=_make_ts(), event_type="process_create")
 
         assert policy.profile == {}
         assert policy.decide("windows_event_sysmon", event).status == "visible"
@@ -152,6 +435,32 @@ class TestObservationProfiles:
         """Missing profile names are still rejected during policy construction."""
         with pytest.raises(ValueError, match="Unknown observation_profile: missing_profile"):
             ObservationPolicy("missing_profile")
+
+    def test_observation_policy_exposes_cross_source_delay_budget(self, monkeypatch):
+        """Action bundles should budget the active profile's worst relative delay."""
+
+        monkeypatch.setattr(
+            "evidenceforge.events.observation.get_observation_profile",
+            lambda _name: {
+                "default": {
+                    "missingness": 0.0,
+                    "delay_ms": {"min_ms": 0, "max_ms": 0},
+                },
+                "sources": {
+                    "ecar": {"delay_ms": {"min_ms": 10, "max_ms": 500}},
+                    "syslog": {"delay_ms": {"min_ms": 20, "max_ms": 250}},
+                },
+            },
+        )
+
+        policy = ObservationPolicy("remote_session_delay_test")
+
+        assert policy.delay_bounds("ecar") == (
+            timedelta(milliseconds=10),
+            timedelta(milliseconds=500),
+        )
+        assert policy.maximum_delay_difference("ecar", "syslog") == timedelta(milliseconds=480)
+        assert policy.maximum_delay_difference("syslog", "ecar") == timedelta(milliseconds=240)
 
     def test_source_missingness_drops_rendering_without_skipping_state(self, monkeypatch):
         """Non-complete profiles can drop source rows without corrupting canonical state."""
@@ -180,15 +489,15 @@ class TestObservationProfiles:
         )
         dispatcher.storyline_cluster_id = "story-001"
 
-        event = SecurityEvent(timestamp=_make_ts(), event_type="process_create")
-        dispatcher.dispatch(event)
+        event = _syslog_event()
+        dispatcher.dispatch_builder(event)
 
-        sm.apply.assert_called_once_with(event)
+        _assert_published_once(sm.apply, event)
         emitter.emit.assert_not_called()
         assert dispatcher.source_evidence_status["story-001"]["sysmon"] == {"dropped": 1}
 
     def test_source_delay_uses_copy_and_preserves_canonical_state(self, monkeypatch):
-        """Source delays render a timestamp-adjusted copy while state sees canonical time."""
+        """Observation delay changes visibility status without mutating canonical time."""
         monkeypatch.setattr(
             "evidenceforge.events.observation.get_observation_profile",
             lambda _name: {
@@ -214,13 +523,19 @@ class TestObservationProfiles:
         )
         dispatcher.storyline_cluster_id = "story-001"
 
-        event = SecurityEvent(timestamp=_make_ts(), event_type="process_create")
-        dispatcher.dispatch(event)
+        event = _syslog_event()
+        dispatcher.dispatch_builder(event)
 
-        sm.apply.assert_called_once_with(event)
+        canonical_event = _assert_published_once(sm.apply, event)
         emitted_event = emitter.emit.call_args.args[0]
         assert emitted_event is not event
-        assert emitted_event.timestamp == event.timestamp + timedelta(milliseconds=17)
+        assert canonical_event.timestamp == event.timestamp
+        assert emitted_event.timestamp == event.timestamp
+        assert emitted_event.source_timing is not None
+        assert emitted_event.source_timing.canonical_timestamp == event.timestamp
+        assert emitted_event.source_timing.observation_delays == {
+            "windows_event_sysmon": timedelta(milliseconds=17)
+        }
         assert event.timestamp == _make_ts()
         assert dispatcher.source_evidence_status["story-001"]["sysmon"] == {"delayed": 1}
 
@@ -259,7 +574,7 @@ class TestObservationProfiles:
             source_port=52267,
         )
         events = [
-            SecurityEvent(
+            OccurrenceBuilder(
                 timestamp=_make_ts(),
                 event_type="syslog",
                 src_host=host,
@@ -272,7 +587,7 @@ class TestObservationProfiles:
                     message="Connection from 10.10.1.31 port 52267 on 10.10.3.20 port 22",
                 ),
             ),
-            SecurityEvent(
+            OccurrenceBuilder(
                 timestamp=_make_ts() + timedelta(milliseconds=100),
                 event_type="syslog",
                 src_host=host,
@@ -285,7 +600,7 @@ class TestObservationProfiles:
                     message="Accepted password for marcus.chen from 10.10.1.31 port 52267 ssh2",
                 ),
             ),
-            SecurityEvent(
+            OccurrenceBuilder(
                 timestamp=_make_ts() + timedelta(milliseconds=180),
                 event_type="syslog",
                 src_host=host,
@@ -301,7 +616,7 @@ class TestObservationProfiles:
                     ),
                 ),
             ),
-            SecurityEvent(
+            OccurrenceBuilder(
                 timestamp=_make_ts() + timedelta(milliseconds=240),
                 event_type="syslog",
                 src_host=host,
@@ -314,7 +629,7 @@ class TestObservationProfiles:
                     message="New session 266599 of user marcus.chen.",
                 ),
             ),
-            SecurityEvent(
+            OccurrenceBuilder(
                 timestamp=_make_ts() + timedelta(seconds=60),
                 event_type="logoff",
                 dst_host=host,
@@ -327,7 +642,7 @@ class TestObservationProfiles:
                     message="pam_unix(sshd:session): session closed for user marcus.chen",
                 ),
             ),
-            SecurityEvent(
+            OccurrenceBuilder(
                 timestamp=_make_ts() + timedelta(seconds=60, milliseconds=120),
                 event_type="syslog",
                 src_host=host,
@@ -346,11 +661,11 @@ class TestObservationProfiles:
 
         assert len(delays) == 1
 
-    def test_delayed_process_source_observation_extends_process_activity(
+    def test_delayed_process_source_observation_does_not_mutate_canonical_activity(
         self,
         monkeypatch,
     ):
-        """Delayed endpoint source rows should keep process lifetimes behind visible activity."""
+        """Source collection delay must not feed observed time back into world state."""
         monkeypatch.setattr(
             "evidenceforge.events.observation.get_observation_profile",
             lambda _name: {
@@ -386,7 +701,7 @@ class TestObservationProfiles:
             observation_policy=ObservationPolicy("delayed_process_activity_test"),
         )
 
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=timestamp + timedelta(minutes=5),
             event_type="connection",
             src_host=HostContext(
@@ -406,7 +721,7 @@ class TestObservationProfiles:
                 logon_id="0x100",
                 start_time=timestamp,
             ),
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.0.10",
                 src_port=50123,
                 dst_ip="10.0.0.20",
@@ -416,14 +731,19 @@ class TestObservationProfiles:
             ),
         )
 
-        dispatcher.dispatch(event)
+        dispatcher.dispatch_builder(event)
 
         running = sm.get_process("WS-01", pid)
         assert running is not None
-        assert running.last_activity_time == event.timestamp + timedelta(milliseconds=900000)
+        assert running.last_activity_time == event.timestamp
+        emitted_event = emitter.emit.call_args.args[0]
+        assert emitted_event.timestamp == event.timestamp
+        assert emitted_event.source_timing.observation_delays == {
+            "windows_event_sysmon": timedelta(milliseconds=900000)
+        }
 
     def test_zeek_observation_delay_is_coherent_per_uid(self, monkeypatch):
-        """Zeek protocol rows for one UID should share source collection delay."""
+        """Zeek policy delay is visibility-only and cannot mutate canonical time."""
         monkeypatch.setattr(
             "evidenceforge.events.observation.get_observation_profile",
             lambda _name: {
@@ -449,10 +769,10 @@ class TestObservationProfiles:
             observation_policy=ObservationPolicy("zeek_delay_test"),
         )
 
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10",
                 src_port=51111,
                 dst_ip="10.0.2.20",
@@ -461,12 +781,13 @@ class TestObservationProfiles:
                 zeek_uid="CUID123456789",
             ),
         )
-        dispatcher.dispatch(event)
+        dispatcher.dispatch_builder(event)
 
         conn_event = conn.emit.call_args.args[0]
         http_event = http.emit.call_args.args[0]
         assert conn_event.timestamp == http_event.timestamp
-        assert conn_event.timestamp > event.timestamp
+        assert conn_event.timestamp == event.timestamp
+        assert conn_event.source_timing.canonical_timestamp == event.timestamp
 
     def test_zeek_format_missingness_can_drop_child_without_dropping_conn(self, monkeypatch):
         """Zeek companion analyzers may be missing while conn.log stays visible."""
@@ -497,10 +818,10 @@ class TestObservationProfiles:
         )
         dispatcher.storyline_cluster_id = "story-001"
 
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10",
                 src_port=51111,
                 dst_ip="10.0.2.20",
@@ -509,7 +830,7 @@ class TestObservationProfiles:
                 zeek_uid="CUID123456789",
             ),
         )
-        dispatcher.dispatch(event)
+        dispatcher.dispatch_builder(event)
 
         conn.emit.assert_called_once()
         http.emit.assert_not_called()
@@ -518,6 +839,72 @@ class TestObservationProfiles:
             "visible": 1,
             "dropped": 1,
         }
+
+    def test_zeek_http_missingness_is_coherent_across_persistent_transactions(self, monkeypatch):
+        """One persistent flow should not gain a synthetic gap from per-row missingness."""
+        monkeypatch.setattr(
+            "evidenceforge.events.observation.get_observation_profile",
+            lambda _name: {
+                "default": {
+                    "missingness": 0.0,
+                    "delay_ms": {"min_ms": 0, "max_ms": 0},
+                    "host_missingness_multiplier": {"min": 1.0, "max": 1.0},
+                },
+                "sources": {
+                    "zeek": {
+                        "missingness": 0.0,
+                        "format_missingness": {"zeek_http": 0.5},
+                        "delay_ms": {"min_ms": 0, "max_ms": 0},
+                    }
+                },
+            },
+        )
+        policy = ObservationPolicy("zeek_http_transaction_gap_test")
+        first = OccurrenceBuilder(
+            timestamp=_make_ts(),
+            event_type="connection",
+            network=network_plan(
+                src_ip="10.0.1.10",
+                src_port=51111,
+                dst_ip="10.0.2.20",
+                dst_port=80,
+                protocol="tcp",
+                zeek_uid="CUID123456789",
+            ),
+            lifecycle=ActionLifecycleContext(
+                group_id="http-request-1",
+                canonical_start=_make_ts(),
+                phase="start",
+            ),
+        )
+        second = OccurrenceBuilder(
+            timestamp=_make_ts() + timedelta(milliseconds=600),
+            event_type="connection",
+            network=network_plan(
+                src_ip="10.0.1.10",
+                src_port=51111,
+                dst_ip="10.0.2.20",
+                dst_port=80,
+                protocol="tcp",
+                zeek_uid="CUID123456789",
+                application_layer_only=True,
+            ),
+            lifecycle=ActionLifecycleContext(
+                group_id="http-request-2",
+                canonical_start=_make_ts() + timedelta(milliseconds=600),
+                phase="start",
+            ),
+        )
+
+        first_identity = policy._event_identity(
+            "zeek", "zeek_http", first, force_format_specific=True
+        )
+        second_identity = policy._event_identity(
+            "zeek", "zeek_http", second, force_format_specific=True
+        )
+
+        assert first_identity == second_identity
+        assert policy.decide("zeek_http", first).status == policy.decide("zeek_http", second).status
 
     def test_zeek_visible_child_promotes_dropped_conn_parent(self, monkeypatch):
         """A visible Zeek child row must not orphan its conn.log parent."""
@@ -548,10 +935,10 @@ class TestObservationProfiles:
         )
         dispatcher.storyline_cluster_id = "story-001"
 
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10",
                 src_port=51111,
                 dst_ip="10.0.2.20",
@@ -560,7 +947,7 @@ class TestObservationProfiles:
                 zeek_uid="CUID123456789",
             ),
         )
-        dispatcher.dispatch(event)
+        dispatcher.dispatch_builder(event)
 
         conn.emit.assert_called_once()
         http.emit.assert_called_once()
@@ -596,8 +983,12 @@ class TestObservationProfiles:
             observation_policy=ObservationPolicy("zeek_x509_parent_test"),
         )
 
-        event = SecurityEvent(timestamp=_make_ts(), event_type="connection")
-        dispatcher.dispatch(event)
+        event = OccurrenceBuilder(
+            timestamp=_make_ts(),
+            event_type="connection",
+            network=_network(),
+        )
+        dispatcher.dispatch_builder(event)
 
         files.emit.assert_called_once()
         x509.emit.assert_called_once()
@@ -637,10 +1028,10 @@ class TestObservationProfiles:
             observation_policy=ObservationPolicy("zeek_tls_certificate_companion_test"),
         )
 
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10",
                 src_port=51111,
                 dst_ip="203.0.113.10",
@@ -664,7 +1055,7 @@ class TestObservationProfiles:
                 certificate_not_valid_after=1730000000.0,
             ),
         )
-        dispatcher.dispatch(event)
+        dispatcher.dispatch_builder(event)
 
         ssl.emit.assert_called_once()
         files.emit.assert_called_once()
@@ -685,8 +1076,180 @@ class TestObservationProfiles:
             "zeek_x509",
         }
 
+    def test_clean_successful_tls_conn_promotes_ssl_analyzer_companion(self, monkeypatch):
+        """A lossless successful TLS conn row keeps its ssl.log analyzer owner."""
+        monkeypatch.setattr(
+            "evidenceforge.events.observation.get_observation_profile",
+            lambda _name: {
+                "default": {
+                    "missingness": 0.0,
+                    "delay_ms": {"min_ms": 0, "max_ms": 0},
+                    "host_missingness_multiplier": {"min": 1.0, "max": 1.0},
+                },
+                "sources": {
+                    "zeek": {
+                        "missingness": 0.0,
+                        "format_missingness": {
+                            "zeek_conn": 0.0,
+                            "zeek_ssl": 1.0,
+                        },
+                        "delay_ms": {"min_ms": 0, "max_ms": 0},
+                    }
+                },
+            },
+        )
+        state_manager = MagicMock(spec=StateManager)
+        conn = _make_mock_emitter("zeek_conn", handles=True)
+        ssl = _make_mock_emitter("zeek_ssl", handles=True)
+        dispatcher = EventDispatcher(
+            state_manager=state_manager,
+            emitters={"zeek_conn": conn, "zeek_ssl": ssl},
+            observation_policy=ObservationPolicy("zeek_tls_analyzer_companion_test"),
+        )
+        event = OccurrenceBuilder(
+            timestamp=_make_ts(),
+            event_type="connection",
+            network=network_plan(
+                src_ip="10.0.1.10",
+                src_port=51111,
+                dst_ip="203.0.113.10",
+                dst_port=443,
+                protocol="tcp",
+                service="ssl",
+                conn_state="SF",
+                zeek_uid="Ctlsanalyzer01",
+            ),
+            ssl=SslContext(
+                version="TLSv13",
+                cipher="TLS_AES_128_GCM_SHA256",
+                server_name="www.example.test",
+                established=True,
+            ),
+        )
+
+        dispatcher.dispatch_builder(event)
+
+        conn.emit.assert_called_once()
+        ssl.emit.assert_called_once()
+        assert ssl.emit.call_args.args[0]._observed_formats == {"zeek_conn", "zeek_ssl"}
+
+    def test_partial_tls_analyzer_retains_independent_missingness(self, monkeypatch):
+        """A failed handshake may keep its conn row while its SSL analyzer row drops."""
+        monkeypatch.setattr(
+            "evidenceforge.events.observation.get_observation_profile",
+            lambda _name: {
+                "default": {
+                    "missingness": 0.0,
+                    "delay_ms": {"min_ms": 0, "max_ms": 0},
+                    "host_missingness_multiplier": {"min": 1.0, "max": 1.0},
+                },
+                "sources": {
+                    "zeek": {
+                        "missingness": 0.0,
+                        "format_missingness": {
+                            "zeek_conn": 0.0,
+                            "zeek_ssl": 1.0,
+                        },
+                        "delay_ms": {"min_ms": 0, "max_ms": 0},
+                    }
+                },
+            },
+        )
+        state_manager = MagicMock(spec=StateManager)
+        conn = _make_mock_emitter("zeek_conn", handles=True)
+        ssl = _make_mock_emitter("zeek_ssl", handles=True)
+        dispatcher = EventDispatcher(
+            state_manager=state_manager,
+            emitters={"zeek_conn": conn, "zeek_ssl": ssl},
+            observation_policy=ObservationPolicy("zeek_tls_partial_missingness_test"),
+        )
+        event = OccurrenceBuilder(
+            timestamp=_make_ts(),
+            event_type="connection",
+            network=network_plan(
+                src_ip="10.0.1.10",
+                src_port=51112,
+                dst_ip="203.0.113.10",
+                dst_port=443,
+                protocol="tcp",
+                service="ssl",
+                conn_state="S1",
+                zeek_uid="Ctlsanalyzer02",
+            ),
+            ssl=SslContext(
+                version="TLSv12",
+                server_name="www.example.test",
+                established=False,
+                ssl_history="ShAD",
+            ),
+        )
+
+        dispatcher.dispatch_builder(event)
+
+        conn.emit.assert_called_once()
+        ssl.emit.assert_not_called()
+
+    def test_zeek_ocsp_transaction_uses_one_source_observation_decision(self, monkeypatch):
+        """OCSP HTTP, file, and response rows must survive or drop as one Zeek group."""
+        monkeypatch.setattr(
+            "evidenceforge.events.observation.get_observation_profile",
+            lambda _name: {
+                "default": {
+                    "missingness": 0.0,
+                    "delay_ms": {"min_ms": 0, "max_ms": 0},
+                    "host_missingness_multiplier": {"min": 1.0, "max": 1.0},
+                },
+                "sources": {
+                    "zeek": {
+                        "missingness": 0.0,
+                        "format_missingness": {
+                            "zeek_http": 0.0,
+                            "zeek_files": 0.0,
+                            "zeek_ocsp": 1.0,
+                        },
+                        "delay_ms": {"min_ms": 0, "max_ms": 0},
+                    }
+                },
+            },
+        )
+        sm = MagicMock(spec=StateManager)
+        http = _make_mock_emitter("zeek_http", handles=True)
+        files = _make_mock_emitter("zeek_files", handles=True)
+        ocsp = _make_mock_emitter("zeek_ocsp", handles=True)
+        dispatcher = EventDispatcher(
+            state_manager=sm,
+            emitters={"zeek_http": http, "zeek_files": files, "zeek_ocsp": ocsp},
+            observation_policy=ObservationPolicy("zeek_ocsp_companion_test"),
+        )
+
+        event = OccurrenceBuilder(
+            timestamp=_make_ts(),
+            event_type="connection",
+            network=_network(),
+            http=HttpContext(
+                host="ocsp.example.test",
+                resp_fuids=["Focspcompanion01"],
+                resp_mime_types=["application/ocsp-response"],
+            ),
+            file_transfer=FileTransferContext(
+                fuid="Focspcompanion01",
+                source="HTTP",
+                mime_type="application/ocsp-response",
+            ),
+            ocsp=OcspContext(id="Focspcompanion01"),
+        )
+        dispatcher.dispatch_builder(event)
+
+        http.emit.assert_called_once()
+        files.emit.assert_called_once()
+        ocsp.emit.assert_called_once()
+        expected_formats = {"zeek_http", "zeek_files", "zeek_ocsp"}
+        assert http.emit.call_args.args[0]._observed_formats == expected_formats
+        assert files.emit.call_args.args[0]._observed_formats == expected_formats
+        assert ocsp.emit.call_args.args[0]._observed_formats == expected_formats
+
     def test_zeek_format_missingness_keeps_delay_coherent_when_visible(self, monkeypatch):
-        """Format-specific drop policy must not split same-UID source delay."""
+        """Format-specific visibility cannot split or shift same-UID canonical time."""
         monkeypatch.setattr(
             "evidenceforge.events.observation.get_observation_profile",
             lambda _name: {
@@ -713,10 +1276,10 @@ class TestObservationProfiles:
             observation_policy=ObservationPolicy("zeek_child_delay_test"),
         )
 
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.10",
                 src_port=51111,
                 dst_ip="10.0.2.20",
@@ -725,12 +1288,13 @@ class TestObservationProfiles:
                 zeek_uid="CUID123456789",
             ),
         )
-        dispatcher.dispatch(event)
+        dispatcher.dispatch_builder(event)
 
         conn_event = conn.emit.call_args.args[0]
         http_event = http.emit.call_args.args[0]
         assert conn_event.timestamp == http_event.timestamp
-        assert conn_event.timestamp > event.timestamp
+        assert conn_event.timestamp == event.timestamp
+        assert conn_event.source_timing.canonical_timestamp == event.timestamp
 
     def test_ecar_storyline_process_observation_delay_is_coherent(self, monkeypatch):
         """Storyline eCAR process graphs should not orphan source-local references."""
@@ -766,19 +1330,19 @@ class TestObservationProfiles:
             username="www-data",
             start_time=_make_ts(),
         )
-        create = SecurityEvent(
+        create = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="process_create",
             src_host=host,
             process=process,
             storyline_cluster_id="evt-005",
         )
-        callback = SecurityEvent(
+        callback = OccurrenceBuilder(
             timestamp=_make_ts() + timedelta(seconds=1),
             event_type="connection",
             src_host=host,
             process=process,
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.10.3.10",
                 src_port=53836,
                 dst_ip="45.33.32.30",
@@ -788,7 +1352,7 @@ class TestObservationProfiles:
             ),
             storyline_cluster_id="evt-005",
         )
-        terminate = SecurityEvent(
+        terminate = OccurrenceBuilder(
             timestamp=_make_ts() + timedelta(seconds=10),
             event_type="process_terminate",
             src_host=host,
@@ -851,13 +1415,13 @@ class TestObservationProfiles:
             username=r"CORP\alice",
             start_time=_make_ts(),
         )
-        create = SecurityEvent(
+        create = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="process_create",
             src_host=host,
             process=process,
         )
-        terminate = SecurityEvent(
+        terminate = OccurrenceBuilder(
             timestamp=_make_ts() + timedelta(seconds=8),
             event_type="process_terminate",
             src_host=host,
@@ -897,10 +1461,15 @@ class TestObservationProfiles:
             system_type="server",
         )
         group_id = "cron:APP-INT-01:debian-sa1:1710763200000"
-        shell = SecurityEvent(
+        shell = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="system_process_create",
             src_host=host,
+            lifecycle=ActionLifecycleContext(
+                group_id="process-request-shell",
+                canonical_start=_make_ts(),
+                phase="start",
+            ),
             process=ProcessContext(
                 pid=838396,
                 parent_pid=36175,
@@ -910,10 +1479,15 @@ class TestObservationProfiles:
                 concurrency_group_id=group_id,
             ),
         )
-        workload = SecurityEvent(
+        workload = OccurrenceBuilder(
             timestamp=_make_ts() + timedelta(milliseconds=120),
             event_type="system_process_create",
             src_host=host,
+            lifecycle=ActionLifecycleContext(
+                group_id="process-request-workload",
+                canonical_start=_make_ts() + timedelta(milliseconds=120),
+                phase="start",
+            ),
             process=ProcessContext(
                 pid=838421,
                 parent_pid=838396,
@@ -925,6 +1499,58 @@ class TestObservationProfiles:
         )
 
         assert policy.decide("ecar", shell).delay == policy.decide("ecar", workload).delay
+
+    def test_ecar_process_observation_delay_preserves_dense_host_order(self, monkeypatch):
+        """Independent process lifecycles must not reorder under eCAR collection delay."""
+        monkeypatch.setattr(
+            "evidenceforge.events.observation.get_observation_profile",
+            lambda _name: {
+                "default": {
+                    "missingness": 0.0,
+                    "delay_ms": {"min_ms": 0, "max_ms": 0},
+                },
+                "sources": {
+                    "ecar": {
+                        "missingness": 0.0,
+                        "delay_ms": {"min_ms": 25, "max_ms": 2500},
+                    }
+                },
+            },
+        )
+        policy = ObservationPolicy("ecar_dense_process_delay_test")
+        host = HostContext(
+            hostname="APP-INT-01",
+            ip="10.10.2.30",
+            os="Ubuntu 22.04",
+            os_category="linux",
+            system_type="server",
+        )
+        observed_times = []
+
+        for ordinal in range(400):
+            start_time = _make_ts() + timedelta(milliseconds=ordinal * 3)
+            event = OccurrenceBuilder(
+                timestamp=start_time,
+                event_type="process_create",
+                src_host=host,
+                lifecycle=ActionLifecycleContext(
+                    group_id=f"independent-process-{ordinal}",
+                    canonical_start=start_time,
+                    phase="start",
+                ),
+                process=ProcessContext(
+                    pid=520_000 + ordinal,
+                    parent_pid=1,
+                    image="/usr/bin/true",
+                    command_line="true",
+                    username="root",
+                    start_time=start_time,
+                ),
+            )
+            observed_times.append(event.timestamp + policy.decide("ecar", event).delay)
+
+        assert observed_times == sorted(observed_times)
+        assert len(set(observed_times)) == len(observed_times)
 
     def test_ecar_cron_process_group_preserves_visibility(self, monkeypatch):
         """Cron eCAR process groups should not lose rows independently of CRON syslog."""
@@ -952,7 +1578,7 @@ class TestObservationProfiles:
             os_category="linux",
             system_type="server",
         )
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="system_process_create",
             src_host=host,
@@ -987,6 +1613,10 @@ class TestObservationProfiles:
                         "missingness": 0.0,
                         "delay_ms": {"min_ms": 20, "max_ms": 2000},
                     },
+                    "syslog": {
+                        "missingness": 0.0,
+                        "delay_ms": {"min_ms": 20, "max_ms": 2000},
+                    },
                 },
             },
         )
@@ -1003,23 +1633,76 @@ class TestObservationProfiles:
             logon_id="0x123456",
             logon_type=2,
         )
-        logon = SecurityEvent(
+        logon = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="logon",
             dst_host=host,
             auth=auth,
         )
-        logoff = SecurityEvent(
+        logoff = OccurrenceBuilder(
             timestamp=_make_ts() + timedelta(hours=1),
             event_type="logoff",
             dst_host=host,
             auth=auth,
         )
 
-        for format_name in ("windows_event_security", "ecar"):
+        for format_name in ("windows_event_security", "ecar", "syslog"):
             assert (
                 policy.decide(format_name, logon).delay == policy.decide(format_name, logoff).delay
             )
+
+    def test_action_lifecycle_observation_is_coherent_across_event_types(self, monkeypatch):
+        """One source shares drop and delay decisions for a canonical action lifecycle."""
+        monkeypatch.setattr(
+            "evidenceforge.events.observation.get_observation_profile",
+            lambda _name: {
+                "default": {
+                    "missingness": 0.0,
+                    "delay_ms": {"min_ms": 0, "max_ms": 0},
+                    "host_missingness_multiplier": {"min": 1.0, "max": 1.0},
+                },
+                "sources": {
+                    "ecar": {
+                        "missingness": 0.5,
+                        "delay_ms": {"min_ms": 20, "max_ms": 2000},
+                    },
+                },
+            },
+        )
+        policy = ObservationPolicy("action_lifecycle_test")
+        host = HostContext(
+            hostname="DC-01",
+            ip="10.0.2.10",
+            os="Windows Server 2022",
+            os_category="windows",
+            system_type="server",
+        )
+        auth = AuthContext(username="WS-01$", logon_id="0x537dab7", logon_type=3)
+        group_id = "machine-account-logon-test"
+        logon = OccurrenceBuilder(
+            timestamp=_make_ts(),
+            event_type="machine_logon",
+            dst_host=host,
+            auth=auth,
+            lifecycle=ActionLifecycleContext(
+                group_id=group_id,
+                canonical_start=_make_ts(),
+                phase="start",
+            ),
+        )
+        logoff = OccurrenceBuilder(
+            timestamp=_make_ts() + timedelta(seconds=8),
+            event_type="logoff",
+            dst_host=host,
+            auth=auth,
+            lifecycle=ActionLifecycleContext(
+                group_id=group_id,
+                canonical_start=_make_ts(),
+                phase="closure",
+            ),
+        )
+
+        assert policy.decide("ecar", logon) == policy.decide("ecar", logoff)
 
     def test_network_observation_delay_is_coherent_per_uid_source(self, monkeypatch):
         """Network tuple companions should share source-local delay for one UID."""
@@ -1044,7 +1727,7 @@ class TestObservationProfiles:
             },
         )
         policy = ObservationPolicy("network_uid_delay_test")
-        network = NetworkContext(
+        network = network_plan(
             src_ip="10.0.1.10",
             src_port=51111,
             dst_ip="203.0.113.20",
@@ -1052,12 +1735,12 @@ class TestObservationProfiles:
             protocol="tcp",
             zeek_uid="CsharedUID123",
         )
-        first = SecurityEvent(
+        first = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="connection",
             network=network,
         )
-        second = SecurityEvent(
+        second = OccurrenceBuilder(
             timestamp=_make_ts() + timedelta(milliseconds=250),
             event_type="ids_alert",
             network=network,
@@ -1094,11 +1777,11 @@ class TestObservationProfiles:
             os_category="linux",
             system_type="server",
         )
-        transport = SecurityEvent(
+        transport = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="connection",
             dst_host=target,
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.25",
                 src_port=55122,
                 dst_ip="10.0.3.10",
@@ -1107,7 +1790,7 @@ class TestObservationProfiles:
                 zeek_uid="CsshTransport123",
             ),
         )
-        login = SecurityEvent(
+        login = OccurrenceBuilder(
             timestamp=_make_ts() + timedelta(seconds=2),
             event_type="ssh_session",
             dst_host=target,
@@ -1124,6 +1807,72 @@ class TestObservationProfiles:
             "ecar", login
         )
         assert policy.decide("ecar", transport).delay == policy.decide("ecar", login).delay
+
+    def test_boundary_open_ecar_ssh_transport_and_login_share_observation_fate(self, monkeypatch):
+        """A boundary-open SSH login cannot survive without its target inbound FLOW."""
+        monkeypatch.setattr(
+            "evidenceforge.events.observation.get_observation_profile",
+            lambda _name: {
+                "default": {
+                    "missingness": 0.0,
+                    "delay_ms": {"min_ms": 0, "max_ms": 0},
+                    "host_missingness_multiplier": {"min": 1.0, "max": 1.0},
+                },
+                "sources": {
+                    "ecar": {
+                        "missingness": 0.5,
+                        "delay_ms": {"min_ms": 5, "max_ms": 1000},
+                    }
+                },
+            },
+        )
+        policy = ObservationPolicy("ecar_boundary_ssh_tuple_test")
+        target = HostContext(
+            hostname="DB-PROD-01",
+            ip="10.10.4.10",
+            os="Ubuntu 22.04",
+            os_category="linux",
+            system_type="server",
+        )
+        opened_at = _make_ts().replace(hour=17, minute=58, second=30)
+        transport = OccurrenceBuilder(
+            timestamp=opened_at,
+            event_type="connection",
+            dst_host=target,
+            network=network_plan(
+                src_ip="10.10.1.31",
+                src_port=64161,
+                dst_ip=target.ip,
+                dst_port=22,
+                protocol="tcp",
+                zeek_uid="CboundarySsh123",
+                duration=120.0,
+            ),
+            lifecycle=ActionLifecycleContext(
+                group_id="network-transport-boundary-ssh",
+                canonical_start=opened_at,
+                phase="start",
+                parent_group_id="ssh-session-boundary",
+            ),
+        )
+        login = OccurrenceBuilder(
+            timestamp=opened_at + timedelta(seconds=6),
+            event_type="ssh_session",
+            dst_host=target,
+            auth=AuthContext(
+                username="marcus.chen",
+                source_ip="10.10.1.31",
+                source_port=64161,
+                logon_id="0x118b6497",
+                logon_type=10,
+            ),
+        )
+
+        transport_decision = policy.decide("ecar", transport)
+        login_decision = policy.decide("ecar", login)
+
+        assert policy._coherent_group_key("ecar", transport).startswith("remote-session:22:")
+        assert transport_decision == login_decision
 
     def test_ecar_rdp_transport_and_session_observation_are_tuple_coherent(self, monkeypatch):
         """Target eCAR RDP FLOW and Type 10 USER_SESSION rows should share observation fate."""
@@ -1151,11 +1900,11 @@ class TestObservationProfiles:
             os_category="windows",
             system_type="server",
         )
-        transport = SecurityEvent(
+        transport = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="connection",
             dst_host=target,
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.25",
                 src_port=55891,
                 dst_ip="10.0.2.20",
@@ -1164,7 +1913,7 @@ class TestObservationProfiles:
                 zeek_uid="CrdpTransport123",
             ),
         )
-        login = SecurityEvent(
+        login = OccurrenceBuilder(
             timestamp=_make_ts() + timedelta(seconds=2),
             event_type="logon",
             dst_host=target,
@@ -1214,10 +1963,10 @@ class TestObservationProfiles:
             observation_policy=ObservationPolicy("rdp_transport_parent_test"),
         )
 
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.25",
                 src_port=55891,
                 dst_ip="10.0.2.20",
@@ -1228,7 +1977,7 @@ class TestObservationProfiles:
                 conn_state="SF",
             ),
         )
-        dispatcher.dispatch(event)
+        dispatcher.dispatch_builder(event)
 
         ecar.emit.assert_called_once()
         conn.emit.assert_called_once()
@@ -1267,10 +2016,10 @@ class TestObservationProfiles:
             observation_policy=ObservationPolicy("failed_rdp_transport_gap_test"),
         )
 
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.25",
                 src_port=55891,
                 dst_ip="10.0.2.20",
@@ -1281,7 +2030,7 @@ class TestObservationProfiles:
                 conn_state="S0",
             ),
         )
-        dispatcher.dispatch(event)
+        dispatcher.dispatch_builder(event)
 
         ecar.emit.assert_called_once()
         conn.emit.assert_not_called()
@@ -1312,7 +2061,7 @@ class TestObservationProfiles:
             os_category="linux",
             system_type="server",
         )
-        connection = SecurityEvent(
+        connection = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="syslog",
             src_host=host,
@@ -1322,7 +2071,7 @@ class TestObservationProfiles:
                 message='Connection from 10.0.1.10 port 52713 on 10.0.3.10 port 22 rdomain ""',
             ),
         )
-        accepted = SecurityEvent(
+        accepted = OccurrenceBuilder(
             timestamp=_make_ts() + timedelta(milliseconds=120),
             event_type="ssh_session",
             dst_host=host,
@@ -1374,7 +2123,7 @@ class TestObservationProfiles:
             os_category="linux",
             system_type="server",
         )
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="logoff",
             dst_host=host,
@@ -1420,7 +2169,7 @@ class TestObservationProfiles:
             os_category="linux",
             system_type="server",
         )
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="syslog",
             src_host=host,
@@ -1442,10 +2191,10 @@ class TestObservationProfiles:
         dispatcher = EventDispatcher(state_manager=sm, emitters={"zeek_conn": zeek})
         dispatcher.storyline_cluster_id = "story-001"
 
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.50",
                 src_port=54321,
                 dst_ip="10.0.1.50",
@@ -1454,7 +2203,7 @@ class TestObservationProfiles:
             ),
             local_only=True,
         )
-        dispatcher.dispatch(event)
+        dispatcher.dispatch_builder(event)
 
         zeek.emit.assert_not_called()
         assert dispatcher.source_evidence_status["story-001"]["zeek"] == {"filtered": 1}
@@ -1499,10 +2248,10 @@ class TestNetworkVisibilityFiltering:
             visibility_engine=visibility,
         )
 
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.50",
                 src_port=54321,
                 dst_ip="10.0.1.100",
@@ -1510,9 +2259,9 @@ class TestNetworkVisibilityFiltering:
                 protocol="tcp",
             ),
         )
-        dispatcher.dispatch(event)
+        dispatcher.dispatch_builder(event)
 
-        zeek.emit.assert_called_once_with(event)
+        _assert_published_once(zeek.emit, event)
         snort.emit.assert_not_called()
 
     def test_host_event_bypasses_visibility(self):
@@ -1528,9 +2277,9 @@ class TestNetworkVisibilityFiltering:
             visibility_engine=visibility,
         )
 
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=_make_ts(),
-            event_type="logon",
+            event_type="workstation_locked",
             dst_host=HostContext(
                 hostname="WS-01",
                 ip="10.0.1.50",
@@ -1538,12 +2287,13 @@ class TestNetworkVisibilityFiltering:
                 os_category="windows",
                 system_type="workstation",
             ),
+            auth=AuthContext(username="alice", logon_id="0x100"),
         )
-        dispatcher.dispatch(event)
+        dispatcher.dispatch_builder(event)
 
         # Visibility engine should NOT be called for host events
         visibility.get_log_formats_for_connection.assert_not_called()
-        windows.emit.assert_called_once_with(event)
+        _assert_published_once(windows.emit, event)
 
     def test_no_visibility_engine_skips_filtering(self):
         """Without a visibility engine, all matching emitters receive events."""
@@ -1556,10 +2306,10 @@ class TestNetworkVisibilityFiltering:
             visibility_engine=None,
         )
 
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.50",
                 src_port=54321,
                 dst_ip="10.0.1.100",
@@ -1567,13 +2317,13 @@ class TestNetworkVisibilityFiltering:
                 protocol="tcp",
             ),
         )
-        dispatcher.dispatch(event)
+        dispatcher.dispatch_builder(event)
 
-        zeek.emit.assert_called_once_with(event)
+        _assert_published_once(zeek.emit, event)
 
 
 class TestDispatchRaw:
-    """Tests for RawLogEntry escape hatch."""
+    """Tests for RawProjectionRequest escape hatch."""
 
     def test_dispatch_raw_routes_to_named_emitter(self):
         """dispatch_raw() calls emit_raw() on the named emitter."""
@@ -1584,9 +2334,9 @@ class TestDispatchRaw:
             emitters={"syslog": syslog},
         )
 
-        entry = RawLogEntry(
+        entry = RawProjectionRequest(
             timestamp=_make_ts(),
-            target_emitter="syslog",
+            target_format="syslog",
             data={"message": "test"},
         )
         dispatcher.dispatch_raw(entry)
@@ -1598,13 +2348,558 @@ class TestDispatchRaw:
         sm = MagicMock(spec=StateManager)
         dispatcher = EventDispatcher(state_manager=sm, emitters={})
 
-        entry = RawLogEntry(
+        entry = RawProjectionRequest(
             timestamp=_make_ts(),
-            target_emitter="nonexistent",
+            target_format="nonexistent",
             data={},
         )
         with pytest.raises(KeyError, match="nonexistent"):
             dispatcher.dispatch_raw(entry)
+
+
+class TestPreparedDispatch:
+    """Tests for allocation-free, integrity-bound, one-shot publication."""
+
+    @staticmethod
+    def _environment(
+        *,
+        with_emitter: bool = True,
+    ) -> tuple[
+        StateManager,
+        LifecycleRegistry,
+        GeneratorLifecycleAuthority,
+        EventDispatcher,
+        MagicMock,
+        ProcessMaterializationPlan,
+    ]:
+        state = StateManager()
+        registry = LifecycleRegistry(shard_count=4)
+        shadow = LifecycleShadow(state, registry)
+        authority = GeneratorLifecycleAuthority(state, shadow, shard_count=4)
+        emitter = _make_mock_emitter("ecar", handles=with_emitter)
+        dispatcher = EventDispatcher(
+            state_manager=state,
+            emitters={"ecar": emitter} if with_emitter else {},
+            lifecycle_shadow=shadow,
+            enforce_lifecycle_authority=True,
+        )
+        dispatcher.bind_lifecycle_authority(authority)
+        plan = _planned_process(state)
+        return state, registry, authority, dispatcher, emitter, plan
+
+    def test_prepare_and_validate_leave_every_publication_authority_unchanged(self):
+        """Preparation freezes exact work without consuming any global authority."""
+
+        state, registry, _authority, dispatcher, emitter, plan = self._environment()
+        ledger = IntentExecutionLedger(AuthoredIntentLedger("prepared-zero-mutation", ()))
+        dispatcher.intent_execution_ledger = ledger
+        dispatcher.authored_intent_id = "prepared-process"
+        audit = ExecutionEffectAuditCounter()
+        dispatcher.bind_execution_effect_audit(audit)
+        state_version = state.materialization_version
+        state_digest = state.materialization_digest()
+        allocator_census = state.pid_allocator_census()
+        lifecycle_census = registry.stats()
+        audit_snapshot = audit.snapshot()
+
+        prepared = dispatcher.prepare_builder(
+            _process_start_builder(plan),
+            state_intent=PreparedDispatchStateIntent.EXTERNAL_MATERIALIZED_START,
+            lifecycle_ticket=plan,
+        )
+        dispatcher.validate_prepared(prepared)
+
+        assert state.materialization_version == state_version
+        assert state.materialization_digest() == state_digest
+        assert state.pid_allocator_census() == allocator_census
+        assert state.get_process(plan.identity.hostname, plan.identity.pid) is None
+        assert registry.stats() == lifecycle_census
+        assert audit.snapshot() == audit_snapshot
+        assert ledger.snapshot() == ()
+        assert dispatcher.source_evidence_status == {}
+        emitter.emit.assert_not_called()
+
+    def test_authority_precommit_rejection_leaves_prepared_dispatch_unpublished(self):
+        """A rejected root start changes neither state nor lifecycle nor source truth."""
+
+        state, registry, authority, dispatcher, emitter, plan = self._environment()
+        ledger = IntentExecutionLedger(AuthoredIntentLedger("prepared-precommit", ()))
+        dispatcher.intent_execution_ledger = ledger
+        dispatcher.authored_intent_id = "prepared-process"
+        prepared = dispatcher.prepare_builder(
+            _process_start_builder(plan),
+            state_intent=PreparedDispatchStateIntent.EXTERNAL_MATERIALIZED_START,
+            lifecycle_ticket=plan,
+        )
+        dispatcher.validate_prepared(prepared)
+        state_version = state.materialization_version
+        state_digest = state.materialization_digest()
+        allocator_census = state.pid_allocator_census()
+        lifecycle_census = registry.stats()
+
+        def _reject() -> None:
+            raise StateError("injected prepared root rejection")
+
+        authority._materialization_precommit_hook = _reject
+        with pytest.raises(StateError, match="injected prepared root rejection"):
+            authority.materialize_process(plan)
+
+        assert state.materialization_version == state_version
+        assert state.materialization_digest() == state_digest
+        assert state.pid_allocator_census() == allocator_census
+        assert state.get_process(plan.identity.hostname, plan.identity.pid) is None
+        assert registry.stats() == lifecycle_census
+        assert ledger.snapshot() == ()
+        assert dispatcher.source_evidence_status == {}
+        emitter.emit.assert_not_called()
+
+    def test_source_timing_preparation_commits_with_authority_and_publishes_once(self):
+        """One timing capability commits inside authority and authenticates one-shot publish."""
+
+        state, registry, authority, dispatcher, emitter, plan = self._environment()
+        planner = dispatcher.source_timing_planner
+        state_digest = state.materialization_digest()
+        lifecycle_census = registry.stats()
+        timing_digest = planner.state_digest()
+        with planner.prepared_planning() as preparation:
+            prepared = dispatcher.prepare_builder(
+                _process_start_builder(plan),
+                state_intent=PreparedDispatchStateIntent.EXTERNAL_MATERIALIZED_START,
+                lifecycle_ticket=plan,
+                source_timing_preparation=preparation,
+            )
+
+        assert planner.authenticates_preparation(preparation)
+        dispatcher.validate_prepared(prepared)
+        assert planner.state_digest() == timing_digest
+        assert state.materialization_digest() == state_digest
+        assert registry.stats() == lifecycle_census
+        with pytest.raises(EventContractError, match="source timing capability has no authentic"):
+            dispatcher.publish_prepared(prepared)
+        assert planner.state_digest() == timing_digest
+        assert state.materialization_digest() == state_digest
+        assert registry.stats() == lifecycle_census
+        emitter.emit.assert_not_called()
+
+        with preparation.claimed_commit():
+            process, receipt = authority.materialize_process(
+                plan,
+                finalize_external_no_fail=preparation.commit_no_fail,
+            )
+
+        assert preparation.committed
+        assert preparation.receipt is not None
+        assert planner.authenticates_preparation(preparation)
+        assert planner.authenticates_preparation_receipt(preparation.receipt)
+        dispatcher.publish_prepared(prepared, materialization_receipt=receipt)
+        assert state.get_process(plan.identity.hostname, plan.identity.pid) is process
+        emitter.emit.assert_called_once()
+        with pytest.raises(EventContractError, match="already published"):
+            dispatcher.publish_prepared(prepared, materialization_receipt=receipt)
+        emitter.emit.assert_called_once()
+
+    def test_source_timing_preparation_rejects_wrong_planner(self):
+        """A timing capability owned by another planner cannot authorize publication."""
+
+        state, registry, _authority, dispatcher, emitter, plan = self._environment()
+        timing_digest = dispatcher.source_timing_planner.state_digest()
+        foreign = SourceTimingPlanner()
+        with foreign.prepared_planning() as foreign_preparation:
+            with pytest.raises(EventContractError, match="not active for this planner"):
+                dispatcher.prepare_builder(
+                    _process_start_builder(plan),
+                    state_intent=PreparedDispatchStateIntent.EXTERNAL_MATERIALIZED_START,
+                    lifecycle_ticket=plan,
+                    source_timing_preparation=foreign_preparation,
+                )
+        assert dispatcher.source_timing_planner.state_digest() == timing_digest
+
+        with dispatcher.source_timing_planner.prepared_planning() as preparation:
+            prepared = dispatcher.prepare_builder(
+                _process_start_builder(plan),
+                state_intent=PreparedDispatchStateIntent.EXTERNAL_MATERIALIZED_START,
+                lifecycle_ticket=plan,
+                source_timing_preparation=preparation,
+            )
+        dispatcher.validate_prepared(prepared)
+        assert state.get_process(plan.identity.hostname, plan.identity.pid) is None
+        assert registry.stats().live_processes == 0
+        assert dispatcher.source_timing_planner.state_digest() == timing_digest
+        emitter.emit.assert_not_called()
+
+    def test_wrong_receipt_rejects_then_exact_receipt_publishes_only_once(self):
+        """Only the exact authority receipt may consume a root publication once."""
+
+        state, registry, authority, dispatcher, emitter, plan = self._environment()
+        ledger = IntentExecutionLedger(AuthoredIntentLedger("prepared-receipt", ()))
+        dispatcher.intent_execution_ledger = ledger
+        dispatcher.authored_intent_id = "prepared-process"
+        prepared = dispatcher.prepare_builder(
+            _process_start_builder(plan),
+            state_intent=PreparedDispatchStateIntent.EXTERNAL_MATERIALIZED_START,
+            lifecycle_ticket=plan,
+        )
+        dispatcher.validate_prepared(prepared)
+        process, receipt = authority.materialize_process(plan)
+        lifecycle_after_materialization = registry.stats()
+        forged = replace(receipt, _publication_token="forged-publication-token")
+
+        with pytest.raises(EventContractError, match="does not authenticate"):
+            dispatcher.publish_prepared(prepared, materialization_receipt=forged)
+
+        assert ledger.snapshot() == ()
+        assert dispatcher.source_evidence_status == {}
+        emitter.emit.assert_not_called()
+
+        dispatcher.publish_prepared(prepared, materialization_receipt=receipt)
+
+        assert state.get_process(plan.identity.hostname, plan.identity.pid) is process
+        assert registry.stats() == lifecycle_after_materialization
+        assert len(ledger.snapshot()) == 1
+        emitter.emit.assert_called_once()
+        source_status = dispatcher.source_evidence_status
+        with pytest.raises(EventContractError, match="already published"):
+            dispatcher.publish_prepared(prepared, materialization_receipt=receipt)
+        assert len(ledger.snapshot()) == 1
+        assert dispatcher.source_evidence_status == source_status
+        emitter.emit.assert_called_once()
+
+    def test_prepared_publication_freezes_intent_occurrence_and_observation_attribution(self):
+        """Later dispatcher intent changes cannot reattribute a prepared occurrence."""
+
+        state, _registry, authority, dispatcher, emitter, plan = self._environment()
+        ledger = IntentExecutionLedger(AuthoredIntentLedger("prepared-intent-freeze", ()))
+        dispatcher.intent_execution_ledger = ledger
+        dispatcher.authored_intent_id = "intent-at-prepare"
+        builder = _process_start_builder(plan)
+        builder.storyline_cluster_id = "prepared-intent-cluster"
+        prepared = dispatcher.prepare_builder(
+            builder,
+            state_intent=PreparedDispatchStateIntent.EXTERNAL_MATERIALIZED_START,
+            lifecycle_ticket=plan,
+        )
+
+        dispatcher.authored_intent_id = "intent-after-prepare"
+        process, receipt = authority.materialize_process(plan)
+        dispatcher.publish_prepared(prepared, materialization_receipt=receipt)
+
+        assert state.get_process(plan.identity.hostname, plan.identity.pid) is process
+        snapshots = {item.intent_id: item for item in ledger.snapshot()}
+        assert set(snapshots) == {"intent-at-prepare"}
+        assert snapshots["intent-at-prepare"].occurrence_reference_count == 1
+        assert snapshots["intent-at-prepare"].source_status == {"ecar": {"visible": 1}}
+        assert prepared._authored_intent_id == "intent-at-prepare"
+        emitter.emit.assert_called_once()
+        with pytest.raises(EventContractError, match="already published"):
+            dispatcher.publish_prepared(prepared, materialization_receipt=receipt)
+        assert ledger.snapshot() == tuple(snapshots.values())
+
+    def test_prepared_without_intent_cannot_adopt_later_dispatcher_attribution(self):
+        """A prepared unattributed occurrence stays unattributed through publication."""
+
+        _state, _registry, authority, dispatcher, emitter, plan = self._environment()
+        ledger = IntentExecutionLedger(AuthoredIntentLedger("prepared-no-intent", ()))
+        dispatcher.intent_execution_ledger = ledger
+        builder = _process_start_builder(plan)
+        builder.storyline_cluster_id = "prepared-no-intent-cluster"
+        prepared = dispatcher.prepare_builder(
+            builder,
+            state_intent=PreparedDispatchStateIntent.EXTERNAL_MATERIALIZED_START,
+            lifecycle_ticket=plan,
+        )
+
+        dispatcher.authored_intent_id = "late-intent"
+        _process, receipt = authority.materialize_process(plan)
+        dispatcher.publish_prepared(prepared, materialization_receipt=receipt)
+
+        assert prepared._authored_intent_id is None
+        assert ledger.snapshot() == ()
+        assert dispatcher.source_evidence_status == {
+            "prepared-no-intent-cluster": {"ecar": {"visible": 1}}
+        }
+        emitter.emit.assert_called_once()
+
+    def test_prepared_identity_rejects_copies_and_foreign_dispatchers(self):
+        """Only the exact dispatcher-retained prepared object is accepted."""
+
+        state, _registry, _authority, dispatcher, emitter, plan = self._environment()
+        dispatcher.authored_intent_id = "bound-intent"
+        prepared = dispatcher.prepare_builder(
+            _process_start_builder(plan),
+            state_intent=PreparedDispatchStateIntent.EXTERNAL_MATERIALIZED_START,
+            lifecycle_ticket=plan,
+        )
+
+        copied = copy(prepared)
+        with pytest.raises(EventContractError, match="stale or belongs to another dispatcher"):
+            dispatcher.validate_prepared(copied)
+
+        foreign = EventDispatcher(state_manager=state, emitters={})
+        with pytest.raises(EventContractError, match="stale or belongs to another dispatcher"):
+            foreign.validate_prepared(prepared)
+
+        dispatcher.validate_prepared(prepared)
+
+        assert plan.expected_version == state.materialization_version
+        assert state.get_process(plan.identity.hostname, plan.identity.pid) is None
+        emitter.emit.assert_not_called()
+
+    def test_public_same_field_receipt_forgery_cannot_publish_or_materialize(self):
+        """Public plan fields and SHA256 cannot forge an authority-issued receipt."""
+
+        state, registry, _authority, dispatcher, emitter, plan = self._environment()
+        prepared = dispatcher.prepare_builder(
+            _process_start_builder(plan),
+            state_intent=PreparedDispatchStateIntent.EXTERNAL_MATERIALIZED_START,
+            lifecycle_ticket=plan,
+        )
+        dispatcher.validate_prepared(prepared)
+        values = (
+            "process",
+            plan.identity.object_id,
+            plan.publication_token,
+            plan.expected_version,
+            plan.expected_version + 1,
+        )
+        forged = LifecycleMaterializationReceipt(
+            _kind="process",
+            _object_id=plan.identity.object_id,
+            _publication_token=plan.publication_token,
+            _prior_version=plan.expected_version,
+            _committed_version=plan.expected_version + 1,
+            _integrity_token=sha256(repr(values).encode()).hexdigest(),
+        )
+        allocator_census = state.pid_allocator_census()
+        state_digest = state.materialization_digest()
+        lifecycle_census = registry.stats()
+
+        with pytest.raises(EventContractError, match="does not authenticate"):
+            dispatcher.publish_prepared(prepared, materialization_receipt=forged)
+
+        assert state.materialization_version == plan.expected_version
+        assert state.materialization_digest() == state_digest
+        assert state.pid_allocator_census() == allocator_census
+        assert state.get_process(plan.identity.hostname, plan.identity.pid) is None
+        assert registry.stats() == lifecycle_census
+        assert dispatcher.source_evidence_status == {}
+        emitter.emit.assert_not_called()
+
+    def test_apply_intent_rejects_state_version_aba_without_publication(self):
+        """A compatibility prepared row cannot cross a StateManager version change."""
+
+        state = StateManager()
+        state.set_current_time(_make_ts())
+        registry = LifecycleRegistry(shard_count=4)
+        authority = GeneratorLifecycleAuthority(
+            state,
+            LifecycleShadow(state, registry),
+            shard_count=4,
+        )
+        emitter = _make_mock_emitter("syslog", handles=True)
+        dispatcher = EventDispatcher(state_manager=state, emitters={"syslog": emitter})
+        prepared = dispatcher.prepare_builder(_syslog_event())
+        session_plan = state.plan_session_materialization(
+            username="alice",
+            system="HOST-01",
+            logon_type=2,
+            source_ip="-",
+            start_time=_make_ts(),
+            session_kind="interactive",
+        )
+        authority.materialize_session(session_plan)
+
+        with pytest.raises(StateError, match="state version is stale"):
+            dispatcher.publish_prepared(prepared)
+
+        assert dispatcher.source_evidence_status == {}
+        emitter.emit.assert_not_called()
+
+    def test_direct_and_explicit_compatibility_paths_publish_identical_occurrences(self):
+        """The compatibility wrapper is byte-equivalent to explicit prepare/publish."""
+
+        direct_state = MagicMock(spec=StateManager)
+        explicit_state = MagicMock(spec=StateManager)
+        direct_emitter = _make_mock_emitter("syslog", handles=True)
+        explicit_emitter = _make_mock_emitter("syslog", handles=True)
+        direct = EventDispatcher(direct_state, {"syslog": direct_emitter})
+        explicit = EventDispatcher(explicit_state, {"syslog": explicit_emitter})
+
+        direct_ids = direct.dispatch_builder(_syslog_event())
+        prepared = explicit.prepare_builder(_syslog_event())
+        assert prepared._authored_intent_id is None
+        assert prepared._action_cohort_batch_id is None
+        explicit_ids = explicit.publish_prepared(prepared)
+
+        direct_occurrence = direct_emitter.emit.call_args.args[0]
+        explicit_occurrence = explicit_emitter.emit.call_args.args[0]
+        assert direct_ids == explicit_ids
+        assert direct_occurrence == explicit_occurrence
+        assert direct_state.apply.call_args.args[0] == explicit_state.apply.call_args.args[0]
+
+    def test_external_dependent_uses_root_receipt_without_lifecycle_replanning(self):
+        """A root and dependent can share one receipt after complete batch preparation."""
+
+        state, registry, authority, dispatcher, emitter, plan = self._environment()
+        root = dispatcher.prepare_builder(
+            _process_start_builder(plan),
+            state_intent=PreparedDispatchStateIntent.EXTERNAL_MATERIALIZED_START,
+            lifecycle_ticket=plan,
+        )
+        dependent = dispatcher.prepare_builder(
+            _process_file_builder(plan),
+            state_intent=PreparedDispatchStateIntent.EXTERNAL_DEPENDENT,
+            lifecycle_ticket=plan,
+        )
+        dispatcher.validate_prepared(root)
+        dispatcher.validate_prepared(dependent)
+        process, receipt = authority.materialize_process(plan)
+        lifecycle_after_materialization = registry.stats()
+
+        dispatcher.publish_prepared(root, materialization_receipt=receipt)
+        dispatcher.publish_prepared(dependent, materialization_receipt=receipt)
+
+        assert state.get_process(plan.identity.hostname, plan.identity.pid) is process
+        assert process.last_activity_time == plan.identity.started_at + timedelta(milliseconds=1)
+        assert registry.stats() == lifecycle_after_materialization
+        assert emitter.emit.call_count == 2
+
+    def test_external_transport_requires_full_receipt_and_never_reapplies_state(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Only the full root receipt publishes once without a second State mutation."""
+
+        state, authority, adapter, runtime, timing, dispatcher, emitter = (
+            _prepared_network_dispatch_environment()
+        )
+        owner_rng = random.Random(201)
+        root, lifecycle_token = _prepared_physical_root(
+            authority,
+            adapter,
+            runtime,
+            owner_rng,
+            stable_id="dispatcher-prepared-transport",
+        )
+        with timing.prepared_planning() as timing_preparation:
+            prepared = dispatcher.prepare_builder(
+                _prepared_connection_builder(root),
+                state_intent=PreparedDispatchStateIntent.EXTERNAL_TRANSPORT,
+                lifecycle_ticket=root,
+                source_timing_preparation=timing_preparation,
+            )
+        dispatcher.validate_prepared(prepared)
+        result = authority.materialize_prepared_network_transaction(
+            root,
+            owner_rng,
+            source_timing_preparation=timing_preparation,
+            lifecycle_token=lifecycle_token,
+        )
+        state_version = state.materialization_version
+        state_apply = MagicMock(side_effect=AssertionError("external transport reapplied State"))
+        # Patch the class seam so the diagnostic digest continues to cover only
+        # StateManager-owned instance authority, not a test-owned MagicMock.
+        monkeypatch.setattr(StateManager, "apply", state_apply)
+        state_digest = state.materialization_digest()
+
+        with pytest.raises(EventContractError, match="does not authenticate"):
+            dispatcher.publish_prepared(
+                prepared,
+                materialization_receipt=result.connection.receipt,
+            )
+        emitter.emit.assert_not_called()
+        dispatcher.publish_prepared(prepared, materialization_receipt=result.receipt)
+
+        assert state.materialization_version == state_version
+        assert state.materialization_digest() == state_digest
+        state_apply.assert_not_called()
+        emitter.emit.assert_called_once()
+        assert dispatcher._latest_network_plan == root.transaction
+        with pytest.raises(EventContractError, match="already published"):
+            dispatcher.publish_prepared(prepared, materialization_receipt=result.receipt)
+
+    def test_external_transport_rejects_a_different_authentic_timing_commit(self) -> None:
+        """A full receipt cannot publish a dispatch prepared under another timing root."""
+
+        _state, authority, adapter, runtime, timing, dispatcher, emitter = (
+            _prepared_network_dispatch_environment()
+        )
+        owner_rng = random.Random(202)
+        root, lifecycle_token = _prepared_physical_root(
+            authority,
+            adapter,
+            runtime,
+            owner_rng,
+            stable_id="dispatcher-timing-mismatch",
+        )
+        with timing.prepared_planning() as dispatch_timing:
+            prepared = dispatcher.prepare_builder(
+                _prepared_connection_builder(root),
+                state_intent=PreparedDispatchStateIntent.EXTERNAL_TRANSPORT,
+                lifecycle_ticket=root,
+                source_timing_preparation=dispatch_timing,
+            )
+        with dispatch_timing.claimed_commit():
+            dispatch_timing.commit_no_fail()
+        with timing.prepared_planning() as materialization_timing:
+            pass
+        result = authority.materialize_prepared_network_transaction(
+            root,
+            owner_rng,
+            source_timing_preparation=materialization_timing,
+            lifecycle_token=lifecycle_token,
+        )
+
+        assert timing.authenticates_preparation_receipt(dispatch_timing.receipt)
+        assert timing.authenticates_preparation_receipt(result.timing)
+        with pytest.raises(EventContractError, match="does not authenticate"):
+            dispatcher.publish_prepared(prepared, materialization_receipt=result.receipt)
+        emitter.emit.assert_not_called()
+
+    def test_external_transport_rejects_semantic_mismatch_before_prepare(self) -> None:
+        """A transport occurrence must agree with its finalized root at the boundary."""
+
+        state, authority, adapter, runtime, timing, dispatcher, emitter = (
+            _prepared_network_dispatch_environment()
+        )
+        owner_rng = random.Random(203)
+        root, lifecycle_token = _prepared_physical_root(
+            authority,
+            adapter,
+            runtime,
+            owner_rng,
+            stable_id="dispatcher-root-binding",
+        )
+        mismatched_transaction = replace(
+            root.transaction,
+            dst_port=root.transaction.dst_port + 1,
+        )
+        mismatched_builder = _prepared_connection_builder(root)
+        mismatched_builder.network = mismatched_transaction
+        state_digest = state.materialization_digest()
+        with pytest.raises(EventContractError, match="disagrees with its finalized root"):
+            with timing.prepared_planning() as rejected_timing:
+                dispatcher.prepare_builder(
+                    mismatched_builder,
+                    state_intent=PreparedDispatchStateIntent.EXTERNAL_TRANSPORT,
+                    lifecycle_ticket=root,
+                    source_timing_preparation=rejected_timing,
+                )
+        assert state.materialization_digest() == state_digest
+        emitter.emit.assert_not_called()
+
+        with timing.prepared_planning() as timing_preparation:
+            prepared = dispatcher.prepare_builder(
+                _prepared_connection_builder(root),
+                state_intent=PreparedDispatchStateIntent.EXTERNAL_TRANSPORT,
+                lifecycle_ticket=root,
+                source_timing_preparation=timing_preparation,
+            )
+        dispatcher.validate_prepared(prepared)
+        assert state.materialization_digest() == state_digest
+        emitter.emit.assert_not_called()
+        runtime.cancel_preparation(root.runtime_token)
+        adapter.cancel_closed_transport_publication(lifecycle_token)
+        timing_preparation.cancel()
 
 
 class TestStateManagerApply:
@@ -1625,7 +2920,7 @@ class TestStateManagerApply:
         assert sm.get_session(logon_id) is not None
 
         # Dispatch logoff event
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="logoff",
             auth=AuthContext(username="alice", logon_id=logon_id),
@@ -1652,7 +2947,7 @@ class TestStateManagerApply:
         assert sm.get_process("WS-01", pid) is not None
 
         # Dispatch terminate event
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="process_terminate",
             src_host=HostContext(
@@ -1678,7 +2973,7 @@ class TestStateManagerApply:
     def test_apply_logon_is_noop(self):
         """apply() with logon event is a no-op (IDs allocated before dispatch)."""
         sm = StateManager()
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="logon",
             auth=AuthContext(username="alice", logon_id="0x12345"),
@@ -1698,10 +2993,10 @@ class TestStateManagerApply:
             protocol="tcp",
         )
 
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.1.50",
                 src_port=54321,
                 dst_ip="10.0.1.100",
@@ -1726,7 +3021,7 @@ class TestCanHandleDefault:
     def test_base_can_handle_returns_false(self):
         """Base LogEmitter.can_handle() returns False for any event."""
 
-        event = SecurityEvent(timestamp=_make_ts(), event_type="logon")
+        event = OccurrenceBuilder(timestamp=_make_ts(), event_type="logon")
 
         # Can't instantiate ABC directly, but we can test via a concrete subclass
         # All current subclasses inherit the default can_handle() which returns False
@@ -1782,7 +3077,7 @@ class TestCanHandleDefault:
         format_def = load_format("syslog")
         with tempfile.NamedTemporaryFile(suffix=".log") as f:
             emitter = SyslogEmitter(format_def, Path(f.name))
-            event = SecurityEvent(timestamp=_make_ts(), event_type="unsupported_type")
+            event = OccurrenceBuilder(timestamp=_make_ts(), event_type="unsupported_type")
             with pytest.raises(NotImplementedError, match="SyslogEmitter"):
                 emitter.emit(event)
 
@@ -1843,6 +3138,63 @@ class TestCanHandleDefault:
         lines = output_path.read_text(encoding="utf-8").splitlines()
         assert lines[0].startswith("<86>Oct 14 19:00:53")
         assert lines[1].startswith("<86>Oct 14 20:01:25")
+
+    def test_syslog_barrier_spooling_preserves_byte_identical_final_output(self, tmp_path):
+        """Barrier spills should bound buffers without changing normalized output bytes."""
+        from datetime import UTC, datetime
+
+        from evidenceforge.formats import load_format
+        from evidenceforge.generation.emitters.syslog import SyslogEmitter
+
+        events = [
+            {
+                "timestamp": datetime(2024, 10, 14, 20, 1, 25, tzinfo=UTC),
+                "hostname": "linux01",
+                "app_name": "systemd-logind",
+                "pid": 500,
+                "facility": 10,
+                "severity": 6,
+                "message": "Removed session 170.",
+            },
+            {
+                "timestamp": datetime(2024, 10, 14, 19, 0, 53, tzinfo=UTC),
+                "hostname": "linux01",
+                "app_name": "systemd-logind",
+                "pid": 500,
+                "facility": 10,
+                "severity": 6,
+                "message": "New session 176 of user jsmith.",
+            },
+            {
+                "timestamp": datetime(2024, 10, 14, 19, 30, 0, tzinfo=UTC),
+                "hostname": "linux01",
+                "app_name": "logger",
+                "pid": 700,
+                "facility": 10,
+                "severity": 5,
+                "message": "field=value\r\nforged-entry: status=ok",
+            },
+        ]
+        outputs = []
+        for name, use_barriers in (("buffered.log", False), ("spooled.log", True)):
+            output_path = tmp_path / name
+            emitter = SyslogEmitter(
+                load_format("syslog"),
+                output_path,
+                buffer_size=10,
+                threaded=use_barriers,
+            )
+            emitter.configure_output_target("sof-elk")
+            for event in events:
+                emitter.emit_raw(dict(event))
+                if use_barriers:
+                    emitter.barrier_flush()
+                    assert all(not writer.buffer for writer in emitter._writers.values())
+            emitter.close()
+            outputs.append(output_path.read_bytes())
+
+        assert outputs[0] == outputs[1]
+        assert b"field=value\r\nforged-entry: status=ok" in outputs[1]
 
     def test_syslog_routes_generated_output_by_event_year(self, tmp_path):
         """Directory-mode syslog output should split host logs by event year."""
@@ -2165,7 +3517,7 @@ class TestCanHandleDefault:
             os_category="linux",
             system_type="server",
         )
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=_make_ts(),
             event_type="ssh_session",
             src_host=src_host,
@@ -2174,6 +3526,95 @@ class TestCanHandleDefault:
         )
 
         assert SyslogEmitter._linux_host(event) is dst_host
+
+    def test_samba_syslog_routes_to_target_when_both_hosts_are_linux(self):
+        """Samba application evidence belongs to the server, not the Linux client."""
+        from evidenceforge.generation.emitters.syslog import SyslogEmitter
+
+        src_host = HostContext(
+            hostname="LNX-CLIENT-01",
+            ip="10.30.0.10",
+            os="Ubuntu 24.04",
+            os_category="linux",
+            system_type="workstation",
+        )
+        dst_host = HostContext(
+            hostname="SAMBA-01",
+            ip="10.30.0.20",
+            os="Ubuntu Server 24.04",
+            os_category="linux",
+            system_type="server",
+        )
+        event = OccurrenceBuilder(
+            timestamp=_make_ts(),
+            event_type="smb_file_read",
+            src_host=src_host,
+            dst_host=dst_host,
+            auth=AuthContext(
+                username="linux_user",
+                session_kind="smb",
+                auth_session_ref="smb-auth-1",
+            ),
+            smb=SmbContext(
+                phase="read",
+                operation="read",
+                purpose="routing test",
+                session_id="smb-session-1",
+                tree_id="tree-1",
+                share_ref="SAMBA-01.finance",
+                share_name="Finance",
+                result="success",
+                server_path="/srv/samba/data/report.xlsx",
+                filesystem="xfs",
+                backing_filesystem="xfs",
+                server_platform="linux",
+                provider="samba",
+                audit="high",
+            ),
+        )
+
+        assert SyslogEmitter._linux_host(event) is dst_host
+
+    def test_windows_security_suppresses_samba_audit(self, tmp_path):
+        """Linux Samba events must not be projected as Windows Security audit."""
+        from evidenceforge.formats import load_format
+        from evidenceforge.generation.emitters.windows import WindowsEventEmitter
+
+        emitter = WindowsEventEmitter(
+            load_format("windows_event_security"),
+            tmp_path / "windows_event_security.xml",
+            threaded=False,
+        )
+        event = OccurrenceBuilder(
+            timestamp=_make_ts(),
+            event_type="smb_file_read",
+            dst_host=HostContext(
+                hostname="SAMBA-01",
+                ip="10.30.0.20",
+                os="Ubuntu Server 24.04",
+                os_category="linux",
+                system_type="server",
+            ),
+            auth=AuthContext(username="linux_user", session_kind="smb"),
+            smb=SmbContext(
+                phase="read",
+                operation="read",
+                purpose="routing test",
+                session_id="smb-session-1",
+                tree_id="tree-1",
+                share_ref="SAMBA-01.finance",
+                share_name="Finance",
+                result="success",
+                server_path="/srv/samba/data/report.xlsx",
+                filesystem="xfs",
+                backing_filesystem="xfs",
+                server_platform="linux",
+                provider="samba",
+                audit="high",
+            ),
+        )
+
+        assert not emitter.can_handle(event)
 
 
 class TestBuildHostContext:
@@ -2314,55 +3755,191 @@ class TestWarmUpSuppression:
         dispatcher, sm, emitter = self._make_dispatcher(output_start_time=output_start)
 
         # Event 1 hour before output start
-        event = SecurityEvent(
-            timestamp=datetime(2026, 3, 19, 9, 0, 0, tzinfo=UTC),
-            event_type="logon",
-        )
-        dispatcher.dispatch(event)
+        event = _syslog_event(datetime(2026, 3, 19, 9, 0, 0, tzinfo=UTC))
+        dispatcher.dispatch_builder(event)
 
-        sm.apply.assert_called_once_with(event)
+        _assert_published_once(sm.apply, event)
         emitter.emit.assert_not_called()
+
+    def test_strict_lifecycle_rejection_does_not_record_intent_occurrence(self):
+        """Rejected canonical state cannot leak into intent or source audit truth."""
+
+        sm = MagicMock(spec=StateManager)
+        emitter = _make_mock_emitter("windows", handles=True)
+        lifecycle_shadow = MagicMock()
+        lifecycle_shadow.prepare.side_effect = StateError("rejected before canonical apply")
+        ledger = IntentExecutionLedger(AuthoredIntentLedger("dispatcher-rejection", ()))
+        dispatcher = EventDispatcher(
+            state_manager=sm,
+            emitters={"windows_event_security": emitter},
+            intent_execution_ledger=ledger,
+            lifecycle_shadow=lifecycle_shadow,
+            enforce_lifecycle_authority=True,
+        )
+        dispatcher.authored_intent_id = "rejected-intent"
+        event = _syslog_event()
+
+        with pytest.raises(StateError, match="rejected before canonical apply"):
+            dispatcher.dispatch_builder(event)
+
+        assert ledger.snapshot() == ()
+        assert dispatcher.source_evidence_status == {}
+        sm.apply.assert_not_called()
+        emitter.emit.assert_not_called()
+
+    def test_strict_lifecycle_rejection_does_not_record_effect_publication(self):
+        """Rejected canonical state cannot enter the independent effect denominator."""
+
+        sm = MagicMock(spec=StateManager)
+        emitter = _make_mock_emitter("windows", handles=True)
+        lifecycle_shadow = MagicMock()
+        lifecycle_shadow.prepare.side_effect = StateError("rejected before canonical apply")
+        audit = ExecutionEffectAuditCounter()
+        dispatcher = EventDispatcher(
+            state_manager=sm,
+            emitters={"windows_event_security": emitter},
+            lifecycle_shadow=lifecycle_shadow,
+            enforce_lifecycle_authority=True,
+        )
+        dispatcher.bind_execution_effect_audit(audit)
+        before = audit.snapshot()
+        event = OccurrenceBuilder(
+            timestamp=_make_ts(),
+            event_type="file_create",
+            src_host=_host(),
+            file=FileContext(path="/tmp/rejected", action="create", pid=42),
+            effect_provenance=EffectOccurrenceProvenance.planned(
+                kind=EffectOccurrenceKind.FILE,
+                root_action_id="process-action",
+                plan_action_id="effect-plan-action",
+                node_id="file-node",
+                occurrence_ordinal=0,
+            ),
+        )
+
+        with pytest.raises(StateError, match="rejected before canonical apply"):
+            dispatcher.dispatch_builder(event)
+
+        assert audit.snapshot() == before
+        assert dispatcher.source_evidence_status == {}
+        sm.apply.assert_not_called()
+        emitter.emit.assert_not_called()
+
+    def test_source_suppressed_event_records_one_accepted_intent_occurrence(self):
+        """Canonical warm-up state remains intent truth even with no rendered source row."""
+
+        output_start = _make_ts() + timedelta(hours=1)
+        sm = MagicMock(spec=StateManager)
+        emitter = _make_mock_emitter("windows", handles=True)
+        ledger = IntentExecutionLedger(AuthoredIntentLedger("dispatcher-suppression", ()))
+        dispatcher = EventDispatcher(
+            state_manager=sm,
+            emitters={"windows_event_security": emitter},
+            output_start_time=output_start,
+            intent_execution_ledger=ledger,
+        )
+        dispatcher.authored_intent_id = "accepted-intent"
+        event = _syslog_event()
+
+        dispatcher.dispatch_builder(event)
+
+        snapshot = ledger.snapshot()
+        assert len(snapshot) == 1
+        assert snapshot[0].intent_id == "accepted-intent"
+        assert snapshot[0].occurrence_reference_count == 1
+        assert snapshot[0].duplicate_occurrence_count == 0
+        _assert_published_once(sm.apply, event)
+        emitter.emit.assert_not_called()
+
+    def test_source_suppressed_effect_records_one_canonical_publication(self):
+        """Warm-up suppression cannot erase an accepted canonical effect occurrence."""
+
+        output_start = _make_ts() + timedelta(hours=1)
+        sm = MagicMock(spec=StateManager)
+        emitter = _make_mock_emitter("windows", handles=True)
+        audit = ExecutionEffectAuditCounter()
+        dispatcher = EventDispatcher(
+            state_manager=sm,
+            emitters={"windows_event_security": emitter},
+            output_start_time=output_start,
+        )
+        dispatcher.bind_execution_effect_audit(audit)
+        event = OccurrenceBuilder(
+            timestamp=_make_ts(),
+            event_type="file_create",
+            src_host=_host(),
+            file=FileContext(path="/tmp/suppressed", action="create", pid=42),
+            effect_provenance=EffectOccurrenceProvenance.planned(
+                kind=EffectOccurrenceKind.FILE,
+                root_action_id="process-action",
+                plan_action_id="effect-plan-action",
+                node_id="file-node",
+                occurrence_ordinal=0,
+            ),
+        )
+
+        dispatcher.dispatch_builder(event)
+
+        snapshot = audit.snapshot()
+        assert snapshot.published_effect_occurrence_count == 1
+        assert snapshot.unprovenanced_effect_occurrence_count == 0
+        assert snapshot.effect_publication_mismatch_count == 1
+        _assert_published_once(sm.apply, event)
+        emitter.emit.assert_not_called()
+
+    def test_unprovenanced_effect_publication_makes_bound_audit_incomplete(self):
+        """A raw accepted FileContext cannot produce an empty-denominator false green."""
+
+        sm = MagicMock(spec=StateManager)
+        audit = ExecutionEffectAuditCounter()
+        dispatcher = EventDispatcher(state_manager=sm, emitters={})
+        dispatcher.bind_execution_effect_audit(audit)
+        event = OccurrenceBuilder(
+            timestamp=_make_ts(),
+            event_type="file_read",
+            src_host=_host(),
+            file=FileContext(path="/tmp/untyped", action="read", pid=42),
+        )
+
+        dispatcher.dispatch_builder(event)
+
+        snapshot = audit.snapshot()
+        assert snapshot.plan_count == 0
+        assert snapshot.unprovenanced_effect_occurrence_count == 1
+        assert not snapshot.complete
+        _assert_published_once(sm.apply, event)
 
     def test_dispatch_emits_at_output_start(self):
         """Events exactly at output_start_time are emitted normally."""
         output_start = datetime(2026, 3, 19, 10, 0, 0, tzinfo=UTC)
         dispatcher, sm, emitter = self._make_dispatcher(output_start_time=output_start)
 
-        event = SecurityEvent(
-            timestamp=datetime(2026, 3, 19, 10, 0, 0, tzinfo=UTC),
-            event_type="logon",
-        )
-        dispatcher.dispatch(event)
+        event = _syslog_event(datetime(2026, 3, 19, 10, 0, 0, tzinfo=UTC))
+        dispatcher.dispatch_builder(event)
 
-        sm.apply.assert_called_once_with(event)
-        emitter.emit.assert_called_once_with(event)
+        _assert_published_once(sm.apply, event)
+        _assert_published_once(emitter.emit, event)
 
     def test_dispatch_emits_after_output_start(self):
         """Events after output_start_time are emitted normally."""
         output_start = datetime(2026, 3, 19, 10, 0, 0, tzinfo=UTC)
         dispatcher, sm, emitter = self._make_dispatcher(output_start_time=output_start)
 
-        event = SecurityEvent(
-            timestamp=datetime(2026, 3, 19, 11, 0, 0, tzinfo=UTC),
-            event_type="logon",
-        )
-        dispatcher.dispatch(event)
+        event = _syslog_event(datetime(2026, 3, 19, 11, 0, 0, tzinfo=UTC))
+        dispatcher.dispatch_builder(event)
 
-        sm.apply.assert_called_once_with(event)
-        emitter.emit.assert_called_once_with(event)
+        _assert_published_once(sm.apply, event)
+        _assert_published_once(emitter.emit, event)
 
     def test_dispatch_no_suppression_when_output_start_none(self):
         """Without output_start_time, all events are emitted (default behavior)."""
         dispatcher, sm, emitter = self._make_dispatcher(output_start_time=None)
 
-        event = SecurityEvent(
-            timestamp=datetime(2026, 3, 19, 9, 0, 0, tzinfo=UTC),
-            event_type="logon",
-        )
-        dispatcher.dispatch(event)
+        event = _syslog_event(datetime(2026, 3, 19, 9, 0, 0, tzinfo=UTC))
+        dispatcher.dispatch_builder(event)
 
-        sm.apply.assert_called_once_with(event)
-        emitter.emit.assert_called_once_with(event)
+        _assert_published_once(sm.apply, event)
+        _assert_published_once(emitter.emit, event)
 
     def test_dispatch_raw_suppressed_before_output_start(self):
         """dispatch_raw() skips emission for pre-window raw entries."""
@@ -2375,9 +3952,9 @@ class TestWarmUpSuppression:
             output_start_time=output_start,
         )
 
-        entry = RawLogEntry(
+        entry = RawProjectionRequest(
             timestamp=datetime(2026, 3, 19, 9, 0, 0, tzinfo=UTC),
-            target_emitter="syslog",
+            target_format="syslog",
             data={"message": "test"},
         )
         dispatcher.dispatch_raw(entry)
@@ -2395,9 +3972,9 @@ class TestWarmUpSuppression:
             output_start_time=output_start,
         )
 
-        entry = RawLogEntry(
+        entry = RawProjectionRequest(
             timestamp=datetime(2026, 3, 19, 10, 0, 0, tzinfo=UTC),
-            target_emitter="syslog",
+            target_format="syslog",
             data={"message": "test"},
         )
         dispatcher.dispatch_raw(entry)

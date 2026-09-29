@@ -20,11 +20,16 @@ from evidenceforge.generation.actions import (
     ScheduledScanOverlapRequest,
     WebScanActionBundle,
     WebScanRequest,
+    WorkstationLockResult,
+)
+from evidenceforge.generation.actions import (
+    network_transaction_planner as network_planner_module,
 )
 from evidenceforge.generation.engine.baseline import BaselineMixin
 from evidenceforge.generation.engine.storyline import (
     StorylineMixin,
     _c2_http_response_size,
+    _dns_periodic_exclusive_start_fence,
     _effective_rate_interval,
     _is_c2_http_request,
     _iter_dns_tunnel_ticks,
@@ -32,11 +37,13 @@ from evidenceforge.generation.engine.storyline import (
     _iter_shuffled_port_scan_pairs,
     _observed_web_scan_status,
     _port_scan_connection_profile,
+    _sample_network_hosts,
     _scan_target_exposes_port,
     _web_scan_connection_profile,
     _web_scan_path_allows_referrer,
     _web_scan_uri_with_runtime_variation,
 )
+from evidenceforge.generation.engine.storyline_helpers import periodic as periodic_helpers
 from evidenceforge.models import System, User
 from evidenceforge.models.scenario import (
     BeaconEventSpec,
@@ -45,6 +52,8 @@ from evidenceforge.models.scenario import (
     DnsQueryEventSpec,
     DnsTunnelEventSpec,
     ExplicitCredentialsEventSpec,
+    FailedLogonEventSpec,
+    LogonEventSpec,
     NetworkConfig,
     NetworkSegment,
     NetworkSensor,
@@ -165,6 +174,7 @@ class TestBeaconEventSpec:
             orig_bytes=500,
             resp_bytes=1000,
             conn_state="SF",
+            request_body_len=700,
             response_body_len=1000,
             interval="5m",
             duration="2h",
@@ -172,6 +182,20 @@ class TestBeaconEventSpec:
         )
         assert spec.hostname == "evil.com"
         assert spec.orig_bytes == 500
+        assert spec.request_body_len == 700
+
+    def test_http_sequence_accepts_request_body_ranges(self):
+        spec = BeaconEventSpec(
+            dst_ip="1.2.3.4",
+            service="http",
+            interval="5m",
+            count=2,
+            http_sequence=[
+                {"method": "POST", "uri": "/api/checkin", "request_body_len": [96, 144]}
+            ],
+        )
+
+        assert spec.http_sequence[0].request_body_len == [96, 144]
 
     def test_rejects_rate(self):
         with pytest.raises(ValidationError, match="interval"):
@@ -277,6 +301,71 @@ class TestIterPeriodicTicks:
         # duration=300s, interval=60s → ticks at t=0,60,120,180,240,300 → 6 ticks
         assert len(ticks) == 6
 
+    def test_exclusive_end_omits_exact_boundary_before_rng(self):
+        from unittest.mock import Mock
+
+        start = datetime(2026, 4, 16, 12, 0, 0, tzinfo=UTC)
+        rng = Mock()
+        rng.uniform.side_effect = [0.0, 0.0]
+
+        ticks = list(
+            _iter_periodic_ticks(
+                start,
+                60.0,
+                180.0,
+                None,
+                0.0,
+                rng,
+                exclusive_end_time=start + timedelta(seconds=120),
+            )
+        )
+
+        assert ticks == [start, start + timedelta(seconds=60)]
+        assert rng.uniform.call_count == 2
+
+    def test_exclusive_end_omits_post_window_campaign_before_rng(self):
+        from unittest.mock import Mock
+
+        fence = datetime(2026, 4, 16, 12, 0, 0, tzinfo=UTC)
+        rng = Mock()
+
+        ticks = list(
+            _iter_periodic_ticks(
+                fence + timedelta(microseconds=1),
+                60.0,
+                None,
+                2,
+                0.0,
+                rng,
+                exclusive_end_time=fence,
+            )
+        )
+
+        assert ticks == []
+        rng.uniform.assert_not_called()
+
+    def test_exclusive_end_preserves_inclusive_campaign_end_inside_fence(self):
+        rng = random.Random(42)
+        start = datetime(2026, 4, 16, 12, 0, 0, tzinfo=UTC)
+
+        ticks = list(
+            _iter_periodic_ticks(
+                start,
+                60.0,
+                120.0,
+                None,
+                0.0,
+                rng,
+                exclusive_end_time=start + timedelta(seconds=121),
+            )
+        )
+
+        assert ticks == [
+            start,
+            start + timedelta(seconds=60),
+            start + timedelta(seconds=120),
+        ]
+
     def test_zero_jitter_exact_spacing(self):
         rng = random.Random(42)
         start = datetime(2026, 4, 16, 12, 0, 0, tzinfo=UTC)
@@ -320,6 +409,30 @@ class TestIterPeriodicTicks:
         assert sum(interval < 3.0 for interval in intervals) < len(intervals) * 0.82
         assert len({round(interval, 1) for interval in intervals}) > 20
 
+    def test_dns_tunnel_pacing_omits_exact_exclusive_end(self):
+        start = datetime(2026, 4, 16, 12, 0, 0, tzinfo=UTC)
+        rng = random.Random(42)
+        initial_rng_state = rng.getstate()
+        probe_rng = random.Random()
+        probe_rng.setstate(initial_rng_state)
+        probe_rng.uniform(0.0, 0.0)
+        exact_spacing = probe_rng.expovariate(1.0 / (60.0 * 0.55))
+
+        ticks = list(
+            _iter_dns_tunnel_ticks(
+                start,
+                60.0,
+                None,
+                1,
+                0.0,
+                rng,
+                exclusive_end_time=start + timedelta(seconds=exact_spacing),
+            )
+        )
+
+        assert ticks == []
+        assert rng.getstate() == initial_rng_state
+
     def test_duration_shorter_than_interval(self):
         rng = random.Random(42)
         start = datetime(2026, 4, 16, 12, 0, 0, tzinfo=UTC)
@@ -332,7 +445,6 @@ class TestIterPeriodicTicks:
         from types import SimpleNamespace
         from unittest.mock import Mock
 
-        from evidenceforge.generation.engine import storyline
         from evidenceforge.generation.engine.storyline import StorylineMixin
         from evidenceforge.models.scenario import System, User
 
@@ -351,9 +463,9 @@ class TestIterPeriodicTicks:
         engine.activity_generator._proxy_mode = "transparent"
 
         periodic = Mock(return_value=iter(expected_ticks))
-        monkeypatch.setattr(storyline, "_iter_periodic_ticks", periodic)
+        monkeypatch.setattr(periodic_helpers, "_iter_periodic_ticks", periodic)
         monkeypatch.setattr(
-            storyline,
+            periodic_helpers,
             "_iter_dns_tunnel_ticks",
             Mock(side_effect=AssertionError("generic beacons must not use DNS tunnel pacing")),
         )
@@ -383,7 +495,6 @@ class TestIterPeriodicTicks:
         """Beacon http_sequence should vary URI templates without hand-authored events."""
         from unittest.mock import Mock
 
-        from evidenceforge.generation.engine import storyline
         from evidenceforge.generation.engine.storyline import StorylineMixin
 
         start = datetime(2026, 4, 16, 12, 0, 0, tzinfo=UTC)
@@ -401,7 +512,7 @@ class TestIterPeriodicTicks:
         engine.activity_generator._proxy_mode = "transparent"
 
         monkeypatch.setattr(
-            storyline, "_iter_periodic_ticks", Mock(return_value=iter(expected_ticks))
+            periodic_helpers, "_iter_periodic_ticks", Mock(return_value=iter(expected_ticks))
         )
 
         spec = BeaconEventSpec(
@@ -412,8 +523,18 @@ class TestIterPeriodicTicks:
             action="allow",
             jitter=0.0,
             http_sequence=[
-                {"method": "GET", "uri": "/check?k={base64url:8}", "resp_bytes": [100, 200]},
-                {"method": "POST", "uri": "/task/{hex8}", "orig_bytes": [300, 400]},
+                {
+                    "method": "GET",
+                    "uri": "/check?k={base64url:8}",
+                    "request_body_len": 0,
+                    "resp_bytes": [100, 200],
+                },
+                {
+                    "method": "POST",
+                    "uri": "/task/{hex8}",
+                    "request_body_len": 512,
+                    "orig_bytes": [300, 400],
+                },
             ],
         )
 
@@ -429,7 +550,9 @@ class TestIterPeriodicTicks:
         calls = engine.activity_generator.generate_connection.call_args_list
         uris = [call.kwargs["http"].uri for call in calls]
         methods = [call.kwargs["http"].method for call in calls]
+        request_sizes = [call.kwargs["http"].request_body_len for call in calls]
         assert methods == ["GET", "POST", "GET", "POST"]
+        assert request_sizes == [0, 512, 0, 512]
         assert uris[0].startswith("/check?k=")
         assert uris[1].startswith("/task/")
         assert uris[0] != uris[2]
@@ -437,8 +560,6 @@ class TestIterPeriodicTicks:
     def test_service_backed_beacon_uses_installed_service_process(self, monkeypatch):
         """A SYSTEM beacon after service persistence should not fall back to svchost."""
         from unittest.mock import Mock
-
-        from evidenceforge.generation.engine import storyline
 
         start = datetime(2026, 4, 16, 16, 30, 0, tzinfo=UTC)
         system = System(
@@ -469,7 +590,9 @@ class TestIterPeriodicTicks:
             service_account="LocalSystem",
             time=start - timedelta(minutes=10),
         )
-        monkeypatch.setattr(storyline, "_iter_periodic_ticks", Mock(return_value=iter([start])))
+        monkeypatch.setattr(
+            periodic_helpers, "_iter_periodic_ticks", Mock(return_value=iter([start]))
+        )
 
         spec = BeaconEventSpec(
             dst_ip="45.33.32.30",
@@ -511,8 +634,6 @@ class TestIterPeriodicTicks:
         """Beacon activity should not render /v2/status as stable text/html page traffic."""
         from unittest.mock import Mock
 
-        from evidenceforge.generation.engine import storyline
-
         start = datetime(2026, 4, 16, 16, 30, 0, tzinfo=UTC)
         system = System(hostname="DC-01", ip="10.0.2.10", os="Windows Server 2019", type="server")
         actor = User(username="SYSTEM", full_name="SYSTEM", email="system@example.com")
@@ -525,7 +646,9 @@ class TestIterPeriodicTicks:
         engine.activity_generator._ip_to_system = {system.ip: system}
         engine.activity_generator._proxy_routes = {}
         engine.activity_generator._proxy_mode = "transparent"
-        monkeypatch.setattr(storyline, "_iter_periodic_ticks", Mock(return_value=iter([start])))
+        monkeypatch.setattr(
+            periodic_helpers, "_iter_periodic_ticks", Mock(return_value=iter([start]))
+        )
 
         spec = BeaconEventSpec(
             dst_ip="45.33.32.30",
@@ -659,6 +782,29 @@ class TestWebScanConnectionProfile:
 
 
 class TestPortScanPairIteration:
+    def test_sample_network_hosts_handles_ipv6_64_without_enumeration(self):
+        import ipaddress
+
+        network = ipaddress.ip_network("2001:db8:1234::/64")
+        sampled = _sample_network_hosts(network, 3, random.Random(29))
+
+        assert len(sampled) == 3
+        assert len(set(sampled)) == 3
+        assert all(ipaddress.ip_address(address) in network for address in sampled)
+        assert str(network.network_address) not in sampled
+
+    def test_sample_network_hosts_matches_ipv4_host_semantics(self):
+        import ipaddress
+
+        network = ipaddress.ip_network("10.0.0.0/8")
+        sampled = _sample_network_hosts(network, 5, random.Random(31))
+
+        assert len(sampled) == 5
+        assert len(set(sampled)) == 5
+        assert all(ipaddress.ip_address(address) in network for address in sampled)
+        assert str(network.network_address) not in sampled
+        assert str(network.broadcast_address) not in sampled
+
     def test_iter_shuffled_port_scan_pairs_covers_product_once(self):
         targets = ["10.0.0.10", "10.0.0.11", "10.0.0.12"]
         ports = [22, 80, 443, 3389]
@@ -1205,6 +1351,25 @@ class TestCredentialSprayEventSpec:
         with pytest.raises(ValidationError):
             CredentialSprayEventSpec(target_accounts=[], interval="2s", count=50)
 
+    def test_rejects_new_credentials_logon_type(self):
+        with pytest.raises(ValidationError, match="no remote authentication target"):
+            CredentialSprayEventSpec(
+                target_accounts=["admin"], interval="2s", count=10, logon_type=9
+            )
+
+
+def test_storyline_logon_accepts_new_credentials_for_contextual_resolution() -> None:
+    """Storyline execution supplies Type 9 caller and outbound identity facts."""
+
+    assert LogonEventSpec(logon_type=9).logon_type == 9
+
+
+def test_failed_logon_rejects_new_credentials() -> None:
+    """NewCredentials is not an inbound failed-logon transport."""
+
+    with pytest.raises(ValidationError, match="outbound authentication failure"):
+        FailedLogonEventSpec(logon_type=9)
+
 
 # ── Web Scan Presets Config ───────────────────────────────────────────────
 
@@ -1271,7 +1436,11 @@ class TestWebScanPresets:
             _ip_to_system={},
             generate_connection=lambda **kwargs: captured.append(kwargs),
         )
-        monkeypatch.setattr(storyline, "_iter_periodic_ticks", lambda *args: iter([start]))
+        monkeypatch.setattr(
+            periodic_helpers,
+            "_iter_periodic_ticks",
+            lambda *args, **kwargs: iter([start]),
+        )
         monkeypatch.setattr(
             storyline,
             "_web_scan_connection_profile",
@@ -1301,7 +1470,7 @@ class TestWebScanPresets:
         http = captured[0]["http"]
         assert http.method == "HEAD"
         assert http.response_body_len == 0
-        assert http.resp_mime_types == []
+        assert http.resp_mime_types == ()
 
     def test_web_scan_paths_are_shuffled_between_passes(self):
         import inspect
@@ -1602,6 +1771,281 @@ class TestDnsTunnelEventSpec:
         assert b"ABCD" not in raw_label
         assert event["bytes_exfiltrated"] == 0
 
+    @pytest.mark.parametrize("offset", [timedelta(0), timedelta(microseconds=1)])
+    def test_dns_tunnel_outside_exclusive_end_has_no_owner_mutation(self, monkeypatch, offset):
+        from unittest.mock import Mock
+
+        from evidenceforge.generation.engine import storyline
+
+        fence = datetime(2024, 1, 15, 10, 0, tzinfo=UTC)
+        source = System(hostname="APP-01", ip="10.0.0.10", os="Ubuntu Server", type="server")
+        peer = System(hostname="WS-01", ip="10.0.0.20", os="Windows 10", type="workstation")
+        rng = random.Random(42)
+        rng_state = rng.getstate()
+        generate_connection = Mock()
+        set_current_time = Mock()
+        engine = object.__new__(StorylineMixin)
+        engine.end_time = fence
+        engine.scenario = SimpleNamespace(environment=SimpleNamespace(systems=[source, peer]))
+        engine.state_manager = SimpleNamespace(set_current_time=set_current_time)
+        engine.activity_generator = SimpleNamespace(
+            _dns_server_ips=["10.0.0.53"],
+            generate_connection=generate_connection,
+        )
+        monkeypatch.setattr(storyline, "_get_rng", lambda: rng)
+        spec = DnsTunnelEventSpec(
+            base_domain="tunnel.example.test",
+            interval="2s",
+            duration="1m",
+        )
+
+        event = engine._execute_typed_event(
+            spec=spec,
+            actor=User(username="attacker", full_name="Attacker", email="a@example.com"),
+            system=source,
+            time=fence + offset,
+            activity="DNS exfiltration",
+            explicit_types={"dns_tunnel"},
+        )
+
+        assert event["total_queries"] == 0
+        assert event["bytes_exfiltrated"] == 0
+        assert rng.getstate() == rng_state
+        set_current_time.assert_not_called()
+        generate_connection.assert_not_called()
+
+    def test_dns_tunnel_partial_campaign_bounds_all_owned_connections(self, monkeypatch):
+        from evidenceforge.generation.engine import storyline
+
+        start = datetime(2024, 1, 15, 10, 0, tzinfo=UTC)
+        fence = start + timedelta(seconds=10)
+        source = System(hostname="APP-01", ip="10.0.0.10", os="Ubuntu Server", type="server")
+        peers = [
+            System(hostname="WS-01", ip="10.0.0.20", os="Windows 10", type="workstation"),
+            System(hostname="MAIL-01", ip="10.0.0.30", os="Ubuntu Server", type="server"),
+        ]
+        captured = []
+        engine = object.__new__(StorylineMixin)
+        engine.start_time = start
+        engine.end_time = fence
+        engine.scenario = SimpleNamespace(environment=SimpleNamespace(systems=[source, *peers]))
+        engine.state_manager = SimpleNamespace(set_current_time=lambda _time: None)
+        engine.activity_generator = SimpleNamespace(
+            _dns_server_ips=["10.0.0.53"],
+            generate_connection=lambda **kwargs: captured.append(kwargs),
+        )
+        monkeypatch.setattr(storyline, "_get_rng", lambda: random.Random(42))
+        spec = DnsTunnelEventSpec(
+            base_domain="tunnel.example.test",
+            interval="2s",
+            duration="1m",
+            jitter=0.0,
+        )
+
+        engine._execute_typed_event(
+            spec=spec,
+            actor=User(username="attacker", full_name="Attacker", email="a@example.com"),
+            system=source,
+            time=start,
+            activity="DNS exfiltration",
+            explicit_types={"dns_tunnel"},
+        )
+
+        assert any(item["dns"].query.endswith("tunnel.example.test") for item in captured)
+        assert any(not item["dns"].query.endswith("tunnel.example.test") for item in captured)
+        assert all(item["time"] >= start for item in captured)
+        assert all(item["time"] < fence for item in captured)
+
+    def test_dns_tunnel_real_generator_reserves_rendered_close_window(self, monkeypatch):
+        from unittest.mock import Mock
+
+        from evidenceforge.events.dispatcher import EventDispatcher
+        from evidenceforge.generation.activity import ActivityGenerator
+        from evidenceforge.generation.activity import generator as generator_module
+        from evidenceforge.generation.activity.network_params import dns_tunnel_rtt_range
+        from evidenceforge.generation.engine import storyline
+        from evidenceforge.generation.network_visibility import NetworkVisibilityEngine
+        from evidenceforge.generation.state_manager import StateManager
+        from evidenceforge.generation.timing import TimingRuntime
+        from evidenceforge.utils.time import ensure_utc
+
+        start = datetime(2024, 1, 15, 10, 0, tzinfo=UTC)
+        source = System(hostname="APP-01", ip="10.0.0.10", os="Ubuntu Server", type="server")
+        peer = System(hostname="WS-01", ip="10.0.0.20", os="Windows 10", type="workstation")
+        network = NetworkConfig(
+            segments=[
+                NetworkSegment(name="lan", cidr="10.0.0.0/24", exposure="internal"),
+            ],
+            sensors=[
+                NetworkSensor(
+                    type="network",
+                    name="zeek01",
+                    hostname="zeek01",
+                    monitoring_segments=["lan"],
+                    log_formats=["zeek_conn"],
+                ),
+            ],
+        )
+        visibility = NetworkVisibilityEngine(network, [source, peer])
+
+        def build_engine(fence: datetime, namespace: str):
+            state_manager = StateManager()
+            state_manager.set_current_time(start)
+            emitter = Mock()
+            emitter.can_handle.side_effect = lambda event: event.network is not None
+            timing_runtime = TimingRuntime(reference_time=start, namespace=namespace)
+            dispatcher = EventDispatcher(
+                state_manager=state_manager,
+                emitters={"zeek_conn": emitter},
+                visibility_engine=visibility,
+                output_start_time=start,
+                output_end_time=fence,
+                timing_runtime=timing_runtime,
+            )
+            activity_generator = ActivityGenerator(
+                state_manager,
+                {"zeek_conn": emitter},
+                network_visibility=visibility,
+                dispatcher=dispatcher,
+                timing_runtime=timing_runtime,
+                generation_window_start=start,
+                generation_window_end=fence,
+            )
+            activity_generator._ip_to_system = {source.ip: source, peer.ip: peer}
+            activity_generator._all_system_ips = [source.ip, peer.ip]
+            activity_generator._dns_server_ips = ["10.0.0.53"]
+            engine = object.__new__(StorylineMixin)
+            engine.start_time = start
+            engine.end_time = fence
+            engine.scenario = SimpleNamespace(
+                environment=SimpleNamespace(systems=[source, peer], network=network)
+            )
+            engine.state_manager = state_manager
+            engine.activity_generator = activity_generator
+            engine.dispatcher = dispatcher
+            return engine, activity_generator, state_manager, timing_runtime, emitter
+
+        spec = DnsTunnelEventSpec(
+            base_domain="tunnel.example.test",
+            payload="bounded payload",
+            interval="500ms",
+            duration="1m",
+            jitter=0.0,
+        )
+        actor = User(username="attacker", full_name="Attacker", email="a@example.com")
+
+        short_fence = start + timedelta(seconds=1)
+        engine, activity_generator, state_manager, timing_runtime, emitter = build_engine(
+            short_fence,
+            "dns-periodic-short-window",
+        )
+        rng = random.Random(42)
+        monkeypatch.setattr(storyline, "_get_rng", lambda: rng)
+        monkeypatch.setattr(generator_module, "_get_rng", lambda: rng)
+        monkeypatch.setattr(network_planner_module, "_get_rng", lambda: rng)
+        before = (
+            state_manager.materialization_digest(),
+            activity_generator._network_transaction_runtime.state_digest(),
+            timing_runtime.state_digest(),
+            rng.getstate(),
+        )
+
+        event = engine._execute_typed_event(
+            spec=spec,
+            actor=actor,
+            system=source,
+            time=start,
+            activity="DNS exfiltration",
+            explicit_types={"dns_tunnel"},
+        )
+
+        assert event["total_queries"] == 0
+        assert event["bytes_exfiltrated"] == 0
+        assert before == (
+            state_manager.materialization_digest(),
+            activity_generator._network_transaction_runtime.state_digest(),
+            timing_runtime.state_digest(),
+            rng.getstate(),
+        )
+        emitter.emit.assert_not_called()
+
+        fence = start + timedelta(seconds=10)
+        engine, activity_generator, state_manager, timing_runtime, emitter = build_engine(
+            fence,
+            "dns-periodic-exact-start-fence",
+        )
+        exact_start_fence = _dns_periodic_exclusive_start_fence(
+            activity_generator,
+            window_start=start,
+            exclusive_end_time=fence,
+            maximum_rtt_seconds=dns_tunnel_rtt_range()[1],
+        )
+        assert exact_start_fence is not None
+        rng = random.Random(42)
+        before = (
+            state_manager.materialization_digest(),
+            activity_generator._network_transaction_runtime.state_digest(),
+            timing_runtime.state_digest(),
+            rng.getstate(),
+        )
+
+        event = engine._execute_typed_event(
+            spec=spec,
+            actor=actor,
+            system=source,
+            time=exact_start_fence,
+            activity="DNS exfiltration",
+            explicit_types={"dns_tunnel"},
+        )
+
+        assert event["total_queries"] == 0
+        assert before == (
+            state_manager.materialization_digest(),
+            activity_generator._network_transaction_runtime.state_digest(),
+            timing_runtime.state_digest(),
+            rng.getstate(),
+        )
+        emitter.emit.assert_not_called()
+
+        engine, _activity_generator, state_manager, _timing_runtime, emitter = build_engine(
+            fence,
+            "dns-periodic-partial-window",
+        )
+        rng = random.Random(42)
+        event = engine._execute_typed_event(
+            spec=spec,
+            actor=actor,
+            system=source,
+            time=start,
+            activity="DNS exfiltration",
+            explicit_types={"dns_tunnel"},
+        )
+
+        emitted = [call.args[0] for call in emitter.emit.call_args_list]
+        assert event["total_queries"] > 0
+        assert emitted
+        assert any(item.dns.query.endswith("tunnel.example.test") for item in emitted)
+        assert any(not item.dns.query.endswith("tunnel.example.test") for item in emitted)
+        connections = state_manager.list_open_connections()
+        assert len(connections) == len(emitted)
+        assert all(
+            start <= connection.start_time < fence
+            and connection.close_time is not None
+            and connection.close_time < fence
+            for connection in connections
+        )
+        rendered_times = []
+        for item in emitted:
+            rendered_times.append(item.timestamp)
+            rendered_times.extend((item.network.started_at, item.network.closed_at))
+            for observation in item.network_observations:
+                rendered_times.append(observation.observed_start_time)
+                if observation.observed_close_time is not None:
+                    rendered_times.append(observation.observed_close_time)
+                rendered_times.extend(timestamp for _key, timestamp in observation.source_times)
+        assert rendered_times
+        assert all(start <= ensure_utc(timestamp) < fence for timestamp in rendered_times)
+
     def test_dns_tunnel_generation_uses_natural_pacing_and_variable_labels(self):
         engine = object.__new__(StorylineMixin)
         captured = []
@@ -1777,3 +2221,44 @@ class TestWorkstationLockUnlockEventSpec:
     def test_unlock_defaults(self):
         spec = WorkstationUnlockEventSpec()
         assert spec.type == "workstation_unlock"
+
+    def test_storyline_records_already_locked_transition_as_skipped(self):
+        """A realistic lock no-op must not be labeled as emitted ground truth."""
+        from unittest.mock import Mock
+
+        event_time = datetime(2026, 4, 16, 17, 20, tzinfo=UTC)
+        system = System(hostname="WS-01", ip="10.0.0.10", os="Windows 11", type="workstation")
+        actor = User(username="alice", full_name="Alice Example", email="alice@example.com")
+        session = SimpleNamespace(
+            system=system.hostname,
+            logon_type=2,
+            session_kind="interactive",
+            start_time=event_time - timedelta(hours=2),
+            logon_id="0x12345",
+        )
+        engine = object.__new__(StorylineMixin)
+        engine.state_manager = Mock()
+        engine.state_manager.get_sessions_for_user.return_value = [session]
+        engine.activity_generator = Mock()
+        engine.activity_generator.generate_workstation_lock.return_value = WorkstationLockResult(
+            emitted=False,
+            skipped_reason="workstation_already_locked",
+        )
+        engine.dispatcher = SimpleNamespace(storyline_cluster_id="evt-lock")
+
+        malicious_event = engine._execute_typed_event(
+            spec=WorkstationLockEventSpec(),
+            actor=actor,
+            system=system,
+            time=event_time,
+            activity="Lock workstation",
+            explicit_types={"workstation_lock"},
+        )
+
+        assert malicious_event["skipped_reason"] == "workstation_already_locked"
+        engine.activity_generator.generate_workstation_lock.assert_called_once_with(
+            user=actor,
+            system=system,
+            time=event_time,
+            logon_id="0x12345",
+        )

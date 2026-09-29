@@ -25,7 +25,7 @@
 1. External client IP special-use range exclusion
 2. ASA connection ID non-round start
 3. PAT port gaps (non-sequential)
-4. Snort microsecond timestamps
+4. Snort emitter timestamp preservation
 5. ASA chronological sort on flush
 """
 
@@ -33,10 +33,8 @@ import ipaddress
 import random
 from datetime import UTC, datetime, timedelta
 
-import pytest
-
-from evidenceforge.events.base import SecurityEvent
-from evidenceforge.events.contexts import IdsContext, NetworkContext
+from evidenceforge.events.base import OccurrenceBuilder
+from evidenceforge.events.contexts import IdsAlertPlan
 from evidenceforge.formats import load_format
 from evidenceforge.generation.emitters.cisco_asa import CiscoAsaEmitter
 from evidenceforge.generation.emitters.snort import SnortEmitter
@@ -48,6 +46,7 @@ from evidenceforge.models.scenario import (
     NetworkSensor,
     System,
 )
+from tests.network_factories import network_plan
 
 T0 = datetime(2024, 6, 15, 14, 0, 0, tzinfo=UTC)
 
@@ -166,6 +165,27 @@ def test_generate_external_ip_excludes_non_global_special_use_ranges():
     assert ipaddress.ip_address(ip).is_global
 
 
+def test_generate_external_ip_excludes_implausible_dod_client_ranges():
+    """Ordinary external web clients must not be allocated from DoD networks."""
+    from unittest.mock import MagicMock
+
+    from evidenceforge.generation.engine.emitter_setup import EmitterSetupMixin
+
+    octets = [29, 176, 39, 5, 45, 33, 49, 112]
+
+    def rigged_randint(lo, hi):
+        value = octets.pop(0)
+        assert lo <= value <= hi
+        return value
+
+    rng = MagicMock()
+    rng.randint = rigged_randint
+    obj = MagicMock(spec=[])
+    obj._org_cidr_networks = []
+
+    assert EmitterSetupMixin._generate_external_client_ip(obj, rng) == "45.33.49.112"
+
+
 def test_random_activity_external_ip_excludes_rfc5737():
     """Activity-level external IP fallback must avoid documentation ranges."""
     from evidenceforge.generation.activity.network import _generate_random_external_ip
@@ -183,27 +203,52 @@ def test_random_activity_external_ip_excludes_rfc5737():
 # ---------------------------------------------------------------------------
 
 
-def test_asa_conn_id_not_round():
-    """ASA connection IDs should be monotonic without clock-shaped jumps."""
-    from datetime import datetime
-
+def test_asa_conn_id_not_round(tmp_path):
+    """ASA final IDs should follow canonical ordinals without clock-shaped jumps."""
     fmt = load_format("cisco_asa")
     emitter = CiscoAsaEmitter(
         format_def=fmt,
-        output_path=pytest.importorskip("pathlib").Path("/tmp/test_asa_conn"),
+        output_path=tmp_path,
         sensor_hostnames=["fw01"],
     )
     ts1 = datetime(2024, 3, 18, 12, 0, 0, tzinfo=UTC)
     ts2 = datetime(2024, 3, 18, 12, 0, 1, tzinfo=UTC)
-    first_id = emitter._next_conn_id("fw01", ts1)
+    first_event = OccurrenceBuilder(
+        timestamp=ts1,
+        event_type="connection",
+        network=network_plan(
+            src_ip="10.0.10.50",
+            src_port=40_000,
+            dst_ip="8.8.8.8",
+            dst_port=443,
+            protocol="TCP",
+            conn_id="conn-100",
+            source_visible_start_time=ts1,
+        ),
+    )
+    second_event = OccurrenceBuilder(
+        timestamp=ts2,
+        event_type="connection",
+        network=network_plan(
+            src_ip="10.0.10.50",
+            src_port=40_001,
+            dst_ip="8.8.8.8",
+            dst_port=443,
+            protocol="TCP",
+            conn_id="conn-101",
+            source_visible_start_time=ts2,
+        ),
+    )
+    first_id = emitter._connection_id(first_event, "fw01")
     assert first_id > 0, "Connection ID should be positive"
 
-    second_id = emitter._next_conn_id("fw01", ts2)
+    second_id = emitter._connection_id(second_event, "fw01")
     assert second_id > first_id, "Later timestamps should produce higher IDs"
     assert second_id - first_id < 100, "Connection IDs should not encode timestamp buckets"
+    assert emitter._connection_id(first_event, "fw01") == first_id
 
     # Different sensor should get a different starting ID
-    other_id = emitter._next_conn_id("fw02")
+    other_id = emitter._connection_id(first_event, "fw02")
     assert other_id != first_id, "Different sensors should get different starting IDs"
 
 
@@ -284,8 +329,8 @@ def test_pat_port_start_not_round():
 # ---------------------------------------------------------------------------
 
 
-def test_snort_timestamp_has_microseconds(tmp_path):
-    """Snort alert timestamps should have non-zero microseconds."""
+def test_snort_direct_emission_preserves_canonical_timestamps(tmp_path):
+    """Snort does not invent clock jitter when no observation plan exists."""
     fmt = load_format("snort_alert")
     emitter = SnortEmitter(
         format_def=fmt,
@@ -295,16 +340,18 @@ def test_snort_timestamp_has_microseconds(tmp_path):
     # Emit several events with different timestamps
     for i in range(5):
         ts = T0 + timedelta(seconds=i * 60)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="connection",
-            ids=IdsContext(
-                sid=2000000 + i,
-                message=f"Test alert {i}",
-                classification="Attempted Information Leak",
-                priority=2,
+            ids_alerts=(
+                IdsAlertPlan(
+                    sid=2000000 + i,
+                    message=f"Test alert {i}",
+                    classification="Attempted Information Leak",
+                    priority=2,
+                ),
             ),
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.10.50",
                 src_port=40000 + i,
                 dst_ip="192.168.1.1",
@@ -314,24 +361,18 @@ def test_snort_timestamp_has_microseconds(tmp_path):
         )
         emitter.emit(event)
 
-    emitter.flush()
+    emitter.close()
 
     output = (tmp_path / "snort_alert.log").read_text()
     lines = [line for line in output.strip().split("\n") if line.strip()]
     assert len(lines) >= 5, f"Expected at least 5 alert lines, got {len(lines)}"
 
-    # Check that at least some timestamps have non-zero millisecond part
-    zero_ms_count = 0
+    # Sensor clock and jitter belong to NetworkObservationPlanner.
     for line in lines:
-        # Format: MM/DD-HH:MM:SS.mmm
+        # Format: MM/DD-HH:MM:SS.ffffff
         ts_part = line.split("[")[0].strip()
-        ms_part = ts_part.split(".")[-1]
-        if ms_part == "000":
-            zero_ms_count += 1
-
-    assert zero_ms_count < len(lines), (
-        "All Snort timestamps end in .000 — microsecond jitter is not working"
-    )
+        fractional_part = ts_part.split(".")[-1]
+        assert fractional_part == "000000"
 
 
 # ---------------------------------------------------------------------------
@@ -364,10 +405,10 @@ def test_asa_output_sorted(tmp_path):
     # The Teardown for the first connection lands AFTER the Built for the second connection
     for i in range(5):
         ts = T0 + timedelta(seconds=i * 10)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.10.50",
                 src_port=40000 + i,
                 dst_ip="8.8.8.8",

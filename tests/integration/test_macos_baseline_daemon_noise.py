@@ -114,7 +114,9 @@ def _generate(tmp_path: Path) -> Path:
     scenario_path = tmp_path / "scenario.yaml"
     scenario_path.write_text(_SCENARIO_YAML, encoding="utf-8")
     out = tmp_path / "output"
-    result = runner.invoke(app, ["generate", str(scenario_path), "--output", str(out), "--force"])
+    result = runner.invoke(
+        app, ["generate", str(scenario_path), "--output", str(out), "--overwrite"]
+    )
     assert result.exit_code == EXIT_SUCCESS, result.stdout
     return out
 

@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from evidenceforge.models.scenario import Scenario
 from evidenceforge.utils.paths import safe_write_text
@@ -19,7 +19,7 @@ from evidenceforge.utils.time import resolve_time_window
 logger = logging.getLogger(__name__)
 
 GROUND_TRUTH_JSON_FILENAME = "GROUND_TRUTH.json"
-GROUND_TRUTH_SCHEMA_VERSION = 1
+GROUND_TRUTH_SCHEMA_VERSION = 3
 MAX_GROUND_TRUTH_BYTES = 8_388_608
 
 GroundTruthSection = Literal["storyline", "red_herring"]
@@ -44,6 +44,7 @@ class GroundTruthAttributesBase(BaseModel):
     family: str | None = None
     group_name: str | None = None
     interval: str | int | float | None = None
+    ids_alerts: list[dict[str, object]] | None = None
     logon_id: str | None = None
     logon_type: int | None = None
     mail_action: str | None = None
@@ -128,12 +129,76 @@ class FileAttributes(GroundTruthAttributesBase):
     path: str | None = None
 
 
+class HttpUploadAttributes(BaseModel):
+    """Resolved local and wire metadata for an authored HTTP upload."""
+
+    request_body_len: int = Field(ge=0)
+    mime_type: str
+    local_source_path: str
+    local_source_filename: str
+    wire_filename: str | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class HttpMultipartPartAttributes(BaseModel):
+    """Ordered decoded and wire metadata for one multipart leaf."""
+
+    path: list[int]
+    name: str
+    decoded_size: int = Field(ge=0)
+    encoded_size: int = Field(ge=0)
+    local_source_path: str | None = None
+    local_source_filename: str | None = None
+    wire_filename: str | None = None
+    declared_mime_type: str | None = None
+    detected_mime_type: str | None = None
+    transfer_encoding: str
+    endpoint_read_owner_pid: int | None = None
+    fuids: list[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class HttpMultipartEntityAttributes(BaseModel):
+    """One serialized multipart direction and its ordered leaf projections."""
+
+    body_len: int = Field(ge=0)
+    media_type: str
+    boundary: str
+    parts: list[HttpMultipartPartAttributes]
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class HttpMultipartAttributes(BaseModel):
+    """Serialized request and response multipart entities for one HTTP transaction."""
+
+    request: HttpMultipartEntityAttributes | None = None
+    response: HttpMultipartEntityAttributes | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class ConnectionAttributes(GroundTruthAttributesBase):
     """Connection event attributes."""
+
+    http_upload: HttpUploadAttributes | None = None
+    http_multipart: HttpMultipartAttributes | None = None
 
 
 class SshSessionAttributes(GroundTruthAttributesBase):
     """SSH session event attributes."""
+
+
+class SmbActivityAttributes(GroundTruthAttributesBase):
+    """Resolved canonical SMB activity and batch summary."""
+
+    session_id: str
+    tree_ids: list[str] = Field(default_factory=list)
+    transport_uids: list[str] = Field(default_factory=list)
+    operations: list[dict[str, object]] = Field(default_factory=list)
+    batch_summary: dict[str, object]
 
 
 class RdpSessionAttributes(GroundTruthAttributesBase):
@@ -269,6 +334,7 @@ class GroundTruthEventBase(BaseModel):
 
     record_id: str
     kind: str
+    intent_id: str | None = None
     storyline_id: str | None = None
     time: datetime
     actor: str
@@ -326,6 +392,11 @@ class ConnectionGroundTruthEvent(GroundTruthEventBase):
 class SshSessionGroundTruthEvent(GroundTruthEventBase):
     kind: Literal["ssh_session"]
     attributes: SshSessionAttributes = Field(default_factory=SshSessionAttributes)
+
+
+class SmbActivityGroundTruthEvent(GroundTruthEventBase):
+    kind: Literal["smb_activity"]
+    attributes: SmbActivityAttributes
 
 
 class RdpSessionGroundTruthEvent(GroundTruthEventBase):
@@ -508,6 +579,7 @@ GroundTruthEvent = Annotated[
     | FileGroundTruthEvent
     | ConnectionGroundTruthEvent
     | SshSessionGroundTruthEvent
+    | SmbActivityGroundTruthEvent
     | RdpSessionGroundTruthEvent
     | AccountCreatedGroundTruthEvent
     | AccountDeletedGroundTruthEvent
@@ -552,18 +624,317 @@ class GroundTruthStep(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class GroundTruthIntentEvidence(BaseModel):
+    """Authored intent reconciled with planning, occurrence, and observation evidence."""
+
+    intent_id: str
+    ground_truth_section: GroundTruthSection
+    storyline_id: str
+    event_type: str
+    semantic_instance_key: str
+    authored_time: str
+    actor: str
+    system: str
+    activity: str
+    planned: bool
+    action_ids: list[str] = Field(default_factory=list)
+    occurrence_ids: list[str] = Field(default_factory=list)
+    action_reference_count: int | None = Field(default=None, ge=0)
+    occurrence_reference_count: int | None = Field(default=None, ge=0)
+    action_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    occurrence_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    duplicate_occurrence_count: int = Field(default=0, ge=0)
+    occurrence_window_counts: dict[Literal["24h", "7d", "30d"], int] = Field(default_factory=dict)
+    source_status: dict[str, dict[str, int]] = Field(default_factory=dict)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("source_status")
+    @classmethod
+    def validate_source_status(cls, value: dict[str, dict[str, int]]) -> dict[str, dict[str, int]]:
+        """Reject unknown or negative intent-scoped observation counters."""
+
+        allowed = {"visible", "delayed", "dropped", "filtered", "out_of_window"}
+        for source, statuses in value.items():
+            for status, count in statuses.items():
+                if status not in allowed:
+                    raise ValueError(
+                        f"source_status[{source!r}] contains unknown status {status!r}"
+                    )
+                if count < 0:
+                    raise ValueError(f"source_status[{source!r}][{status!r}] must be non-negative")
+        return value
+
+    @model_validator(mode="after")
+    def validate_bounded_identity_aggregates(self) -> GroundTruthIntentEvidence:
+        """Keep samples subordinate to authoritative count/digest aggregates."""
+
+        if len(self.action_ids) > 8 or len(self.occurrence_ids) > 8:
+            raise ValueError("intent identity samples cannot exceed eight IDs")
+        if self.action_reference_count is not None:
+            if self.action_reference_count < len(self.action_ids):
+                raise ValueError("action_reference_count cannot be smaller than its ID sample")
+            if self.action_digest is None:
+                raise ValueError("action_digest is required with action_reference_count")
+        if self.occurrence_reference_count is not None:
+            if self.occurrence_reference_count < len(self.occurrence_ids):
+                raise ValueError("occurrence_reference_count cannot be smaller than its ID sample")
+            if self.occurrence_digest is None:
+                raise ValueError("occurrence_digest is required with occurrence_reference_count")
+            if self.duplicate_occurrence_count > self.occurrence_reference_count:
+                raise ValueError("duplicate occurrence count exceeds occurrence references")
+            window_counts = [
+                self.occurrence_window_counts.get(window, 0) for window in ("24h", "7d", "30d")
+            ]
+            if window_counts != sorted(window_counts):
+                raise ValueError("intent occurrence window counts must be monotonic")
+            if window_counts[-1] > self.occurrence_reference_count:
+                raise ValueError("30d occurrence count exceeds lifetime occurrence references")
+        if any(count < 0 for count in self.occurrence_window_counts.values()):
+            raise ValueError("intent occurrence window counts must be non-negative")
+        return self
+
+
+class GroundTruthIntentReconciliation(BaseModel):
+    """Dataset-level reconciliation of the independent authored intent ledger."""
+
+    complete: bool
+    expected_count: int = Field(ge=0)
+    planned_count: int = Field(ge=0)
+    occurred_count: int = Field(ge=0)
+    observed_count: int = Field(ge=0)
+    duplicate_occurrence_count: int = Field(default=0, ge=0)
+    missing_intent_ids: list[str] = Field(default_factory=list)
+    unexpected_intent_ids: list[str] = Field(default_factory=list)
+    intents: list[GroundTruthIntentEvidence] = Field(default_factory=list)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> GroundTruthIntentReconciliation:
+        """Keep summary counts and completeness consistent with the intent rows."""
+
+        if self.expected_count != len(self.intents):
+            raise ValueError("expected_count must equal the number of reconciled intent rows")
+        intent_ids = [intent.intent_id for intent in self.intents]
+        if len(intent_ids) != len(set(intent_ids)):
+            raise ValueError("reconciled intent IDs must be unique")
+        if self.planned_count != sum(intent.planned for intent in self.intents):
+            raise ValueError("planned_count does not match reconciled intent rows")
+        if self.occurred_count != sum(
+            (
+                intent.occurrence_reference_count > 0
+                if intent.occurrence_reference_count is not None
+                else bool(intent.occurrence_ids)
+            )
+            for intent in self.intents
+        ):
+            raise ValueError("occurred_count does not match reconciled intent rows")
+        if self.duplicate_occurrence_count != sum(
+            intent.duplicate_occurrence_count for intent in self.intents
+        ):
+            raise ValueError("duplicate_occurrence_count does not match reconciled intent rows")
+        observed_count = sum(
+            any(
+                statuses.get("visible", 0) > 0 or statuses.get("delayed", 0) > 0
+                for statuses in intent.source_status.values()
+            )
+            for intent in self.intents
+        )
+        if self.observed_count != observed_count:
+            raise ValueError("observed_count does not match reconciled intent rows")
+        expected_complete = (
+            self.planned_count == self.expected_count
+            and not self.missing_intent_ids
+            and not self.unexpected_intent_ids
+            and self.duplicate_occurrence_count == 0
+        )
+        if self.complete != expected_complete:
+            raise ValueError("complete does not match missing/unexpected intent IDs")
+        return self
+
+
+class GroundTruthExecutionEffectReconciliation(BaseModel):
+    """Bounded run-level effect-plan reconciliation and deterministic digest."""
+
+    complete: bool
+    plan_count: int = Field(ge=0)
+    no_effect_plan_count: int = Field(ge=0)
+    planned_node_count: int = Field(ge=0)
+    required_node_count: int = Field(ge=0)
+    optional_node_count: int = Field(ge=0)
+    externally_owned_node_count: int = Field(ge=0)
+    planned_effect_occurrence_count: int = Field(ge=0)
+    owned_effect_plan_count: int = Field(default=0, ge=0)
+    owned_effect_expected_occurrence_count: int = Field(default=0, ge=0)
+    owned_effect_published_occurrence_count: int = Field(default=0, ge=0)
+    realized_node_count: int = Field(ge=0)
+    realized_effect_occurrence_count: int = Field(ge=0)
+    linked_node_count: int = Field(ge=0)
+    suppressed_node_count: int = Field(ge=0)
+    failed_node_count: int = Field(ge=0)
+    missing_node_count: int = Field(ge=0)
+    missing_required_node_count: int = Field(ge=0)
+    unexpected_node_count: int = Field(ge=0)
+    unplanned_failure_count: int = Field(ge=0)
+    invalid_outcome_node_count: int = Field(ge=0)
+    policy_invalid_outcome_count: int = Field(ge=0)
+    cardinality_mismatch_count: int = Field(ge=0)
+    duplicate_outcome_count: int = Field(ge=0)
+    incomplete_reconciliation_count: int = Field(ge=0)
+    reconciled_effect_occurrence_count: int = Field(ge=0)
+    published_effect_occurrence_count: int = Field(ge=0)
+    exempt_effect_occurrence_count: int = Field(ge=0)
+    unprovenanced_effect_occurrence_count: int = Field(ge=0)
+    effect_publication_mismatch_count: int = Field(ge=0)
+    reconciliation_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    effect_occurrence_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def validate_effect_totals(self) -> GroundTruthExecutionEffectReconciliation:
+        """Reject count drift and summaries that claim false completeness."""
+
+        if self.no_effect_plan_count > self.plan_count:
+            raise ValueError("no_effect_plan_count cannot exceed plan_count")
+        if self.plan_count == 0 and self.planned_node_count:
+            raise ValueError("planned effects require at least one execution-effect plan")
+        if (
+            self.plan_count + self.owned_effect_plan_count == 0
+            and self.published_effect_occurrence_count
+        ):
+            raise ValueError("published effects require an execution or owned-effect plan")
+        if self.owned_effect_plan_count == 0 and self.owned_effect_expected_occurrence_count:
+            raise ValueError("owned effect occurrences require an owned-effect plan")
+        if (
+            self.owned_effect_plan_count
+            and self.owned_effect_expected_occurrence_count < self.owned_effect_plan_count
+        ):
+            raise ValueError("every owned-effect plan must expect at least one occurrence")
+        if self.owned_effect_expected_occurrence_count > self.reconciled_effect_occurrence_count:
+            raise ValueError("owned expected effects cannot exceed all reconciled effects")
+        if self.owned_effect_published_occurrence_count > self.published_effect_occurrence_count:
+            raise ValueError("owned published effects cannot exceed all published effects")
+        if (
+            self.required_node_count + self.optional_node_count + self.externally_owned_node_count
+            != self.planned_node_count
+        ):
+            raise ValueError("effect requirement totals do not match planned_node_count")
+        if (
+            self.realized_node_count
+            + self.linked_node_count
+            + self.suppressed_node_count
+            + self.failed_node_count
+            + self.missing_node_count
+            != self.planned_node_count
+        ):
+            raise ValueError("effect outcome totals do not match planned_node_count")
+        if self.missing_required_node_count > self.missing_node_count:
+            raise ValueError("missing required effects cannot exceed all missing effects")
+        if (
+            self.policy_invalid_outcome_count + self.cardinality_mismatch_count
+            != self.invalid_outcome_node_count
+        ):
+            raise ValueError("invalid effect outcome categories do not match their total")
+        publication_counts_match = (
+            self.published_effect_occurrence_count == self.reconciled_effect_occurrence_count
+        )
+        if not publication_counts_match and self.effect_publication_mismatch_count == 0:
+            raise ValueError(
+                "effect publication mismatch truth contradicts published/realized counts"
+            )
+        expected_complete = not any(
+            (
+                self.failed_node_count,
+                self.missing_node_count,
+                self.missing_required_node_count,
+                self.unexpected_node_count,
+                self.unplanned_failure_count,
+                self.invalid_outcome_node_count,
+                self.policy_invalid_outcome_count,
+                self.cardinality_mismatch_count,
+                self.duplicate_outcome_count,
+                self.incomplete_reconciliation_count,
+                self.exempt_effect_occurrence_count,
+                self.unprovenanced_effect_occurrence_count,
+                self.effect_publication_mismatch_count,
+            )
+        )
+        if self.complete != expected_complete:
+            raise ValueError("effect reconciliation completeness contradicts defect totals")
+        return self
+
+
+class IdsEvaluationSignature(BaseModel):
+    """Bounded expected-output summary for one signature on one IDS sensor."""
+
+    gid: int = Field(ge=0)
+    sid: int = Field(gt=0)
+    candidate: int = Field(ge=0)
+    emitted: int = Field(ge=0)
+    policy_filtered: int = Field(ge=0)
+    emitted_visible: int = Field(ge=0)
+    emitted_delayed: int = Field(ge=0)
+    origins: dict[Literal["authored_attachment", "built_in", "raw"], int] = Field(
+        default_factory=dict
+    )
+    emitted_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def validate_totals(self) -> IdsEvaluationSignature:
+        """Keep candidate, emission, filtering, and origin totals internally consistent."""
+
+        if self.candidate != self.emitted + self.policy_filtered:
+            raise ValueError("IDS candidate must equal emitted plus policy_filtered")
+        if self.emitted != self.emitted_visible + self.emitted_delayed:
+            raise ValueError("IDS emitted must equal emitted_visible plus emitted_delayed")
+        if sum(self.origins.values()) != self.emitted:
+            raise ValueError("IDS origin totals must equal emitted")
+        return self
+
+
+class IdsEvaluationSummary(BaseModel):
+    """Sensor-local IDS integrity contract stored in canonical ground truth."""
+
+    observation: dict[str, int] = Field(default_factory=dict)
+    sensors: dict[str, dict[str, IdsEvaluationSignature]] = Field(default_factory=dict)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def validate_sensor_keys(self) -> IdsEvaluationSummary:
+        """Require stable ``gid:sid`` keys and non-negative observation counts."""
+
+        for status, count in self.observation.items():
+            if status not in {"visible", "delayed", "dropped", "filtered", "out_of_window"}:
+                raise ValueError(f"unknown IDS observation status {status!r}")
+            if count < 0:
+                raise ValueError(f"IDS observation count for {status!r} must be non-negative")
+        for signatures in self.sensors.values():
+            for key, summary in signatures.items():
+                if key != f"{summary.gid}:{summary.sid}":
+                    raise ValueError(f"IDS signature key {key!r} does not match its gid/sid")
+        return self
+
+
 class GroundTruthDocument(BaseModel):
     """Canonical machine-readable ground-truth document."""
 
-    schema_version: int = GROUND_TRUTH_SCHEMA_VERSION
+    schema_version: Literal[3] = GROUND_TRUTH_SCHEMA_VERSION
     scenario_name: str
     scenario_description: str
     generated_at: datetime
     observation_profile: str
     collection_window: dict[str, str | None]
     source_evidence_status: dict[str, dict[str, dict[str, int]]] = Field(default_factory=dict)
+    ids_evaluation: IdsEvaluationSummary | None = None
     storyline_steps: list[GroundTruthStep] = Field(default_factory=list)
     red_herring_steps: list[GroundTruthStep] = Field(default_factory=list)
+    intent_reconciliation: GroundTruthIntentReconciliation | None = None
+    effect_reconciliation: GroundTruthExecutionEffectReconciliation | None = None
     events: list[GroundTruthEvent] = Field(default_factory=list)
 
     model_config = ConfigDict(extra="forbid")

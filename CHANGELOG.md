@@ -6,6 +6,766 @@ Detailed development history for the EvidenceForge project. Transferred from TOD
 
 ## Unreleased
 
+## v2.1.2 (2026-09-24)
+
+This patch release closes realism defects found in assessment loops 80 and 83–101. It improves
+source-native semantics and cross-source identity, process, session, lifecycle, and timing
+consistency without changing public interfaces or authored scenario schemas.
+
+**Windows sessions, remote administration, and process lifecycles**
+
+- Reconcile authored and baseline RDP sessions, reconnect disconnected owners before dependent
+  work, pair source aliases before publication, preserve transition evidence, and enforce session
+  lifecycle deadlines (`5055e714`, `dab03869`, `b1fa7b56`, `be14d325`, `846547a2`, `23a5e5cc`,
+  `2f97c253`, `7b09825c`, `13eec5b4`, `e2ecb2b3`, `733b96d6`, `fc2b1b38`).
+- Preserve process/session ownership through SMB and other dependent activity; serialize storyline
+  commands, scope lifecycle holds correctly, retain finalized-process identity, and cluster
+  provider thread identities (`fcb2b5fc`, `6d4ca336`, `cb7c756a`, `b8bdf849`, `80e09c66`,
+  `0cca756a`, `c1b965ee`, `5beb3b6f`, `5e28b22b`).
+- Complete RunAs explicit-credential actions and align Type 9 credential use, caller bootstrap,
+  child lifetimes, source evidence, and process ownership (`b3e5eb40`, `542fdc66`, `fc1a32aa`,
+  `bca46018`, `836b8364`, `d1604935`, `1c3d0c0b`, `7b09825c`).
+
+**SMB, proxy, and browser identity**
+
+- Bind credentialed SMB and Samba operations to exact source processes, preserve credential
+  authority and ancestry, reserve source scheduling headroom, and keep target attribution local
+  (`b1c8583c`, `8e32371e`, `8e92d88c`, `7e6c5c83`, `921be6e0`, `b69c835f`, `2cf462d6`,
+  `a6408d25`, `4f78f242`, `c64ae348`, `54f6bc67`).
+- Carry stable browser process identity through explicit-proxy planning and HTTP rendering, and
+  preserve HTTP body/request timing semantics (`a26bb6ca`, `bf4a07f2`, `b8b015c7`, `7fe30e5e`,
+  `edc3d50c`, `46bad9c0`, `d2089f12`, `f8374d39`).
+
+**Linux, network, and source-native evidence**
+
+- Preserve full native Windows file identities in Bash history export plans so SQLite's signed
+  integer limit cannot interrupt journal publication; older integer rows remain readable
+  (`938f7da5`).
+- Keep Linux background and shell activity attached to live host/session state, rebind processes
+  after SSH close, and resolve shell-session timing before process use (`81cdf1e4`, `d86edc8d`,
+  `623451ca`).
+- Unify Syslog forwarding with canonical transport, deterministic transport randomness, and
+  runtime-owned health timing; preserve successful TCP DNS responses and TLS analyzer observations
+  (`382eeaa0`, `663ed056`, `ff1ed56b`, `1253a191`, `40da26c5`, `284e01bc`).
+- Align Nmap discovery with scan effects, preserve ICMP/Exchange and TCP DNS/Sysmon source
+  semantics, enforce Exchange service cardinality, and stabilize PKINIT identity (`5206e4c1`,
+  `e53b794b`, `66f61766`, `3992a09e`, `74f6c264`, `01167d78`).
+- Bound command and process activity by hard session deadlines and preserve unobserved process-root
+  identity in Sysmon; page wide-fleet boot materialization (`122288d3`, `bf9b7885`, `a0f9db26`,
+  `7fc38cea`).
+
+**Assessment records and maintenance**
+
+- Record assessment results and close realism loops 80, 83–101 (`25741387`, `01ae6ac7`,
+  `a0bf1031`, `b6acfe5c`, `141fc9d3`, `56e57e42`, `8b96a6fe`, `48d5039e`,
+  `8d26ab0f`, `4eb1d810`, `28ae6ab1`, `932a203f`, `4ac73cc8`, `f7fb2ccf`, `603d6243`,
+  `5dc388ef`, `a29c789b`, `71e40f9a`, `8d8dc8be`, `bf328206`).
+- Refresh the generation behavior manifest and avoid duplicate development CI runs (`fee83e51`,
+  `6551d116`, `f44cdd02`).
+
+## v2.1.1 (2026-09-16)
+
+This patch release makes record validation representation-aware, preserves complete Windows Snare
+facts, corrects failed-logon requester semantics, and updates the external parser harness to the
+current validated SOF-ELK rules. Existing authored schemas and public APIs remain unchanged.
+
+**Record validation and evaluation**
+
+- Replace the external JSON-logic dependency with package-owned typed record predicates and apply
+  the same validation contracts across CLI preflight, generation, and evaluation. Cover incomplete
+  Windows XML wrappers and every successful proxy CONNECT response (`0ca530b2`, `c7a7517f`,
+  `3c4323fb`).
+- Route artifacts to their native validators, distinguish malformed evidence from evaluator
+  execution faults, and add reproducible compatibility, mutation, and readiness evidence
+  (`ef7175b8`, `9c89e83d`, `54cf6ac3`).
+- Parse Splunk web and proxy evidence during evaluation and normalize anonymous identities before
+  applying Windows Snare projections (`68cd5dd8`, `2c899b06`).
+
+**Windows Snare and external parser compatibility**
+
+- Preserve canonical Windows facts through typed Snare projections for all supported event
+  variants, with frozen compatibility tests and documented field dispositions (`1e91cf1b`,
+  `7b2ea369`, `e9beeca2`, `39615693`, `f5847ed8`).
+- Update the SOF-ELK pin and harness for the newer parser filenames and scoped generic-syslog probe
+  tags while retaining fatal handling for malformed source records (`d25e71ba`).
+
+**Checkpoint and authentication correctness**
+
+- Decode recognized legacy validation snapshots and resolve checkpoint scratch paths before
+  mixed-format hydration (`cd6463f7`, `2526cda3`).
+- Preserve failed-logon requester identity independently from the authentication target and domain
+  controller, including coherent optional 4771 and 4776 evidence (`2619b865`).
+- Normalize ordinary host-log framing to LF so Windows checkpoint resume matches uninterrupted
+  generation (`1146b5a3`).
+
+## v2.1.0 (2026-09-14)
+
+This release adds native Windows generation and checkpoint recovery on local NTFS, including
+write-through checkpoint publication validated by native API tests and simulated power-loss
+recovery. macOS and Linux remain the primary platforms; their implementations, generated evidence
+semantics, public CLI, and checkpoint schemas remain unchanged.
+
+**Native Windows filesystem and generation support**
+
+- Add isolated, handle-relative NTFS operations with restrictive ACLs, native file identity,
+  reparse-point rejection, safe ancestor pinning, atomic rename, exclusive creation, and explicit
+  handle cleanup. Validate Unicode paths, owner rights, and delete-pending files (`2c333149`,
+  `ed204011`, `aff4578c`, `185ab44b`, `b0ab4363`, `4fd15884`).
+- Route Windows temporary streams, Windows/Sysmon source journals, Syslog, Bash history, Snort,
+  and checkpoint storage through native filesystem paths. Preserve existing POSIX operations
+  behind OS branches and wrappers (`ad7e0ca8`, `cfaf6134`, `709b4766`, `24ec42ab`).
+- Correct Windows binary flushing, writable reconciliation handles, logical manifest/skill
+  references, and native token ownership (`4b0971a3`, `7a5836bd`, `7160bfc6`).
+
+**Checkpoint write-through publication**
+
+- Flush complete checkpoint file contents and publish files and newly created directories through
+  write-through native handles before acknowledging a recovery point. Authenticate and
+  incrementally republish reused dependencies; durably publish and consume suspension control
+  records (`ebdb1611`, `7ed890d6`).
+- Stop further publication and reclamation after an uncertain recovery-index update, and defer
+  reclamation in fresh processes until index durability is confirmed (`730ef96d`).
+- Exercise actual native barriers, injected I/O failures, deliberately broken protocols, and
+  real CLI recovery from simulated crash images. The fault model covers 906 interruption/profile
+  combinations, including torn writes, reused objects, retention, and spool restoration
+  (`70fc28ea`, `8bf08865`, `a2787369`). This validates the documented storage assumptions; it
+  does not certify physical power-loss safety or final bundle publication.
+
+**CI and validation**
+
+- Run the routine Python 3.12 suite on Linux and native Windows, including one short unmarked
+  generation/checkpoint/suspend/verify/resume comparison that also runs locally on macOS. Preserve
+  the Linux slow-release and cross-Python portability gates (`ca146454`, `e012a93c`).
+- Add a required Windows checkpoint durability job and raise the Windows routine timeout to
+  45 minutes for hosted-runner variation; Linux routine and Windows durability timeouts remain
+  25 and 20 minutes (`70fc28ea`, `59678514`).
+- Document platform boundaries, native NTFS security and durability assumptions, CI failure
+  inventories, and passing Windows/Linux/macOS validation (`65212a99`, `4fd15884`, `a2787369`).
+
+## v2.0.1 (2026-09-14)
+
+This patch corrects foreground process ownership, Linux resolver-health evidence, and short
+Kerberos exchange timing, and prevents premature identity retirement from breaking checkpoints
+during long periodic scenarios. It simplifies generation ownership and shared policy while preserving
+public interfaces, authored schemas, output formats, checkpoint representations, and resume
+compatibility policies. Behavior-preserving refactors retain byte-identical evidence; correctness
+fixes intentionally change affected evidence.
+
+**Realism fixes**
+
+- Keep Linux foreground commands attached to their shell until modeled completion, termination,
+  or session teardown; release early terminations promptly and do not manufacture a release at
+  collection end (`ffdce735`).
+- Bind baseline Linux resolver degradation/recovery evidence to the emitting host's selected DNS
+  pool. Preserve stored recovery pairs on checkpoint resume and select the correct pool for new
+  episodes (`237b72c1`).
+- Reserve a joint source-local timing budget for responder WFP admission and subsequent Kerberos
+  processing, preventing short exchanges from exhausting their committed transport interval.
+  Preserve valid candidates and unrelated WFP timing, with bounded regressions and FOR668 scenario
+  and checkpoint comparisons (`d2671021`).
+- Retire process/session identities against completed simulation work instead of future event
+  timestamps, preventing periodic lookahead from invalidating pending SSH checkpoints. Preserve
+  the exact SSH source process through PID reuse and checkpoint hydration, with existing retention
+  caps and checkpoint representations (`b2948b2f`).
+
+**Process and storyline ownership**
+
+- Consolidate shell-history eligibility across validation and both generation paths, dispatch
+  typed events through family handlers, and share process-session resolution and independent
+  storyline helper owners (`2f75a27b`, `bd20077e`, `d3dea0d3`, `233bbf7a`, `5858a0a8`).
+- Extract process execution/termination ownership and staged network transactions; share process
+  normalization and reuse decisions, separate preparation from publication, and bind services to
+  explicit current state, timing, identity, and lifecycle owners (`2c7dee2a`, `2ebd6d09`,
+  `79529f46`, `7a28bbda`, `010ae90f`).
+- Separate Windows/Linux parent policies from shared ancestry coordination, remove the inventoried
+  internal parent-forwarding hops, and move bounded preflight into an ephemeral owner with distinct
+  planning and artifact-reservation phases (`788c3680`, `c72b3a4f`, `e65109ce`, `26a150ac`).
+- Separate HTTP, database, SCP, and file companions from the process-storyline coordinator while
+  preserving action-bundle routing and execution order (`7e86b07e`).
+
+**Shared infrastructure and coordinator simplification**
+
+- Share exact timing-distribution construction and live/prepared clock calculations, consolidate
+  registry admission gates and stable-lock mechanics, and derive fingerprint identity and
+  diagnostics from one payload build and installed-build scan (`7085b0b1`, `bdbc8f93`,
+  `1c266cfd`, `a6b28bcf`).
+- Replace checkpoint scratch object-graph inspection with explicit resource disposal and compose
+  shared Windows/Sysmon spool, journal, and finalization operations (`d5414c4b`, `8275d8dc`).
+- Decompose ordered per-host and cross-host baseline passes, CLI preparation/reporting/recovery,
+  and configuration-validation phases and families (`8230adf6`, `211446d7`, `1cf35c5c`,
+  `2fe26cb8`, `0bcb6e2f`, `4a41709a`).
+- Compose network-stage inputs and extract request-resolution, transport-accounting, and protocol
+  evidence decisions while retaining transaction ownership and commit boundaries (`5bcad92d`,
+  `9db12667`, `6556fe20`, `6d022448`).
+- Decompose persistent SMB action/root preparation, source construction/certification, and
+  publication/recovery along existing authenticated continuation phases (`2b1b7e5e`, `304fc68e`,
+  `e9d174a8`).
+
+**Validation, documentation, and release tooling**
+
+- Freeze characterization and raw-byte comparison controls, document reservation and lifecycle
+  contracts, and record structural, checkpoint, retention, performance, and final acceptance
+  results. The nine-item refactor passes all 250 byte-comparison cases; subsequent resolver and
+  Kerberos corrections retain explicit attribution reports (`ad8a4aa5`, `fd007c7b`).
+- Split the extended release test gate into four deterministic shards while retaining the
+  cross-Python checkpoint-portability gate (`e4035435`).
+- Make RDP ancestry checks host-specific and syslog recovery tests independent of filesystem
+  inode and file-descriptor allocation choices (`8358acdb`).
+- Record general entity availability across evidence families as future work and correct the
+  FOR668 worklog's trademark reference (`3b3917dc`, `d8a3d252`).
+
+## v2.0.0 (2026-09-11)
+
+This final 2.0 release completes the post-RC3 realism gate, closes the remaining hard
+cross-source contradictions, and ships the release-candidate architecture with verified
+checkpoint, lifecycle, performance, and authoring behavior.
+
+**Final realism assessment and evidence hygiene**
+
+- Completed assessment loops 57–75 plus a targeted final blind evaluation, repairing DHCP parent
+  and phase timing, DNS/RDP terminal lifecycles, proxy/token phase alignment, single-exchange DNS
+  timing, submillisecond WFP admission, Windows provider identifiers, source-native identifiers,
+  logind close identity, canonical binary rendering/deployment, Linux process and shell identity,
+  remote-session readiness, native Windows deployment metadata, KDC transport ordering, Linux TTY
+  stability, SMB packet texture, proxy authority/tunnel/byte accounting, Zeek file digests, and the
+  final hard contradictions (`759a46b3`, `a8cbf1bf`, `1840f066`, `7b947962`, `b5b9617f`,
+  `1cb4fbfc`, `bbd00737`, `ab6c55e0`, `f1caae5c`, `28cccc2c`, `9eb47c99`, `e13597b6`,
+  `44107766`, `a9d2b7bf`, `de59b2c6`, `cdb16120`, `ec461d22`, `b7624c7c`, `72de4fb4`,
+  `4347ff4e`, `85e118f9`, `dc94d15a`, `8dc3eaa2`, `8fca52b6`, `1e287427`, `f18b47dd`).
+- Recorded the assessment sequence, final session summary, and refreshed 2.0 positioning in the
+  maintained worklog and documentation (`5adbea2f`, `35407c20`, `12e96aab`, `31bacea2`,
+  `a1156b2f`, `e04c3f0f`, `eecde20a`, `32354f2e`, `08aaf902`, `539ccd80`, `8ba1c0d6`,
+  `c08c9fc4`, `d52edf54`, `bf0a7aac`, `84916060`, `8d9e8ffc`, `b3b79d62`, `1872353a`,
+  `c1ca05c2`, `c475a088`).
+- Stopped tracking ignored blind-assessment outputs while preserving the local artifacts and the
+  curated worklog, restoring the established public-source evidence policy (`0a2b957d`).
+
+**2.0 P1 realism and identity completion**
+
+- Added typed Windows foreground lifetime plans so one-shot commands close promptly and
+  operation/session/persistent processes retain only their actual owner (`ad2661ae`, `d8eb6364`).
+- Added canonical responder endpoint observations and inbound Sysmon Event 3
+  `Initiated=false` alongside responder-owned Security 5156, with shared transaction/process
+  identity and deployment, denial, and observation-policy gating (`e1638663`, `7f775abd`).
+- Added `public_identity_profiles.yaml` as the canonical role/provider registry for generated
+  public IP, DNS/PTR, TLS, and client traits. Shipped external-actor, mail, CDN, DNS, and NTP data
+  now use it; user-owned legacy identity overlays translate silently through 2.x, while only
+  `eforge validate` emits one actionable migration warning per consumed file. Compatibility
+  adapters are scheduled for removal in 3.0; a scenario-local schema field remains future work
+  (`7fa7563f`, `234324fe`, `20e15d5d`).
+
+**Lifecycle, checkpoint, and release contracts**
+
+- Kept SMB clients inside their owning sessions, separated collection cutoff from modeled
+  lifecycle end, preserved process lineage and sensor-route identity, and validated evidence
+  reachability with retained ancestry (`4587acfe`, `85affb5c`, `9ef89297`, `000cac47`).
+- Prevented resumed machine-authentication source-port collisions and preserved semantic
+  checkpoint identity across recovery (`0b42e52e`, `f879c6a0`).
+- Extended the required slow-release CI timeout for the measured hosted-runner runtime of the
+  complete 2.0 suite and its cross-Python checkpoint-portability check (`79330ecd`, `c4a06d19`).
+- Aligned iteration-pack migration expectations, adopted Python 3.12 typing syntax, refreshed
+  Ruff, reconciled the 2.0 roadmap, and recorded successful scenario-authoring acceptance
+  (`b877a942`, `3102b60a`, `5a157543`, `bf3e2c2a`, `12988ce7`).
+
+**Performance**
+
+- Added reusable opt-in generation profiling without changing deterministic output (`946a1569`).
+- Reduced exact SMB connection-state validation work by collapsing redundant validation within
+  locked transitions, retaining already-validated authority state, and avoiding temporary text and
+  integer encodings during callback-safe key checks. In the original pre-`dev`-integration
+  assessment, the representative all-source median improved by 5.64%. Post-integration correctness
+  and determinism were revalidated; all 25 concrete log formats and deterministic sidecars remain
+  byte-identical to the preceding build (`e0c74465`, `0efd6eac`).
+- Reused the existing timing-seed byte contract more efficiently and cached pure deterministic
+  source-clock wander knots in a bounded process-local store. In the original pre-`dev`-integration
+  assessment, the representative all-source median improved by a further 6.66%. Post-integration
+  correctness and determinism were revalidated; all 25 concrete log formats and deterministic
+  sidecars remain byte-identical to the preceding build (`ffc034d2`).
+- Specialized the exact packed-digest index read loop while preserving unsigned-64-bit validation,
+  sentinel normalization, probing, collision behavior, and defaults. Focused hit/miss throughput
+  improved by about 35%/39%, target-exclusive samples fell 77.8%, and the corrected-baseline
+  all-source median improved by at least 3.59%. All 25 concrete log formats, artifacts, and
+  deterministic sidecars remain byte-identical to the preceding build (`77b09990`, `595aaaba`).
+
+**Performance and deterministic output changes**
+
+- Made equal-second `cisco_asa` publication independent of external-sort and checkpoint run
+  boundaries by preserving ASA lifecycle precedence and applying a stable source-native tie-break
+  before appliance-local connection IDs are finalized. Only `cisco_asa` bytes change: tied rows
+  may be ordered differently and their generated appliance-local connection IDs may change. Row
+  counts, schemas, field meanings, lifecycle pairing, and the other 24 concrete formats are
+  unchanged. Repeated generation and same-build checkpoint resume are byte-identical. Checkpoints
+  created before this change require `--resume-policy attempt` after successful full hydration;
+  the measured revision-12 all-source checkpoint completed byte-identically, but historical output
+  equivalence remains conservatively unguaranteed for that compatibility transition (`f16bfd50`).
+
+**Fixed**
+
+- Repaired final release gates by rebuilding compiled deployment state after checkpoint restore,
+  preserving DNS RTT-owned transport duration, serializing concurrent sudo TTY bootstrap,
+  retaining repaired visible SSH session duration through logout, and synchronizing exact
+  identity/timing inventories (`f3f7db40`).
+- Kept failure cleanup usable for partially constructed generation-engine recovery and test
+  harnesses that do not carry the optional process-local profiler field (`5a2a55ef`).
+- Kept the opt-in generation profiler outside checkpoint payloads so checkpoint-enabled generation
+  can suspend and each resumed invocation retains only its own profiling state (`bff4bf7c`).
+- Prevented a later SSH transport that reuses a completed network tuple from inheriting the
+  earlier session's `sshd` worker, including when resuming a legacy checkpoint with a retained
+  window-long responder binding (`23b6ecad`).
+- Corrected the progress average after checkpoint resume so previously completed simulated hours
+  no longer make the displayed generation rate artificially fast (`56894bc9`).
+
+## v2.0.0rc3 (2026-09-06)
+
+This third 2.0 release candidate completes another ten-loop realism assessment cycle, hardens
+cross-source lifecycle and artifact correlations, and makes checkpoint recovery portable across
+attemptable runtime drift with explicit behavior-risk reporting.
+
+**Expanded assessment coverage and source-native ordering**
+
+- Expanded the canonical iteration-test scenario and repaired endpoint effect ownership, Sysmon
+  timing and identity, process/dependent ordering, Windows service and NewCredentials identity,
+  one-way UDP syslog, multipart ownership, SMB receiver ordering, Zeek hash rendering, proxy tunnel
+  spans, and ASA chronology (`e9fc6d01`, `9d5171d0`, `b3dcd4d4`, `6e1c6d62`, `ffdc97fe`,
+  `26c1f8ef`, `93b4f111`, `0a017f89`, `09980406`, `98a4a9a4`, `ce7f79aa`, `7f232f0b`,
+  `3e620a0d`, `f3bd418c`, `7a1713d0`, `db6ff201`, `a7e16540`, `6bc3a862`).
+
+**Lifecycle, session, and network realism**
+
+- Closed operation-lived SMB clients, finalized bounded process state safely, preserved independent
+  closure timelines, aligned ICMP packet observations with Zeek duration, and retained historical
+  Explorer/desktop-shell ownership with valid SMB actors and partial SSH observation
+  (`c9c01ed4`, `d615bfe8`, `c0a7cb54`, `059e971c`, `4799780b`, `65c90a01`, `17ed7570`,
+  `6a3b4a7a`, `47b672a6`, `c62723e2`, `b3e221fe`, `9665c3b5`, `71352a16`).
+- Repaired Windows ancestry, SMB logon identity, RDP bootstrap identity, and eCAR dependent
+  lifecycles, with each blind-assessment result recorded alongside its targeted hard probe
+  (`e8e4776e`, `c0423671`, `42a56402`, `0539bcd0`, `a99cd68a`, `995234ca`, `983a45cb`,
+  `b6495431`).
+
+**Payload, alert, and transfer lineage**
+
+- Conserved explicit-proxy upload payloads, bound IDS alerts to visible triggers, and tied HTTP
+  artifacts and error MIME to terminal outcomes (`58efa45c`, `013f13bf`, `55dec82c`, `d7439744`,
+  `536ee7ad`, `928f2492`, `c3eb1ce4`).
+- Enforced chained-transfer availability and exact SCP close, lineage, source handoff, receiver
+  placement, and source retention, then bound RDP logons to their session `winlogon` bootstrap
+  (`372ad0e2`, `0ee1c37d`, `9843b327`, `4acf035a`, `ac3bda9e`, `a0916908`, `75ae3eeb`,
+  `1597c643`, `42d92f41`).
+
+**Portable checkpoint recovery**
+
+- Completed iteration-scenario checkpoint state, repaired compatible restore performance and
+  aged-out-parent semantics, and added behavior-aware runtime drift, read-only hydration
+  verification, same-cursor migration, provenance, skills, documentation, and portability gates
+  (`ff86dde1`, `6758209b`, `e50e6cf5`, `d353e40b`, `7552fbfd`).
+
+## v2.0.0rc2 (2026-09-04)
+
+This second 2.0 release candidate consolidates the architecture and realism work completed after
+RC1, adds portable pack releases and resumable long-running generation, and refreshes the
+authoring and tester experience ahead of the final 2.0 release.
+
+**Deterministic lifecycle and publication foundations**
+
+- Completed the V2 family-level architecture with bounded state registries, authenticated intent
+  and effect receipts, append-only lifecycle authority, atomic action cohorts, immutable
+  deployment/content identity, and one shared source-timing runtime (`42c4136b`, `af0bb0b9`,
+  `d90010fc`, `2678ad09`, `7d3875a2`).
+- Migrated Windows Security, Sysmon, Bash history, Snort, DNS, DHCP, TLS, email, browser, file
+  transfer, Linux shell, and remote-session timing/publication onto exact recoverable contracts
+  (`f6e9d3f9`, `2facf92b`, `b68e53a7`, `670b3843`, `24520c45`, `5880c4de`, `1ebcb4da`).
+
+**Remote access, network, and persistent application channels**
+
+- Added bounded persistent HTTP/proxy, SSH, RDP, and SMB channel state with exact deferred
+  publication, transport receipt binding, terminal drain coordination, and deterministic recovery
+  (`4deb3097`, `af0bb0b9`, `809aa0da`, `a161db38`, `fe0ef69d`, `96e7e557`, `56550e92`,
+  `e5ccb543`).
+- Hardened RDP, SSH, sudo, proxy, DNS, Cisco ASA, Sysmon, and network tuple/source-port ownership
+  across suppression, teardown, retry, and concurrent publication paths (`902ff73d`, `5c29e817`,
+  `e963d182`, `07ebbbf5`, `b01ec93e`, `7b99b9bd`, `463a08eb`, `5912774c`).
+
+**Realism and long-run correctness**
+
+- Incorporated the post-RC1 assessment fixes for Windows service ancestry, authentication and
+  workstation state, Linux foreground/sudo ownership, SSH timing, proxy accounting, SMB transfer
+  identity, registry artifacts, scheduled automation, Kerberos policy, and CIDR-aware nmap effects
+  (`120fe082`, `52346e69`, `08091e34`, `c8cb60cb`, `d7fec6d6`, `f4b549ec`, `e432bd27`,
+  `6e6e03f0`, `af3edef1`, `065c608b`).
+- Added duration-stable retention and admission checks for TLS, DNS, SSH ports, processes,
+  lifecycle state, and evolving SMB files, including 31-day and long-generation regression gates
+  (`617a9c8c`, `541ce9b4`, `3e514c67`, `6e5b98a4`, `f83d5401`).
+
+**Pack distribution and scenario authoring**
+
+- Added portable immutable `.efpack` release, import, hydration, validation, provenance, and
+  publisher-qualified inventory workflows, with restored authoring contracts and modeled host
+  resources (`9668ea07`, `e1e4054f`).
+- Expanded focused schema guidance, IDS signature inventory, skill routing, and the experimental
+  clean-room scenario-agent acceptance harness (`63834b1f`, `7bd36232`, `29be4518`).
+
+**Incremental generation and operator experience**
+
+- Added atomic incremental checkpoints and byte-identical resume for long-running generation,
+  followed by checkpoint inspection, cleanup, CLI recovery guidance, and slow-suite repair
+  (`c77856f3`, `a3905e69`, `2e790f92`).
+- Improved generation progress reporting and narrow-terminal behavior, refreshed the EvidenceForge
+  2.0 README and visual identity, corrected its trademark references, and clarified the
+  release-readiness roadmap (`6631c13f`, `368bc143`, `4333f1fe`, `05914706`, `6f087045`,
+  `5e6c2e5c`, `af8c01f3`).
+
+**Runtime and dependency support**
+
+- Raised the supported runtime to Python 3.12 and refreshed Ruff, pytest-benchmark, pre-commit,
+  python-dotenv, setup-uv, and the final dependency batch (`2f408600`, `e680cab0`, `327e046c`,
+  `322ff67e`, `881a0361`, `a6a1a292`, `13575583`).
+
+## v2.0.0rc1 (2026-08-14)
+
+This first 2.0 release candidate brings Scenario 2.0 composition, reusable pack authoring, and
+cross-platform SMB2/3 support together on `dev` for release-readiness testing.
+
+**Cross-platform SMB2/3**
+
+- Extended the canonical SMB engine across Linux and Windows clients plus Windows and Samba
+  domain-member servers, with platform-native storage, authentication, process ownership, audit,
+  Zeek/eCAR correlation, manifest-v2 diagnostics, evaluation, and bounded long-run behavior
+  (`cbe9bd24`, `ef99f238`).
+- Added a versioned Northstar Linux/Samba organization-pack extension, mixed-OS fixtures,
+  deterministic integration coverage, resource-calibration v4 artifacts, and synchronized public
+  and skill contracts (`cbe9bd24`).
+
+**Scenario 2.0 and reusable packs**
+
+- Added exact-version industry and organization pack composition with provenance, deterministic
+  catalog qualification, lifecycle tooling, packaged sample packs, and authoring contracts
+  (`e4eb7d0f`, `01fd7e6d`).
+- Extracted the assessment benchmark into
+  `project:organization:meridian-healthcare-solutions@1.0.0`, preserved the monolithic source as
+  `iteration-test-1_0`, and kept `iteration-test` as the behavior-equivalent pack consumer
+  (`cbe9bd24`).
+
+**Agent-skill reliability**
+
+- Added focused pack-authoring workflows and compact, routed EvidenceForge skill references with
+  stronger installer, context-budget, safety, and checkout-CLI contracts (`01fd7e6d`, `d6a25dbd`,
+  `df1f39b6`).
+
+**Release-candidate readiness**
+
+- Locked the packed and inline assessment scenarios to equivalent effective semantics, documented
+  byte-identical current-code generation, and repaired timestamped explicit-credential lookup so
+  authoritative-ended sessions cannot own later process activity (`5e6e7c5e`, `31ac7004`).
+- Added canonical PEP 440 `X.Y.ZrcN` support to the release-version guard and maintainer workflow
+  (`e67f0625`).
+
+## v1.17.0 (2026-08-13)
+
+This minor release adds bidirectional HTTP file and multipart-body analysis, promotes the
+iteration benchmark to a canonical regression scenario, and incorporates ten further blind
+assessment loops of cross-source realism hardening.
+
+**HTTP file and multipart analysis**
+
+- Added canonical upload and download file modeling across authored, browser, beacon, and
+  explicit-proxy traffic, with coherent endpoint, Zeek HTTP/files, executable-analysis, ground
+  truth, configuration, and evaluation projections (`4b58bafc`).
+- Added ordered, source-native multipart sections in both HTTP directions, including curl form
+  parsing, endpoint reads, sparse Zeek vectors, proxy propagation, and multipart-aware
+  observation and plausibility checks (`a6f6acb8`).
+
+**Canonical benchmark and regression coverage**
+
+- Promoted the expanded iteration-test scenario as the canonical benchmark and consolidated its
+  generated assessment history into maintained scenario, report, and worklog artifacts
+  (`9ad1eeb1`).
+- Added a representative multipart upload to that benchmark so the new request-body path remains
+  exercised by end-to-end generation and assessment (`0eba2afb`).
+
+**Cross-source realism**
+
+- Completed assessment loops 60–69 and fixed the resulting lifecycle and identity seams across
+  Windows process/authentication telemetry, Linux sudo and PAM sessions, DNS ownership, TLS-aware
+  IDS attachment, multipart process ownership, and source-native timing (`322369c4`).
+
+## v1.16.0 (2026-08-11)
+
+This minor release replaces static large-workload gating with host-aware resource forecasting,
+makes long-duration PID allocation stable and reusable, and incorporates the latest
+cross-source realism corrections from repeated assessment.
+
+**Adaptive resource forecasting**
+
+- Added deterministic memory, swap, and disk forecasts to validation and generation, with
+  host-capacity-aware low, medium, and high advisories instead of requiring an
+  `--allow-large-workload` override (`6432538d`).
+- Calibrated the model across source-isolated and full-format workloads, documented its fitted
+  intervals, and added CLI, schema, workload, and resource-model regression coverage
+  (`6432538d`).
+
+**Duration-stable process identity**
+
+- Replaced all-history Linux PID uniqueness with a watermarked logical sequence and safe cyclic
+  reuse, while protecting active, fixed, and transient reservations (`89976281`).
+- Applied collision-safe reservation handling to the Windows PID ring, bounded dependent
+  process-instance indexes, and added long-duration state, timing, lifecycle, and evaluator
+  gates (`89976281`).
+
+**Cross-source realism**
+
+- Improved process, network, email, and source-native evidence alignment based on the latest
+  assessment findings, including corrected lifecycle and pivot behavior (`0b14b16a`).
+
+## v1.15.0 (2026-08-10)
+
+This minor release completes the non-breaking canonical event and action-bundle
+architecture, substantially strengthens cross-source lifecycle realism, and
+incorporates repeated blind-assessment fixes across endpoint, network, email,
+and evaluation behavior.
+
+**Canonical architecture and safety**
+
+- Added the canonical contract foundation and completed occurrence, dispatch,
+  session/authentication, interactive-session, network-projection,
+  world-capability, evaluation-validity, and workload-safety boundaries
+  (`0b0ad32c`, `b89855c9`, `739dbea2`, `b2f1dd68`, `91247365`, `c139c77a`,
+  `03401ad0`, `868eb35d`, `53934a16`).
+- Closed the post-migration realism blockers without restoring compatibility
+  layers or changing the public scenario schema (`2ab8e5e9`).
+
+**Windows endpoint, identity, and session realism**
+
+- Enforced module lifecycles, channel-time-derived record IDs, and more varied
+  startup module profiles (`49148992`, `f4979524`, `df33ad10`).
+- Modeled authentication attempts and privilege-event ownership, and kept
+  desktop bootstrap and session lifecycles attached to their canonical logons
+  (`cfd6e10a`, `5c7786d6`, `f5604488`, `2942320d`).
+- Made enterprise software cohorts and endpoint singleton planning coherent
+  and atomic across process and network ownership (`c0a01395`, `b96a96be`,
+  `4a816bcc`, `b7275437`, `d5c6900a`).
+- Reused resident desktop resources and named service processes, and bound
+  endpoint effects and ambient Windows file activity to native process owners
+  (`b3cd49a0`, `d7162d57`, `4f062448`, `90a997db`).
+- Preserved host timezone state and canonical shell bootstrap timing, modeled
+  complete Windows session-process lifecycles, and prevented duplicate RDP
+  shell bootstrap (`bfbe3ed3`, `a1227098`, `ea914c19`, `81fc795c`, `4cc75358`).
+
+**Remote access and Linux lifecycle ownership**
+
+- Enforced Linux process-observation chronology and bounded SSH client
+  ownership, then attached Windows SSH clients, credentials, receiver
+  lifecycles, routine scheduling, and responder processes to their owning
+  sessions (`8616105d`, `a8ddb632`, `2312ec24`, `eeb97e11`, `00a36029`,
+  `316f0da7`, `84294984`).
+- Preserved explicit-credential source semantics and modeled one-shot caller
+  behavior, while assigning Linux SMB activity to native client processes
+  (`f0c6117d`, `17f73d05`, `ebab5c8f`).
+
+**Network, protocol, proxy, and source-native projection**
+
+- Ordered HTTP activity and made persistent transactions share coherent,
+  durable observation identities (`04eb354c`, `8f1593f3`, `9dc294ad`,
+  `481f0ed8`).
+- Ordered and retained ASA translations, modeled coherent sensor clocks and
+  passive datagram accounting, and clipped perimeter teardown observations to
+  visible intervals (`20f08d56`, `2ed74a5d`, `dc4d519c`, `0e75af19`,
+  `e5f5aac8`).
+- Defined and annotated proxy tunnel accounting, omitted unavailable totals,
+  reconciled byte scopes, and attached proxy flows to native client processes
+  (`76421d75`, `1f9e4f5d`, `1f854be8`, `998d9942`, `1ee7ad95`, `ea53038a`).
+- Enforced half-open collection windows, gated analyzers on captured content,
+  normalized Zeek histories, preserved TLS certificate observation, and
+  excluded implausible external client networks (`4565b2e0`, `9e3e7c28`,
+  `e3e9ed9a`, `fc51a85d`, `1f9dd5d1`).
+- Rendered source-native output against explicit versioned schemas
+  (`c3f17ead`).
+
+**Long-lived services, maintenance, packages, and applications**
+
+- Honored bounded process deadlines and completed ownership/closure for APT
+  frontends, package managers, and their transport helpers (`318dfe59`,
+  `490e363b`, `eba43cd9`, `ed2e4d80`).
+- Modeled durable ServiceHealth agents and stateful fleet maintenance
+  (`2a205e0b`, `294d2c80`).
+- Reused resident mail clients, preserved durable but varied rsyslog health
+  state, and aligned generated email artifacts with their owning applications
+  (`07751e47`, `481a48d1`, `772ebabc`, `60ae2587`).
+
+**Evaluation correctness and regression coverage**
+
+- Reconciled storyline pivot identity, explicit-proxy paths, duration windows,
+  account deletion, and truthful already-satisfied action no-ops, restoring
+  full pivot linkability on the expanded IDS assessment (`dcb89ca6`).
+- Corrected the private-IPv6 network regression expectation (`f17096f0`).
+
+**Assessment, documentation, and CI**
+
+- Published the complete realism review, reconciled its remediation roadmap,
+  and recorded the post-Batch-2 and post-Batch-7b effectiveness gates
+  (`7238ca61`, `2b473a3d`, `f2a15f6a`, `0934e808`, `ca03d731`).
+- Recorded assessment loops 15-34 and their individual handoffs, then completed
+  the expanded iteration-test loop documentation (`ff7928e0`, `2eb98588`,
+  `53c454aa`, `6472d02a`, `45467a6b`, `161f30ff`, `6339e586`).
+- Extended CI time allowance for the expanded validation suite (`40ac5f71`).
+- Updated Ruff to 0.16.1 and setup-uv to 9.0.0, retaining explicit cache
+  pruning for cache-enabled GitHub Actions jobs (`8c4685c7`, `93a4510e`).
+
+## v1.14.1 (2026-08-04)
+
+This patch release corrects source-native network and endpoint behavior found
+through blind realism assessment, without adding new scenario capabilities.
+
+**Dependency security**
+
+- Updated `cryptography` to 50.0.0, incorporating the upstream fix for
+  CVE-2026-69247 in PKCS#7 recipient-key decryption.
+
+**Network and timing correctness**
+
+- Kept datagram capture loss protocol-native by limiting Zeek stream-gap
+  semantics to TCP while retaining UDP/ICMP packet-loss accounting
+  (`d8725913`).
+- Preserved Zeek ICMP echo type/code identity through multiplexed sensor
+  observation and added regression coverage for the `8/0` convention
+  (`70efa8bb`).
+- Replaced narrow proxy timing grids and multi-minute one-shot client startup
+  delays with bounded, application-native timing for proxy requests, `wget`,
+  APT transport helpers, and health checks (`adb7ca0c`, `697959a5`).
+
+**Host-role and endpoint robustness**
+
+- Reduced domain-controller WFP baseline concentration and kept database-host
+  administrative traffic focused on role-appropriate services (`5ea6098b`,
+  `821efd3a`).
+- Prevented eCAR RunMRU materialization from interpreting backslashes in
+  domain-qualified Windows usernames as regular-expression replacement escapes
+  (`7fb1d660`).
+
+## v1.14.0 (2026-08-04)
+
+This minor release adds canonical multi-alert IDS attachments and exact
+cross-source evaluation integrity, then hardens the generator against realism
+findings discovered through repeated blind assessment.
+
+**Correlated IDS evidence**
+
+- Added typed, transport-owned IDS alert attachments with multi-SID support,
+  sensor-local routing, filtering policy, validation, configuration overlays,
+  documentation, and source-native Snort rendering (`2be53773`, `96f5afe1`).
+- Added exact IDS integrity evaluation across ground truth, transport evidence,
+  visibility, sensors, and rendered alerts, including acceptance gates and
+  regression coverage for correlation failures (`e023286b`).
+
+**Cross-source and source-native realism**
+
+- Corrected eCAR session timing and module principal ownership, machine-account
+  application transport semantics, versioned Sysmon manifests, and
+  deterministic leaf-certificate issuance (`3dfbd680`).
+- Replaced exact sudo ceilings and public-client User-Agent monoculture with
+  host/source-sticky distributions, and added sensor-local timing and bounded
+  capture-accounting texture for distributed network observations
+  (`3dfbd680`).
+- Prevented impossible baseline signatures and payload-content alerts on opaque
+  TLS while retaining metadata-visible TLS detections and cleartext payload
+  coverage (`3dfbd680`).
+
+## v1.13.1 (2026-07-30)
+
+This patch release hardens agent-facing security boundaries and CI dependency
+integrity while incorporating the latest pytz and Ruff maintenance updates.
+
+**Security remediation**
+
+- Treated scenario, log, MIME, attachment, manifest, and ground-truth content as
+  untrusted evidence during agent-assisted evaluation, with installer
+  regressions preserving the boundary across Claude and ChatGPT skills
+  (`666ea961`).
+- Replaced shell-interpolated payload encoding guidance with constant encoders
+  that consume quoted here-document input, preventing payload text from being
+  reparsed as shell syntax (`666ea961`).
+- Pinned every external GitHub Action to a reviewed full commit SHA and added a
+  repository-wide regression that rejects mutable action references
+  (`666ea961`).
+
+**Dependencies and tooling**
+
+- Updated pytz to 2026.3.post1 and Ruff to 0.16.0 while explicitly preserving
+  the existing Python-only Ruff formatting scope (`9e80adee`).
+
+## v1.13.0 (2026-07-27)
+
+This minor release establishes canonical lifecycle, identity, observation, and
+cryptographic planning contracts while improving long-scenario generation
+performance. Repeated runs of the same version remain byte-identical; the
+bounded Linux PID allocator intentionally changes PID-derived output relative
+to earlier development builds.
+
+**Canonical network, proxy, and observation contracts**
+
+- Centralized network transaction planning and added sensor observation,
+  lifecycle admission, and explicit proxy phase modeling so correlated source
+  evidence is constructed before rendering (`627602ed`, `6c5ee798`,
+  `d36e0d04`).
+- Preserved transport-before-authentication ordering, routed remote interactive
+  logons through RDP bundles, bounded endpoint flows to canonical intervals,
+  and aligned DNS process ownership and sensor timing (`4d441adc`, `f6c00225`,
+  `6bfe4dfa`, `0b8a3875`, `6053153d`).
+- Corrected TLS resumption history and connection duration, Security record-ID
+  epochs, Kerberos service identity, eCAR thread identity, process target
+  security context, and inferred Linux thread leaders (`72f9b86e`, `1650965c`,
+  `a6bc3172`, `27ccb505`, `286cf8bb`, `42373185`, `aef80375`).
+
+**Identity, session, and remote-auth lifecycle**
+
+- Added canonical process/thread identity state, centralized identity lifecycle
+  ownership, and made eCAR identity roles explicit (`2935410a`, `0c4cc579`,
+  `c43b094f`).
+- Enforced explicit session closure with authoritative lifecycle invariants and
+  final acceptance fixes (`0c5ce6a7`, `d82213ea`, `2ada0f30`).
+- Modeled ordered Linux sudo lifecycles, closed the ambient-session bypass, and
+  grouped source-local sudo observations (`016c1984`, `281d5fe5`, `14b094e1`).
+- Added canonical Windows remote-authentication planning, finalized source
+  timing before rendering, and added rendered-order probes (`d5fe4f68`,
+  `a66c363d`, `b9dfde31`).
+
+**Cryptographic protocol realism**
+
+- Added canonical cryptographic material planning, standards-valid OCSP
+  transactions, valid DKIM signing, and rendered cryptographic evidence
+  contracts (`221669ce`, `31e3ba38`, `f07e2c46`).
+
+**Long-scenario performance**
+
+- Replaced global connection-table scans with indexed tuple lookup and bounded
+  closed-connection lifecycle state, preventing progressive slowdown as
+  scenario history grows (`d1b988f4`).
+- Replaced emitter barrier polling with FIFO flush acknowledgements, reducing a
+  representative 48-hour workload by 7% while preserving byte-identical output
+  (`b348fc8f`).
+- Repaired stale recursive process-parent fallbacks so long-running scenarios
+  choose a verified live process anchor instead of failing during later RDP
+  client creation (`13146e9e`).
+- Unified session, process, thread, connection, expiry, Linux PID, and logind
+  history behind shared duration-stable indexes. Replaced the quadratic Linux
+  PID collision walk with bounded deterministic allocation, reducing 8,000
+  sequential allocations from 18.18 seconds to 0.105 seconds (`eafb0f05`).
+- Prevented backdated session bootstrap from resurrecting ended sessions,
+  indexed the remaining session-owned process lookups, bounded syslog retention
+  with record-preserving hourly spools, and stabilized long-run ETA display
+  over a 15-minute speed window (`bb6d6033`).
+- Replaced the duration-growing sensor-UID correlation table with a
+  constant-size completed-connection handoff and compacted stale grouped
+  temporal-index records. Moved `COLLECTION_PROFILE.json` out of the ingestible
+  `data/` tree and into the run metadata root (`b00bdd1f`).
+
+**Assessment records and maintenance**
+
+- Recorded expanded assessment loops 62 through 72 and their accepted
+  source-native realism outcomes (`383e410d`, `12c85d2e`).
+- Updated `actions/setup-python` from 6 to 7, pre-commit from 4.6.0 to 4.6.1,
+  Ruff through 0.15.22, and Typer from 0.26.8 to 0.27.0 (`c726ff7c`,
+  `c8a428a5`, `18b389df`, `74d6ff18`).
+
 ## v1.12.0 (2026-07-10)
 
 This minor release aligns EvidenceForge skill installation with current Claude

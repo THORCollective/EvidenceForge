@@ -26,7 +26,16 @@ from datetime import UTC, datetime
 
 import pytest
 
+from evidenceforge.events.contracts import (
+    EffectOccurrenceKind,
+    EffectOccurrenceOwner,
+    OccurrenceRole,
+    OwnedEffectOccurrencePlan,
+    SemanticOccurrenceKey,
+)
+from evidenceforge.generation.actions.command_effects import ExecutionEffectAuditCounter
 from evidenceforge.generation.ground_truth import GroundTruthGenerator
+from evidenceforge.generation.intent_ledger import AuthoredIntentLedger, IntentExecutionLedger
 from evidenceforge.models import (
     BaselineActivity,
     Environment,
@@ -173,6 +182,130 @@ class TestGroundTruthGenerator:
             "dst_port": 443,
             "uid": "C12345",
         }
+
+    def test_build_document_reconciles_authored_intent_ledgers(
+        self, minimal_scenario, malicious_events
+    ):
+        """Ground truth v2 links independent intent to occurrences and observations."""
+
+        authored = AuthoredIntentLedger.from_scenario(minimal_scenario)
+        execution = IntentExecutionLedger(authored)
+        for intent in authored.intents:
+            execution.mark_planned(intent.intent_id)
+        first = authored.intents[0]
+        occurrence_key = SemanticOccurrenceKey(
+            action_id="action-1",
+            role=OccurrenceRole.PRIMARY,
+            instance_key="process-1",
+        )
+        execution.record_occurrence(first.intent_id, occurrence_key)
+        execution.record_observation(first.intent_id, "windows_security", "visible")
+        events = [dict(event) for event in malicious_events]
+        events[0]["intent_id"] = first.intent_id
+
+        document = GroundTruthGenerator(
+            minimal_scenario,
+            events,
+            authored_intent_ledger=authored,
+            intent_execution_snapshot=execution.snapshot(),
+        ).build_document()
+
+        assert document.schema_version == 3
+        with pytest.raises(ValueError, match="Input should be 3"):
+            type(document).model_validate(
+                {
+                    **document.model_dump(mode="python"),
+                    "schema_version": 1,
+                }
+            )
+        reconciliation = document.intent_reconciliation
+        assert reconciliation is not None
+        assert reconciliation.complete
+        assert reconciliation.expected_count == 2
+        assert reconciliation.planned_count == 2
+        assert reconciliation.occurred_count == 1
+        assert reconciliation.observed_count == 1
+        assert document.events[0].intent_id == first.intent_id
+        first_row = reconciliation.intents[0]
+        assert first_row.action_ids == ["action-1"]
+        assert first_row.occurrence_ids == [occurrence_key.occurrence_id]
+        assert first_row.action_reference_count == 1
+        assert first_row.occurrence_reference_count == 1
+        assert first_row.action_digest is not None and len(first_row.action_digest) == 64
+        assert first_row.occurrence_digest is not None and len(first_row.occurrence_digest) == 64
+        assert first_row.source_status == {"windows_security": {"visible": 1}}
+
+        with pytest.raises(ValueError, match="unknown status"):
+            type(first_row).model_validate(
+                {
+                    **first_row.model_dump(mode="python"),
+                    "source_status": {"windows_security": {"invented": 1}},
+                }
+            )
+
+    def test_build_document_exports_bounded_execution_effect_reconciliation(
+        self,
+        minimal_scenario,
+        malicious_events,
+    ):
+        """New generated documents expose a count-only effect audit and stable digest."""
+
+        snapshot = ExecutionEffectAuditCounter().snapshot()
+
+        document = GroundTruthGenerator(
+            minimal_scenario,
+            malicious_events,
+            execution_effect_audit_snapshot=snapshot,
+        ).build_document()
+
+        reconciliation = document.effect_reconciliation
+        assert reconciliation is not None
+        assert reconciliation.complete
+        assert reconciliation.plan_count == 0
+        assert reconciliation.owned_effect_plan_count == 0
+        assert reconciliation.owned_effect_expected_occurrence_count == 0
+        assert reconciliation.owned_effect_published_occurrence_count == 0
+        assert reconciliation.missing_required_node_count == 0
+        assert reconciliation.cardinality_mismatch_count == 0
+        assert reconciliation.duplicate_outcome_count == 0
+        assert reconciliation.reconciliation_digest == snapshot.reconciliation_digest
+
+    def test_build_document_accepts_complete_family_owned_effect_reconciliation(
+        self,
+        minimal_scenario,
+        malicious_events,
+    ):
+        """Owned roots remain distinct from execution plans in canonical ground truth."""
+
+        plan = OwnedEffectOccurrencePlan(
+            owner=EffectOccurrenceOwner.BASELINE_DHCP_REGISTRY_ROOT,
+            kind=EffectOccurrenceKind.REGISTRY,
+            root_action_id="dhcp-lease-1",
+            instance_key="lease-registry",
+            occurrence_count=1,
+        )
+        counter = ExecutionEffectAuditCounter()
+        counter.record_owned_effect_plan(plan)
+        counter.record_published_effect_occurrence(
+            plan.provenance(0),
+            effect_kind=EffectOccurrenceKind.REGISTRY,
+        )
+
+        document = GroundTruthGenerator(
+            minimal_scenario,
+            malicious_events,
+            execution_effect_audit_snapshot=counter.snapshot(),
+        ).build_document()
+
+        reconciliation = document.effect_reconciliation
+        assert reconciliation is not None
+        assert reconciliation.complete
+        assert reconciliation.plan_count == 0
+        assert reconciliation.owned_effect_plan_count == 1
+        assert reconciliation.owned_effect_expected_occurrence_count == 1
+        assert reconciliation.owned_effect_published_occurrence_count == 1
+        assert reconciliation.reconciled_effect_occurrence_count == 1
+        assert reconciliation.published_effect_occurrence_count == 1
 
     def test_build_document_includes_red_herring_explanation(
         self, minimal_scenario, malicious_events

@@ -31,14 +31,28 @@ Contains the EmitterSetupMixin with methods for:
 - SID registry building
 """
 
+import hashlib
 import logging
 import random
-from datetime import datetime, timedelta
+import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
+from evidenceforge.events.collection_policy import canonical_source_hostname
 from evidenceforge.formats import load_format
 from evidenceforge.generation.actions import dhcp_renewal_interval_seconds
 from evidenceforge.generation.activity.edr_pools import normalize_defender_platform_path
-from evidenceforge.generation.activity.network_params import load_network_params, public_ntp_ips
+from evidenceforge.generation.activity.network_params import (
+    external_client_excluded_cidrs,
+    load_network_params,
+)
+from evidenceforge.generation.activity.public_identity_profiles import PublicIdentityRegistry
+from evidenceforge.generation.activity.smb_profiles import (
+    render_process as render_smb_process,
+)
+from evidenceforge.generation.activity.smb_profiles import (
+    select_server_profile,
+)
 from evidenceforge.generation.emitters import (
     BashHistoryEmitter,
     CiscoAsaEmitter,
@@ -60,17 +74,141 @@ from evidenceforge.generation.emitters import (
     ZeekPacketFilterEmitter,
     ZeekPeEmitter,
     ZeekReporterEmitter,
+    ZeekSmbFilesEmitter,
+    ZeekSmbMappingEmitter,
     ZeekSmtpEmitter,
     ZeekSslEmitter,
     ZeekWeirdEmitter,
     ZeekX509Emitter,
 )
 from evidenceforge.generation.identity import IdentityDirectory
-from evidenceforge.generation.world_model import database_services_for_host
+from evidenceforge.generation.lifecycle_authority import (
+    GeneratorLifecycleAuthority,
+    LifecycleMaterializationBatchPlanningAttempt,
+    LifecycleMaterializationBatchPlanningCapability,
+    LifecycleMaterializationBatchTerminalResult,
+    LifecycleMaterializationBatchTransaction,
+)
+from evidenceforge.generation.lifecycle_registry import LifecycleRegistry
+from evidenceforge.generation.state_manager import (
+    MaterializationBatchBuilder,
+    ProcessMaterializationPlan,
+)
+from evidenceforge.generation.world_model import (
+    HostCapability,
+    WorldModel,
+    database_services_for_host,
+)
+from evidenceforge.models.exceptions import StateError
 from evidenceforge.models.scenario import System
 from evidenceforge.utils.rng import _stable_seed, stable_uuid
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _BootProcessSpec:
+    """One allocation-free symbolic member of a boot process forest."""
+
+    alias: str
+    parent_alias: str | None
+    fixed_pid: int | None
+    image: str
+    command_line: str
+    username: str
+    integrity_level: str
+    os_category: str
+    logon_id: str
+    start_time: datetime | None
+
+    def canonical_payload(self) -> tuple[object, ...]:
+        """Return the exact immutable request projection used by planning."""
+
+        return (
+            self.alias,
+            self.parent_alias,
+            self.fixed_pid,
+            self.image,
+            self.command_line,
+            self.username,
+            self.integrity_level,
+            self.os_category,
+            self.logon_id,
+            self.start_time,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _BootHostSpec:
+    """One host's exact symbolic process forest and durable boot metadata."""
+
+    hostname: str
+    os_category: str
+    boot_time: datetime | None
+    machine_id: str
+    processes: tuple[_BootProcessSpec, ...]
+    aliases: tuple[tuple[str, str], ...]
+
+    def canonical_payload(self) -> tuple[object, ...]:
+        """Return every value that can affect State planning or engine PID maps."""
+
+        return (
+            self.hostname,
+            self.os_category,
+            self.boot_time,
+            self.machine_id,
+            tuple(member.canonical_payload() for member in self.processes),
+            self.aliases,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class BootFleetSpec:
+    """Allocation-free complete input to one atomic fleet boot materialization."""
+
+    state_time: datetime | None
+    hosts: tuple[_BootHostSpec, ...]
+
+    def canonical_payload(self) -> tuple[object, ...]:
+        """Return the single immutable projection shared by hashing and planning."""
+
+        return (
+            "boot-process-fleet-spec-v2",
+            self.state_time,
+            tuple(host.canonical_payload() for host in self.hosts),
+        )
+
+
+_BOOT_MATERIALIZATION_PAGE_HOSTS = 32
+
+
+def _canonical_boot_payload_bytes(value: object) -> bytes:
+    """Encode an exact inert boot payload without invoking caller-defined methods."""
+
+    if value is None:
+        return b"n"
+    if type(value) is bool:
+        return b"b1" if value else b"b0"
+    if type(value) is int:
+        encoded = str(value).encode("ascii")
+        return b"i" + str(len(encoded)).encode("ascii") + b":" + encoded
+    if type(value) is str:
+        encoded = value.encode("utf-8")
+        return b"s" + str(len(encoded)).encode("ascii") + b":" + encoded
+    if type(value) is datetime:
+        if value.tzinfo is not UTC:
+            raise StateError("Boot fleet datetimes must use the exact UTC timezone")
+        encoded = value.isoformat(timespec="microseconds").encode("ascii")
+        return b"d" + str(len(encoded)).encode("ascii") + b":" + encoded
+    if type(value) is tuple:
+        members = tuple(_canonical_boot_payload_bytes(member) for member in value)
+        return (
+            b"t"
+            + str(len(members)).encode("ascii")
+            + b":"
+            + b"".join(str(len(member)).encode("ascii") + b":" + member for member in members)
+        )
+    raise StateError("Boot fleet specifications require exact inert built-in values")
 
 
 def _system_uses_dhcp(system: System) -> bool:
@@ -116,6 +254,8 @@ def _build_emitter_classes() -> dict:
         "zeek_smtp": ZeekSmtpEmitter,
         "zeek_ssl": ZeekSslEmitter,
         "zeek_files": ZeekFilesEmitter,
+        "zeek_smb_files": ZeekSmbFilesEmitter,
+        "zeek_smb_mapping": ZeekSmbMappingEmitter,
         "zeek_dhcp": ZeekDhcpEmitter,
         "zeek_ntp": ZeekNtpEmitter,
         "zeek_weird": ZeekWeirdEmitter,
@@ -142,6 +282,8 @@ _ZEEK_FORMAT_NAMES = {
     "zeek_smtp",
     "zeek_ssl",
     "zeek_files",
+    "zeek_smb_files",
+    "zeek_smb_mapping",
     "zeek_dhcp",
     "zeek_ntp",
     "zeek_weird",
@@ -163,16 +305,6 @@ _HOST_FORMATS = {
     "bash_history",
     "web_access",
     "proxy_access",
-}
-
-# Service name -> (port, zeek_service) mapping for database detection
-DB_SERVICE_MAP = {
-    "mssql": (1433, "mssql"),
-    "sql server": (1433, "mssql"),
-    "mysql": (3306, "mysql"),
-    "mariadb": (3306, "mysql"),
-    "postgres": (5432, "postgresql"),
-    "postgresql": (5432, "postgresql"),
 }
 
 
@@ -228,7 +360,7 @@ class EmitterSetupMixin:
         _sensor_hostnames_by_format: dict[str, list[str]] = {}
         if self.scenario.environment.network and self.scenario.environment.network.sensors:
             for s in self.scenario.environment.network.sensors:
-                hostname = s.hostname or s.name
+                hostname = canonical_source_hostname(s.hostname or s.name)
                 for fmt in expand_formats(s.log_formats):
                     _sensor_hostnames_by_format.setdefault(fmt, []).append(hostname)
 
@@ -248,19 +380,25 @@ class EmitterSetupMixin:
                     sensor_hostnames=sensor_hostnames,
                 )
             elif format_name in _HOST_FORMATS:
-                emitter = emitter_classes[format_name](format_def, self.output_dir, threaded=True)
+                emitter_kwargs: dict[str, object] = {"threaded": True}
+                if format_name in {"windows_event_security", "windows_event_sysmon"}:
+                    emitter_kwargs["source_finalization"] = True
+                emitter = emitter_classes[format_name](
+                    format_def,
+                    self.output_dir,
+                    **emitter_kwargs,
+                )
             else:
                 output_path = self.output_dir / f"{format_name}{format_def.output.file_extension}"
                 emitter = emitter_classes[format_name](format_def, output_path, threaded=True)
 
-            emitter.configure_output_target(self.output_target)
             self.emitters[format_name] = emitter
+            emitter.configure_output_target(self.output_target)
             logger.info(f"Initialized {format_name} emitter (threaded)")
 
         # Configure ASA emitters with network topology for interface resolution
         if "cisco_asa" in self.emitters:
             asa_emitter = self.emitters["cisco_asa"]
-            asa_emitter._output_end_time = self.end_time
             if self.scenario.environment.network:
                 asa_emitter._segment_config = [
                     {"name": seg.name, "cidr": seg.cidr}
@@ -268,8 +406,11 @@ class EmitterSetupMixin:
                 ]
                 for sensor in self.scenario.environment.network.sensors:
                     if sensor.interfaces:
-                        hostname = sensor.hostname or sensor.name
+                        hostname = canonical_source_hostname(sensor.hostname or sensor.name)
                         asa_emitter._sensor_interfaces[hostname] = sensor.interfaces
+                        asa_emitter._sensor_security_levels[hostname] = (
+                            sensor.interface_security_levels
+                        )
                     if sensor.type == "firewall":
                         asa_emitter._td_burst_threshold = sensor.threat_detection_rate
                         asa_emitter._td_avg_threshold = max(1, sensor.threat_detection_rate // 2)
@@ -277,9 +418,6 @@ class EmitterSetupMixin:
                         for rule in sensor.nat_rules:
                             if rule.type == "static" and rule.mapped_ip and rule.real_ip:
                                 asa_emitter._vip_to_real_ip[rule.mapped_ip] = rule.real_ip
-
-        if "ecar" in self.emitters:
-            self.emitters["ecar"]._output_end_time = self.end_time
 
     def _build_proxy_routes(self) -> None:
         """Build proxy routing table: which systems route through which proxies.
@@ -360,13 +498,18 @@ class EmitterSetupMixin:
         but establish lease state. Lease times and MACs are stored in
         _dhcp_lease_state for periodic renewal in _generate_system_traffic().
         """
-        if "zeek_dhcp" not in self.emitters:
-            return
         rng = random.Random(_stable_seed("dhcp_leases"))
         from evidenceforge.utils.ids import generate_zeek_uid
 
         # Track lease state for periodic renewals
         self._dhcp_lease_state: dict[str, dict] = {}
+        world_model = getattr(self, "world_model", None)
+        if world_model is None:
+            ad_domain = getattr(self, "_ad_domain", self._resolve_ad_domain())
+            world_model = WorldModel(self.scenario, ad_domain)
+            self.world_model = world_model
+        if not world_model.dhcp_servers:
+            return
         # Stagger across first 5 minutes using per-host deterministic offsets
         base_time = getattr(self, "warmup_start_time", self.start_time)
 
@@ -403,10 +546,26 @@ class EmitterSetupMixin:
             ts = base_time + timedelta(seconds=offset)
             uid = generate_zeek_uid("C")
             lease_time = float(rng.choice([3600, 7200, 14400, 86400]))
-            infra_ips = getattr(self, "_infra_ips", {})
-            dhcp_servers = infra_ips.get("dc") or infra_ips.get("dns") or ["10.0.0.1"]
-            dhcp_server = dhcp_servers[0] if isinstance(dhcp_servers, list) else dhcp_servers
-            renewal_interval = dhcp_renewal_interval_seconds(lease_time, rng)
+            dhcp_servers = world_model.systems_with_capability(
+                HostCapability.DHCP_SERVER,
+                distinct_from=system,
+            )
+            if not dhcp_servers:
+                continue
+            dhcp_server = dhcp_servers[
+                _stable_seed(f"dhcp_server:{system.hostname}") % len(dhcp_servers)
+            ].ip
+            renewal_rng = random.Random(_stable_seed(f"dhcp_renewal_timer:{system.hostname}:{mac}"))
+            timer_granularity = renewal_rng.choice([0.25, 1.0, 1.0, 5.0])
+            renewal_sequence = 0
+            renewal_interval = dhcp_renewal_interval_seconds(
+                lease_time,
+                timing_runtime=self.timing_runtime,
+                stable_id=f"{system.hostname}|{mac}",
+                host=system.hostname,
+                renewal_sequence=renewal_sequence,
+                timer_granularity=timer_granularity,
+            )
             self.state_manager.set_current_time(ts)
             self.activity_generator.generate_dhcp_lease(
                 system=system,
@@ -423,6 +582,10 @@ class EmitterSetupMixin:
                 "lease_time": lease_time,
                 "last_renewal": ts.timestamp(),
                 "next_renewal": ts.timestamp() + renewal_interval,
+                "renewal_interval": renewal_interval,
+                "renewal_rng": renewal_rng,
+                "renewal_sequence": renewal_sequence + 1,
+                "timer_granularity": timer_granularity,
                 "server_addr": dhcp_server,
                 "system": system,
             }
@@ -461,67 +624,14 @@ class EmitterSetupMixin:
         return "corp.local"
 
     def _detect_infrastructure_ips(self) -> dict[str, str | list]:
-        """Detect infrastructure IPs from scenario systems.
+        """Return the authoritative world-model infrastructure projection."""
 
-        Scans system hostnames/types/services for role hints and
-        maps them to IPs. Falls back to defaults for missing roles.
-        """
-        if hasattr(self, "world_model"):
-            return self.world_model.to_infrastructure_ips()
-
-        infra: dict[str, str | list] = {
-            "dns": [],
-            "ntp": [],  # Populated from DCs (AD) or external (non-domain)
-            "dc": [],
-            "dc_hostnames": [],
-            "db_servers": [],
-            "exchange": None,
-        }
-
-        for system in self.scenario.environment.systems:
-            hn = system.hostname.lower()
-            stype = system.type.lower() if system.type else ""
-            if "dc" in hn or stype == "domain_controller":
-                infra["dc"].append(system.ip)
-                infra["dc_hostnames"].append(system.hostname)
-                if system.ip not in infra["dns"]:
-                    infra["dns"].append(system.ip)
-            elif "dns" in hn:
-                if system.ip not in infra["dns"]:
-                    infra["dns"].append(system.ip)
-            elif "ntp" in hn:
-                infra["ntp"] = [system.ip]
-            elif "exch" in hn or "mail" in hn or stype == "mail_server":
-                infra["exchange"] = system.ip
-
-            for svc in system.services:
-                svc_lower = svc.lower()
-                for svc_key, (port, zeek_svc) in DB_SERVICE_MAP.items():
-                    if svc_key in svc_lower:
-                        infra["db_servers"].append(
-                            {
-                                "ip": system.ip,
-                                "port": port,
-                                "service": zeek_svc,
-                            }
-                        )
-                        break
-
-        if not infra["dns"]:
-            infra["dns"] = ["10.0.0.1"]
-        if not infra["dc"]:
-            infra["dc"] = [infra["dns"][0]]
-            infra["dc_hostnames"] = ["DC-01"]
-
-        # AD environments: workstations sync NTP from the DC (W32Time service).
-        # Only use external NIST servers for non-domain environments.
-        if not infra["ntp"]:
-            if infra["dc"]:
-                infra["ntp"] = list(infra["dc"])
-            else:
-                infra["ntp"] = public_ntp_ips() or ["129.6.15.28", "132.163.97.1"]
-
-        return infra
+        world_model = getattr(self, "world_model", None)
+        if world_model is None:
+            ad_domain = getattr(self, "_ad_domain", self._resolve_ad_domain())
+            world_model = WorldModel(self.scenario, ad_domain)
+            self.world_model = world_model
+        return world_model.to_infrastructure_ips()
 
     def _build_service_defaults(self) -> dict[str, list[str]]:
         """Build per-system service lists, auto-populating defaults if empty."""
@@ -554,6 +664,919 @@ class EmitterSetupMixin:
                 defaults[system.hostname] = svcs
         return defaults
 
+    def _boot_lifecycle_authority(self) -> GeneratorLifecycleAuthority | None:
+        """Resolve and authenticate the optional engine boot lifecycle owner."""
+
+        authority = getattr(self, "lifecycle_authority", None)
+        if authority is None:
+            return None
+        if type(authority) is not GeneratorLifecycleAuthority:
+            raise TypeError("Boot lifecycle authority must be an exact typed engine owner")
+        if authority.state_manager is not self.state_manager:
+            raise StateError("Boot lifecycle authority must share the engine StateManager")
+        if type(authority.registry) is not LifecycleRegistry:
+            raise TypeError("Boot lifecycle authority must own an exact LifecycleRegistry")
+        if (
+            authority.lifecycle_shadow.state_manager is not self.state_manager
+            or authority.lifecycle_shadow.registry is not authority.registry
+        ):
+            raise StateError("Boot lifecycle authority has inconsistent State/registry ownership")
+        engine_registry = getattr(self, "lifecycle_registry", None)
+        if engine_registry is not None and engine_registry is not authority.registry:
+            raise StateError("Boot lifecycle authority must share the engine lifecycle registry")
+        return authority
+
+    def _build_windows_boot_host_spec(
+        self,
+        system: System,
+        boot_time: datetime | None,
+    ) -> _BootHostSpec:
+        """Resolve the exact Windows boot forest without allocating State identity."""
+
+        from evidenceforge.generation.activity.system_processes import (
+            get_scheduled_task_entries,
+        )
+
+        hostname = system.hostname
+        boot_rng = random.Random(_stable_seed(f"windows_boot_sequence:{hostname}"))
+        boot_elapsed = 0.0
+        processes: list[_BootProcessSpec] = []
+        aliases: list[tuple[str, str]] = []
+
+        def process_time() -> datetime | None:
+            nonlocal boot_elapsed
+            if boot_time is None:
+                return None
+            boot_elapsed += boot_rng.uniform(0.08, 2.75)
+            return boot_time + timedelta(seconds=boot_elapsed)
+
+        def add(
+            alias: str,
+            parent_alias: str,
+            image: str,
+            command_line: str,
+            username: str,
+            logon_id: str = "",
+        ) -> None:
+            processes.append(
+                _BootProcessSpec(
+                    alias=alias,
+                    parent_alias=parent_alias,
+                    fixed_pid=None,
+                    image=normalize_defender_platform_path(image, hostname),
+                    command_line=command_line,
+                    username=username,
+                    integrity_level="System",
+                    os_category="windows",
+                    logon_id=logon_id,
+                    start_time=process_time(),
+                )
+            )
+
+        processes.append(
+            _BootProcessSpec(
+                alias="system",
+                parent_alias=None,
+                fixed_pid=4,
+                image="System",
+                command_line="",
+                username="SYSTEM",
+                integrity_level="System",
+                os_category="windows",
+                logon_id="",
+                start_time=boot_time,
+            )
+        )
+        add("smss", "system", r"C:\Windows\System32\smss.exe", "smss.exe", "SYSTEM")
+        add("csrss_s0", "smss", r"C:\Windows\System32\csrss.exe", "csrss.exe", "SYSTEM")
+        add(
+            "wininit",
+            "smss",
+            r"C:\Windows\System32\wininit.exe",
+            "wininit.exe",
+            "SYSTEM",
+        )
+        add(
+            "services",
+            "wininit",
+            r"C:\Windows\System32\services.exe",
+            "services.exe",
+            "SYSTEM",
+        )
+        add("lsass", "wininit", r"C:\Windows\System32\lsass.exe", "lsass.exe", "SYSTEM")
+
+        for alias, command_line, username in (
+            ("svchost_dcom", "svchost.exe -k DcomLaunch", "SYSTEM"),
+            ("svchost_local_system", "svchost.exe -k LocalSystem", "SYSTEM"),
+            ("svchost_netsvcs", "svchost.exe -k netsvcs", "NETWORK SERVICE"),
+            ("svchost_local_svc", "svchost.exe -k LocalService", "LOCAL SERVICE"),
+            ("svchost_net_svc", "svchost.exe -k NetworkService", "NETWORK SERVICE"),
+            (
+                "svchost_local_nr",
+                "svchost.exe -k LocalServiceNetworkRestricted",
+                "LOCAL SERVICE",
+            ),
+            (
+                "svchost_local_nn",
+                "svchost.exe -k LocalServiceNoNetwork",
+                "LOCAL SERVICE",
+            ),
+            ("svchost_wusvcs", "svchost.exe -k wusvcs", "SYSTEM"),
+        ):
+            add(
+                alias,
+                "services",
+                r"C:\Windows\System32\svchost.exe",
+                command_line,
+                username,
+            )
+        aliases.append(("svchost_schedule", "svchost_netsvcs"))
+
+        environment = getattr(getattr(self, "scenario", None), "environment", None)
+        requires_taskeng = bool(getattr(environment, "service_accounts", [])) or any(
+            str(entry.get("parent") or "") == "taskeng"
+            for entry in get_scheduled_task_entries(system)
+        )
+        if requires_taskeng:
+            task_identity = uuid.UUID(
+                int=(
+                    (_stable_seed(f"task_scheduler_guid_hi:{hostname}") << 64)
+                    | _stable_seed(f"task_scheduler_guid_lo:{hostname}")
+                )
+            )
+            add(
+                "taskeng",
+                "svchost_schedule",
+                r"C:\Windows\System32\taskeng.exe",
+                f"taskeng.exe {{{str(task_identity).upper()}}}",
+                "SYSTEM",
+            )
+
+        if (system.type or "").lower() == "domain_controller":
+            add("dns", "services", r"C:\Windows\System32\dns.exe", "dns.exe", "SYSTEM")
+
+        add(
+            "msmpeng",
+            "services",
+            r"C:\ProgramData\Microsoft\Windows Defender\Platform\MsMpEng.exe",
+            "MsMpEng.exe",
+            "SYSTEM",
+        )
+        add(
+            "search_indexer",
+            "services",
+            r"C:\Windows\System32\SearchIndexer.exe",
+            "SearchIndexer.exe",
+            "SYSTEM",
+            "0x3e7",
+        )
+        add(
+            "wmiprvse",
+            "svchost_dcom",
+            r"C:\Windows\System32\wbem\WmiPrvSE.exe",
+            "WmiPrvSE.exe -Embedding",
+            "NETWORK SERVICE",
+        )
+        add(
+            "dllhost",
+            "svchost_dcom",
+            r"C:\Windows\System32\dllhost.exe",
+            "dllhost.exe /Processid:{02D4B3F1-FD88-11D1-960D-00805FC79235}",
+            "SYSTEM",
+        )
+        add(
+            "search_protocol_host",
+            "search_indexer",
+            r"C:\Windows\System32\SearchProtocolHost.exe",
+            "SearchProtocolHost.exe Global\\UsGthrFltPipeMssGthrPipe",
+            "SYSTEM",
+        )
+        add(
+            "mpcmdrun",
+            "msmpeng",
+            r"C:\ProgramData\Microsoft\Windows Defender\Platform\MpCmdRun.exe",
+            "MpCmdRun.exe -Scan -ScanType 1",
+            "SYSTEM",
+        )
+        add(
+            "msiexec",
+            "services",
+            r"C:\Windows\System32\msiexec.exe",
+            "msiexec.exe /V",
+            "SYSTEM",
+        )
+        add(
+            "taskhostw",
+            "svchost_schedule",
+            r"C:\Windows\System32\taskhostw.exe",
+            "taskhostw.exe",
+            "SYSTEM",
+        )
+        add("csrss_s1", "smss", r"C:\Windows\System32\csrss.exe", "csrss.exe", "SYSTEM")
+        add(
+            "winlogon",
+            "smss",
+            r"C:\Windows\System32\winlogon.exe",
+            "winlogon.exe",
+            "SYSTEM",
+        )
+        add(
+            "userinit",
+            "winlogon",
+            r"C:\Windows\System32\userinit.exe",
+            "userinit.exe",
+            "SYSTEM",
+        )
+        desktop_user = system.assigned_user
+        if desktop_user:
+            add(
+                "explorer",
+                "userinit",
+                r"C:\Windows\explorer.exe",
+                "explorer.exe",
+                desktop_user,
+            )
+            add(
+                "runtime_broker",
+                "svchost_local_system",
+                r"C:\Windows\System32\RuntimeBroker.exe",
+                "RuntimeBroker.exe",
+                desktop_user,
+            )
+        else:
+            aliases.append(("explorer", "winlogon"))
+        add("dwm", "csrss_s0", r"C:\Windows\System32\dwm.exe", "dwm.exe", "SYSTEM")
+
+        roles = {role.lower() for role in (system.roles or [])}
+        service_defaults = getattr(self, "_system_service_defaults", {})
+        services = tuple(service_defaults.get(system.hostname, system.services or ()))
+        db_services = database_services_for_host(
+            services,
+            "windows",
+            has_database_role=bool(roles & {"database", "db_server"}),
+        )
+        if "mssql" in db_services:
+            add(
+                "sqlservr",
+                "services",
+                r"C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQL\Binn\sqlservr.exe",
+                "sqlservr.exe -sMSSQLSERVER",
+                r"NT SERVICE\MSSQLSERVER",
+            )
+        return _BootHostSpec(
+            hostname=hostname,
+            os_category="windows",
+            boot_time=boot_time,
+            machine_id="",
+            processes=tuple(processes),
+            aliases=tuple(aliases),
+        )
+
+    def _build_linux_boot_host_spec(
+        self,
+        system: System,
+        boot_time: datetime | None,
+    ) -> _BootHostSpec:
+        """Resolve the exact Linux boot forest without allocating State identity."""
+
+        hostname = system.hostname
+        is_rhel = any(
+            marker in system.os.lower() for marker in ("centos", "rhel", "red hat", "rocky", "alma")
+        )
+        boot_rng = random.Random(_stable_seed(f"linux_boot_sequence:{hostname}"))
+        boot_elapsed = 0.0
+        processes: list[_BootProcessSpec] = []
+        aliases: list[tuple[str, str]] = []
+
+        def process_time() -> datetime | None:
+            nonlocal boot_elapsed
+            if boot_time is None:
+                return None
+            boot_elapsed += boot_rng.uniform(0.05, 1.9)
+            return boot_time + timedelta(seconds=boot_elapsed)
+
+        def add(
+            alias: str,
+            parent_alias: str,
+            image: str,
+            command_line: str,
+            username: str,
+        ) -> None:
+            processes.append(
+                _BootProcessSpec(
+                    alias=alias,
+                    parent_alias=parent_alias,
+                    fixed_pid=None,
+                    image=image,
+                    command_line=command_line,
+                    username=username,
+                    integrity_level="System",
+                    os_category="linux",
+                    logon_id="",
+                    start_time=process_time(),
+                )
+            )
+
+        processes.append(
+            _BootProcessSpec(
+                alias="systemd",
+                parent_alias=None,
+                fixed_pid=1,
+                image="/usr/lib/systemd/systemd",
+                command_line="/usr/lib/systemd/systemd --system --deserialize 26",
+                username="root",
+                integrity_level="System",
+                os_category="linux",
+                logon_id="",
+                start_time=boot_time,
+            )
+        )
+        journal_path = "/usr/lib/systemd/systemd-journald"
+        add("journald", "systemd", journal_path, journal_path, "root")
+        udev_path = "/usr/lib/systemd/systemd-udevd" if is_rhel else "/lib/systemd/systemd-udevd"
+        add("udevd", "systemd", udev_path, udev_path, "root")
+        add("rsyslogd", "systemd", "/usr/sbin/rsyslogd", "rsyslogd -n", "syslog")
+        add(
+            "networkmanager",
+            "systemd",
+            "/usr/sbin/NetworkManager",
+            "/usr/sbin/NetworkManager --no-daemon",
+            "root",
+        )
+        add(
+            "dbus",
+            "systemd",
+            "/usr/bin/dbus-daemon",
+            "/usr/bin/dbus-daemon --system",
+            "messagebus",
+        )
+        logind_path = "/usr/lib/systemd/systemd-logind"
+        add("logind", "systemd", logind_path, logind_path, "root")
+        add("sshd", "systemd", "/usr/sbin/sshd", "/usr/sbin/sshd -D", "root")
+
+        roles = {role.lower() for role in (system.roles or [])}
+        service_defaults = getattr(self, "_system_service_defaults", {})
+        services = tuple(service_defaults.get(system.hostname, system.services or ()))
+        service_tokens = {service.lower() for service in services}
+        world_model = getattr(self, "world_model", None)
+        host_world = getattr(world_model, "hosts", {}).get(system.hostname)
+        if host_world is not None and host_world.supports(HostCapability.SMB_SERVER):
+            server_profile = select_server_profile("linux", services)
+            listener = render_smb_process(server_profile.listener)
+            add(
+                "smbd",
+                "systemd",
+                listener.image,
+                listener.command_line,
+                listener.username,
+            )
+            aliases.append(("smbd_master", "smbd"))
+        proxy_markers = {"forward_proxy", "squid", "proxy"}
+        if roles & proxy_markers or service_tokens & proxy_markers:
+            add(
+                "squid",
+                "systemd",
+                "/usr/sbin/squid",
+                "/usr/sbin/squid --foreground -YC",
+                "squid" if is_rhel else "proxy",
+            )
+        web_markers = {"web_server", "apache", "apache2", "httpd", "nginx"}
+        if roles & web_markers or service_tokens & web_markers or "web" in hostname.lower():
+            if is_rhel:
+                add("httpd", "systemd", "/usr/sbin/httpd", "/usr/sbin/httpd -DFOREGROUND", "apache")
+            else:
+                add(
+                    "apache2",
+                    "systemd",
+                    "/usr/sbin/apache2",
+                    "/usr/sbin/apache2 -DFOREGROUND",
+                    "www-data",
+                )
+        db_services = database_services_for_host(
+            services,
+            "linux",
+            has_database_role=bool(roles & {"database", "db_server"}),
+        )
+        if "mysql" in db_services:
+            add(
+                "mysqld",
+                "systemd",
+                "/usr/sbin/mysqld",
+                "/usr/sbin/mysqld --daemonize --pid-file=/run/mysqld/mysqld.pid",
+                "mysql",
+            )
+        if "postgresql" in db_services:
+            add(
+                "postgres",
+                "systemd",
+                "/usr/bin/postgres",
+                "/usr/bin/postgres -D /var/lib/pgsql/data",
+                "postgres",
+            )
+        add(
+            "cron",
+            "systemd",
+            "/usr/sbin/crond" if is_rhel else "/usr/sbin/cron",
+            "/usr/sbin/crond -n" if is_rhel else "/usr/sbin/cron -f",
+            "root",
+        )
+        add("agetty1", "systemd", "/sbin/agetty", "/sbin/agetty --noclear tty1 linux", "root")
+        add("agetty2", "systemd", "/sbin/agetty", "/sbin/agetty --noclear tty2 linux", "root")
+        add("snapd", "systemd", "/usr/lib/snapd/snapd", "/usr/lib/snapd/snapd", "root")
+        if is_rhel:
+            add("chronyd", "systemd", "/usr/sbin/chronyd", "/usr/sbin/chronyd -F 2", "chrony")
+        else:
+            add(
+                "timesyncd",
+                "systemd",
+                "/usr/lib/systemd/systemd-timesyncd",
+                "/usr/lib/systemd/systemd-timesyncd",
+                "systemd-timesync",
+            )
+            add(
+                "systemd_resolved",
+                "systemd",
+                "/usr/lib/systemd/systemd-resolved",
+                "/usr/lib/systemd/systemd-resolved",
+                "systemd-resolve",
+            )
+        add("bash", "sshd", "/bin/bash", "-bash", "root")
+        machine_id = hashlib.md5(
+            f"machine_id_{hostname}".encode(),
+            usedforsecurity=False,
+        ).hexdigest()
+        return _BootHostSpec(
+            hostname=hostname,
+            os_category="linux",
+            boot_time=boot_time,
+            machine_id=machine_id,
+            processes=tuple(processes),
+            aliases=tuple(aliases),
+        )
+
+    def _build_macos_boot_host_spec(
+        self,
+        system: System,
+        boot_time: datetime | None,
+    ) -> _BootHostSpec:
+        """Resolve the exact macOS boot forest without allocating State identity."""
+
+        hostname = system.hostname
+        boot_rng = random.Random(_stable_seed(f"macos_boot_sequence:{hostname}"))
+        boot_elapsed = 0.0
+        processes: list[_BootProcessSpec] = []
+
+        def process_time() -> datetime | None:
+            nonlocal boot_elapsed
+            if boot_time is None:
+                return None
+            boot_elapsed += boot_rng.uniform(0.05, 1.9)
+            return boot_time + timedelta(seconds=boot_elapsed)
+
+        def add(
+            alias: str,
+            parent_alias: str,
+            image: str,
+            command_line: str,
+            username: str,
+        ) -> None:
+            processes.append(
+                _BootProcessSpec(
+                    alias=alias,
+                    parent_alias=parent_alias,
+                    fixed_pid=None,
+                    image=image,
+                    command_line=command_line,
+                    username=username,
+                    integrity_level="System",
+                    os_category="macos",
+                    logon_id="",
+                    start_time=process_time(),
+                )
+            )
+
+        # launchd is macOS's PID 1: the only process the kernel spawns
+        # directly and the ancestor of every system daemon and Aqua session job.
+        processes.append(
+            _BootProcessSpec(
+                alias="launchd",
+                parent_alias=None,
+                fixed_pid=1,
+                image="/sbin/launchd",
+                command_line="/sbin/launchd",
+                username="root",
+                integrity_level="System",
+                os_category="macos",
+                logon_id="",
+                start_time=boot_time,
+            )
+        )
+        add(
+            "windowserver",
+            "launchd",
+            "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon",
+            "_windowserver",
+        )
+        # macOS's session root (the analog of Windows' winlogon); WorldModel
+        # treats interactive sessions as loginwindow-rooted.
+        loginwindow = "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow"
+        add("loginwindow", "launchd", loginwindow, loginwindow, "root")
+        add("cfprefsd", "launchd", "/usr/sbin/cfprefsd", "/usr/sbin/cfprefsd daemon", "root")
+        add(
+            "user_event_agent",
+            "launchd",
+            "/usr/libexec/UserEventAgent",
+            "/usr/libexec/UserEventAgent (System)",
+            "root",
+        )
+        # Unified logging (logd) plus its BSD syslog compatibility shim.
+        add("logd", "launchd", "/usr/libexec/logd", "/usr/libexec/logd", "root")
+        add("syslogd", "launchd", "/usr/sbin/syslogd", "/usr/sbin/syslogd", "root")
+        add("trustd", "launchd", "/usr/libexec/trustd", "/usr/libexec/trustd --agent", "_trustd")
+        add(
+            "opendirectoryd",
+            "launchd",
+            "/usr/libexec/opendirectoryd",
+            "/usr/libexec/opendirectoryd",
+            "root",
+        )
+        add("notifyd", "launchd", "/usr/libexec/notifyd", "/usr/libexec/notifyd", "root")
+        add(
+            "mdnsresponder",
+            "launchd",
+            "/usr/sbin/mDNSResponder",
+            "/usr/sbin/mDNSResponder",
+            "_mdnsresponder",
+        )
+        # Background Task Management reports ES btm_launch_item_add events.
+        btm_path = (
+            "/System/Library/PrivateFrameworks/BackgroundTaskManagement.framework/"
+            "Versions/A/Resources/backgroundtaskmanagementd"
+        )
+        add("backgroundtaskmanagementd", "launchd", btm_path, btm_path, "root")
+        # Spotlight: mds is the metadata server; mdworker_shared its indexer.
+        metadata_support = (
+            "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/"
+            "Metadata.framework/Versions/A/Support/"
+        )
+        add("mds", "launchd", f"{metadata_support}mds", f"{metadata_support}mds", "root")
+        add(
+            "mdworker",
+            "mds",
+            f"{metadata_support}mdworker_shared",
+            f"{metadata_support}mdworker_shared -s mdworker",
+            "_spotlight",
+        )
+        # Remote Login (sshd), matching WorldModel's macOS SSH support.
+        add("sshd", "launchd", "/usr/sbin/sshd", "/usr/sbin/sshd -i", "root")
+        add("zsh", "sshd", "/bin/zsh", "-zsh", "root")
+        return _BootHostSpec(
+            hostname=hostname,
+            os_category="macos",
+            boot_time=boot_time,
+            machine_id="",
+            processes=tuple(processes),
+            aliases=(),
+        )
+
+    def _build_boot_fleet_spec(self, original_time: datetime | None) -> BootFleetSpec:
+        """Resolve every boot input once into the exact symbolic fleet forest."""
+
+        from evidenceforge.generation.activity import _get_os_category
+
+        start_time = getattr(self, "start_time", None)
+        uptimes = getattr(self, "_kernel_boot_uptimes", {})
+        hosts: list[_BootHostSpec] = []
+        for system in self.scenario.environment.systems:
+            boot_uptime = uptimes.get(system.hostname)
+            boot_time = (
+                start_time - timedelta(seconds=boot_uptime)
+                if start_time is not None and boot_uptime is not None
+                else original_time
+            )
+            os_category = _get_os_category(system.os)
+            if os_category == "windows":
+                hosts.append(self._build_windows_boot_host_spec(system, boot_time))
+            elif os_category == "macos":
+                hosts.append(self._build_macos_boot_host_spec(system, boot_time))
+            else:
+                hosts.append(self._build_linux_boot_host_spec(system, boot_time))
+        return BootFleetSpec(
+            state_time=original_time,
+            hosts=tuple(hosts),
+        )
+
+    def _boot_materialization_request(
+        self,
+        fleet_spec: BootFleetSpec,
+        *,
+        transaction_scope: str = "engine-owned-boot-fleet-v2",
+    ) -> tuple[str, str, tuple[object, ...]]:
+        """Return one retry-stable transaction bound to the exact planned forest."""
+
+        if type(fleet_spec) is not BootFleetSpec:
+            raise StateError("Boot materialization requires an exact BootFleetSpec")
+        request = fleet_spec.canonical_payload()
+        request_digest = hashlib.sha256(_canonical_boot_payload_bytes(request)).hexdigest()
+        return (
+            stable_uuid("boot-process-fleet-transaction", transaction_scope),
+            request_digest,
+            request,
+        )
+
+    @staticmethod
+    def _boot_materialization_requires_paging(error: StateError) -> bool:
+        """Return whether one whole-fleet transaction exceeded a retained payload bound."""
+
+        message = str(error)
+        return any(
+            marker in message
+            for marker in (
+                "Materialization-batch payload has too many retained members",
+                "Materialization-batch terminal exceeds its retained-byte limit",
+                "Materialization-batch request exceeds its retained-byte limit",
+            )
+        )
+
+    def _seed_paged_boot_fleet(
+        self,
+        *,
+        lifecycle_authority: GeneratorLifecycleAuthority,
+        fleet_spec: BootFleetSpec,
+        existing_system_pids: tuple[tuple[str, tuple[tuple[str, int], ...]], ...],
+    ) -> None:
+        """Materialize a wide fleet in preflighted, bounded host pages."""
+
+        pages = tuple(
+            BootFleetSpec(
+                state_time=fleet_spec.state_time,
+                hosts=fleet_spec.hosts[index : index + _BOOT_MATERIALIZATION_PAGE_HOSTS],
+            )
+            for index in range(0, len(fleet_spec.hosts), _BOOT_MATERIALIZATION_PAGE_HOSTS)
+        )
+        page_requests: list[BootFleetSpec] = []
+
+        # Validate every page before any State or registry mutation. Reservations
+        # are released immediately so arbitrarily wide fleets do not consume the
+        # aggregate retained-transaction budget during preflight.
+        for page_index, page in enumerate(pages):
+            scope = f"engine-owned-boot-fleet-v2:page:{page_index}:{len(pages)}"
+            transaction_id, request_digest, request_payload = self._boot_materialization_request(
+                page,
+                transaction_scope=scope,
+            )
+            anticipated_terminal_payload, _retained_bytes = (
+                self._boot_materialization_terminal_reservation(
+                    page,
+                    transaction_id,
+                    request_digest,
+                    (),
+                )
+            )
+            try:
+                preflight = lifecycle_authority.reserve_materialization_batch_transaction(
+                    transaction_id=transaction_id,
+                    request_digest=request_digest,
+                    request_payload=request_payload,
+                    anticipated_terminal_payload=anticipated_terminal_payload,
+                )
+            except StateError as error:
+                first = page.hosts[0].hostname
+                last = page.hosts[-1].hostname
+                raise StateError(
+                    "Boot-process page cannot be retained for systems "
+                    f"{first} through {last} ({len(page.hosts)} hosts): {error}"
+                ) from error
+            lifecycle_authority.cancel_materialization_batch_transaction(preflight)
+            page_requests.append(page)
+
+        published_machine_ids = dict(getattr(self, "_machine_ids", {}))
+        published_system_pids = {
+            hostname: dict(members) for hostname, members in existing_system_pids
+        }
+        for page in page_requests:
+            builder = self.state_manager.begin_materialization_batch()
+            page_pids: dict[str, dict[str, int]] = {}
+            page_machine_ids: dict[str, str] = {}
+            for host_spec in page.hosts:
+                page_pids[host_spec.hostname] = self._plan_boot_host_spec(builder, host_spec)
+                if host_spec.machine_id:
+                    page_machine_ids[host_spec.hostname] = host_spec.machine_id
+            # The page is already fully preflighted. A direct page commit avoids
+            # retaining one acknowledged terminal per page during initialization,
+            # so fleet width is not capped by transaction-retention capacity.
+            lifecycle_authority.materialize_batch(builder.seal())
+            published_machine_ids.update(page_machine_ids)
+            published_system_pids.update(page_pids)
+
+        self._machine_ids = published_machine_ids
+        self._system_pids = published_system_pids
+
+    @staticmethod
+    def _boot_materialization_terminal_reservation(
+        fleet_spec: BootFleetSpec,
+        transaction_id: str,
+        request_digest: str,
+        existing_system_pids: tuple[tuple[str, tuple[tuple[str, int], ...]], ...],
+    ) -> tuple[tuple[object, ...], int]:
+        """Return the full preplanning terminal bound and its retained byte charge."""
+
+        if type(fleet_spec) is not BootFleetSpec:
+            raise StateError("Boot materialization requires an exact BootFleetSpec")
+        uuid_upper = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+        integer_upper = 10**20 - 1
+        generation_upper = 10**128 - 1
+        fallback_time = fleet_spec.state_time or datetime.max.replace(tzinfo=UTC)
+        process_projections: list[tuple[object, ...]] = []
+        machine_ids: list[tuple[str, str]] = []
+        system_pids: dict[str, dict[str, int]] = {
+            hostname: dict(members) for hostname, members in existing_system_pids
+        }
+        boot_times: list[tuple[str, datetime]] = []
+        final_state_time = fallback_time
+        for host in fleet_spec.hosts:
+            if host.boot_time is not None:
+                boot_times.append((host.hostname, host.boot_time))
+            if host.machine_id:
+                machine_ids.append((host.hostname, host.machine_id))
+            host_pids = {member.alias: integer_upper for member in host.processes}
+            host_pids.update({alias: integer_upper for alias, _target in host.aliases})
+            system_pids[host.hostname] = host_pids
+            for member in host.processes:
+                started_at = member.start_time or fallback_time
+                final_state_time = max(final_state_time, started_at)
+                thread_projection: tuple[object, ...] = (
+                    "thread-identity-v1",
+                    host.hostname,
+                    uuid_upper,
+                    integer_upper,
+                    integer_upper,
+                    uuid_upper,
+                    started_at,
+                    "primary",
+                )
+                process_projections.append(
+                    (
+                        "process-identity-v1",
+                        host.hostname,
+                        uuid_upper,
+                        integer_upper,
+                        integer_upper,
+                        member.image,
+                        member.command_line,
+                        member.username,
+                        member.logon_id,
+                        started_at,
+                        uuid_upper,
+                        uuid_upper,
+                        thread_projection,
+                    )
+                )
+        external_projection = EmitterSetupMixin._boot_materialization_external_result(
+            dict(machine_ids),
+            system_pids,
+        )
+        terminal_projection: tuple[object, ...] = (
+            "materialization-batch-terminal-size-v1",
+            transaction_id,
+            request_digest,
+            generation_upper,
+            uuid_upper,
+            None,
+            tuple(process_projections),
+            tuple(sorted(boot_times)),
+            external_projection,
+            final_state_time,
+        )
+        return (
+            terminal_projection,
+            512 + len(_canonical_boot_payload_bytes(terminal_projection)),
+        )
+
+    @staticmethod
+    def _plan_boot_host_spec(
+        batch_builder: MaterializationBatchBuilder,
+        host_spec: _BootHostSpec,
+    ) -> dict[str, int]:
+        """Allocate one exact symbolic host forest into the shared fleet builder."""
+
+        if host_spec.boot_time is not None:
+            batch_builder.plan_boot_time(host_spec.hostname, host_spec.boot_time)
+        pids: dict[str, int] = {}
+        plans_by_alias: dict[str, ProcessMaterializationPlan] = {}
+        for member in host_spec.processes:
+            if member.parent_alias is None:
+                parent_pid = 0
+                parent_plan = None
+            else:
+                if member.parent_alias not in pids:
+                    raise StateError(
+                        f"Boot process {member.alias} precedes parent {member.parent_alias}"
+                    )
+                parent_pid = pids[member.parent_alias]
+                parent_plan = plans_by_alias.get(member.parent_alias)
+            plan = batch_builder.plan_process(
+                system=host_spec.hostname,
+                fixed_pid=member.fixed_pid,
+                parent_pid=parent_pid,
+                image=member.image,
+                command_line=member.command_line,
+                username=member.username,
+                integrity_level=member.integrity_level,
+                os_category=member.os_category,
+                logon_id=member.logon_id,
+                start_time=member.start_time,
+                parent_plan=parent_plan,
+            )
+            pids[member.alias] = plan.identity.pid
+            plans_by_alias[member.alias] = plan
+            for alias, target in host_spec.aliases:
+                if target == member.alias:
+                    pids[alias] = plan.identity.pid
+                    plans_by_alias[alias] = plan
+        unresolved = {alias for alias, _target in host_spec.aliases} - pids.keys()
+        if unresolved:
+            raise StateError(f"Boot PID aliases have unresolved targets: {sorted(unresolved)!r}")
+        return pids
+
+    @staticmethod
+    def _boot_materialization_external_result(
+        machine_ids: dict[str, str],
+        system_pids: dict[str, dict[str, int]],
+    ) -> tuple[object, ...]:
+        """Freeze exact engine maps for authenticated retry reconciliation."""
+
+        return (
+            "boot-process-fleet-external-v1",
+            tuple(sorted(machine_ids.items())),
+            tuple(
+                (hostname, tuple(sorted(pids.items())))
+                for hostname, pids in sorted(system_pids.items())
+            ),
+        )
+
+    @staticmethod
+    def _decode_boot_materialization_external_result(
+        external_result: tuple[object, ...],
+    ) -> tuple[dict[str, str], dict[str, dict[str, int]]]:
+        """Validate and precompute exact maps from an authenticated terminal."""
+
+        if (
+            type(external_result) is not tuple
+            or len(external_result) != 3
+            or external_result[0] != "boot-process-fleet-external-v1"
+            or type(external_result[1]) is not tuple
+            or type(external_result[2]) is not tuple
+        ):
+            raise StateError("Boot materialization terminal has malformed external maps")
+        machine_ids: dict[str, str] = {}
+        for member in external_result[1]:
+            if (
+                type(member) is not tuple
+                or len(member) != 2
+                or type(member[0]) is not str
+                or type(member[1]) is not str
+                or member[0] in machine_ids
+            ):
+                raise StateError("Boot materialization terminal has malformed machine IDs")
+            machine_ids[member[0]] = member[1]
+        system_pids: dict[str, dict[str, int]] = {}
+        for host_member in external_result[2]:
+            if (
+                type(host_member) is not tuple
+                or len(host_member) != 2
+                or type(host_member[0]) is not str
+                or type(host_member[1]) is not tuple
+                or host_member[0] in system_pids
+            ):
+                raise StateError("Boot materialization terminal has malformed PID maps")
+            pids: dict[str, int] = {}
+            for pid_member in host_member[1]:
+                if (
+                    type(pid_member) is not tuple
+                    or len(pid_member) != 2
+                    or type(pid_member[0]) is not str
+                    or type(pid_member[1]) is not int
+                    or pid_member[0] in pids
+                ):
+                    raise StateError("Boot materialization terminal has malformed PID aliases")
+                pids[pid_member[0]] = pid_member[1]
+            system_pids[host_member[0]] = pids
+        return machine_ids, system_pids
+
+    def _apply_boot_materialization_external_result(
+        self,
+        external_result: tuple[object, ...],
+    ) -> None:
+        """Idempotently install exact engine maps from an authenticated terminal."""
+
+        machine_ids, system_pids = self._decode_boot_materialization_external_result(
+            external_result
+        )
+        self._machine_ids = machine_ids
+        self._system_pids = system_pids
+
     def _seed_system_process_trees(self) -> None:
         """Pre-seed StateManager with long-running system processes.
 
@@ -561,48 +1584,262 @@ class EmitterSetupMixin:
         We register them silently (no log events) so they exist as valid
         parents for child processes spawned during the scenario.
         """
-        import hashlib as _hl
-
-        from evidenceforge.generation.activity import _get_os_category
-
-        self._machine_ids: dict[str, str] = {}
         original_time = self.state_manager.state.current_time
-
-        for system in self.scenario.environment.systems:
-            os_cat = _get_os_category(system.os)
-            pids: dict[str, int] = {}
-            boot_uptime = getattr(self, "_kernel_boot_uptimes", {}).get(system.hostname)
-            boot_time = (
-                self.start_time - timedelta(seconds=boot_uptime)
-                if self.start_time and boot_uptime is not None
+        lifecycle_authority = self._boot_lifecycle_authority()
+        fleet_spec: BootFleetSpec | None = None
+        boot_transaction: LifecycleMaterializationBatchTransaction | None = None
+        boot_terminal: LifecycleMaterializationBatchTerminalResult | None = None
+        boot_planning_attempt: LifecycleMaterializationBatchPlanningAttempt | None = None
+        boot_planning_capability: LifecycleMaterializationBatchPlanningCapability | None = None
+        boot_existing_system_pids: tuple[tuple[str, tuple[tuple[str, int], ...]], ...] = ()
+        lost_planning_return: BaseException | None = None
+        paged_boot_completed = False
+        if lifecycle_authority is not None:
+            pinned_transaction = getattr(self, "_boot_materialization_transaction", None)
+            request_state_time = (
+                getattr(self, "_boot_materialization_state_time", original_time)
+                if pinned_transaction is not None
                 else original_time
             )
-            if boot_time is not None:
-                self.state_manager.set_current_time(boot_time)
-
-            if os_cat == "windows":
-                self._seed_windows_process_tree(system, pids)
-            elif os_cat == "macos":
-                self._seed_macos_process_tree(system, pids)
+            fleet_spec = self._build_boot_fleet_spec(request_state_time)
+            materialized_hostnames = {host.hostname for host in fleet_spec.hosts}
+            current_existing_system_pids = tuple(
+                (hostname, tuple(sorted(pids.items())))
+                for hostname, pids in sorted(getattr(self, "_system_pids", {}).items())
+                if hostname not in materialized_hostnames
+            )
+            transaction_id, request_digest, request_payload = self._boot_materialization_request(
+                fleet_spec
+            )
+            pinned_terminal = getattr(self, "_boot_materialization_terminal_result", None)
+            if pinned_transaction is not None:
+                if (
+                    type(pinned_transaction) is not LifecycleMaterializationBatchTransaction
+                    or getattr(self, "_boot_materialization_transaction_identity", None)
+                    is not pinned_transaction
+                    or pinned_transaction.transaction_id != transaction_id
+                    or pinned_transaction.request_digest != request_digest
+                ):
+                    raise StateError("Pinned boot materialization transaction is not authentic")
+                boot_transaction = pinned_transaction
+                boot_existing_system_pids = getattr(
+                    self,
+                    "_boot_materialization_existing_system_pids",
+                    current_existing_system_pids,
+                )
             else:
-                self._seed_linux_process_tree(system, pids)
-                # Per-host persistent machine-ID (like /etc/machine-id). This is
-                # specifically consumed by systemd-journald housekeeping syslog
-                # rendering (see _machine_ids usage in baseline.py), which has
-                # no macOS equivalent — macOS uses unified logging (logd), not
-                # journald, so this block intentionally stays Linux-only.
-                self._machine_ids[system.hostname] = _hl.md5(
-                    f"machine_id_{system.hostname}".encode(), usedforsecurity=False
-                ).hexdigest()
+                anticipated_terminal_payload, _anticipated_terminal_bytes = (
+                    self._boot_materialization_terminal_reservation(
+                        fleet_spec,
+                        transaction_id,
+                        request_digest,
+                        current_existing_system_pids,
+                    )
+                )
+                try:
+                    boot_transaction = (
+                        lifecycle_authority.reserve_materialization_batch_transaction(
+                            transaction_id=transaction_id,
+                            request_digest=request_digest,
+                            request_payload=request_payload,
+                            anticipated_terminal_payload=anticipated_terminal_payload,
+                        )
+                    )
+                except StateError as error:
+                    if not self._boot_materialization_requires_paging(error):
+                        raise
+                    logger.info(
+                        "Boot fleet exceeds one retained transaction; materializing %s hosts "
+                        "in bounded pages",
+                        len(fleet_spec.hosts),
+                    )
+                    self._seed_paged_boot_fleet(
+                        lifecycle_authority=lifecycle_authority,
+                        fleet_spec=fleet_spec,
+                        existing_system_pids=current_existing_system_pids,
+                    )
+                    paged_boot_completed = True
+                    boot_existing_system_pids = current_existing_system_pids
+                else:
+                    self._boot_materialization_transaction_identity = boot_transaction
+                    self._boot_materialization_transaction = boot_transaction
+                    self._boot_materialization_state_time = original_time
+                    self._boot_materialization_existing_system_pids = current_existing_system_pids
+                    boot_existing_system_pids = current_existing_system_pids
+            if pinned_terminal is not None and not paged_boot_completed:
+                if (
+                    type(pinned_terminal) is not LifecycleMaterializationBatchTerminalResult
+                    or getattr(self, "_boot_materialization_terminal_identity", None)
+                    is not pinned_terminal
+                    or not lifecycle_authority.validates_archived_materialization_batch_terminal_result(
+                        boot_transaction,
+                        pinned_terminal,
+                    )
+                ):
+                    raise StateError("Pinned boot materialization terminal is not authentic")
+                lifecycle_authority.validate_archived_materialization_batch_terminal_state(
+                    boot_transaction,
+                    pinned_terminal,
+                )
+                boot_terminal = pinned_terminal
+                self._apply_boot_materialization_external_result(pinned_terminal.external_result)
+            elif not paged_boot_completed:
+                boot_terminal = lifecycle_authority.reconcile_materialization_batch_transaction(
+                    boot_transaction
+                )
+                if boot_terminal is None:
+                    boot_planning_attempt = lifecycle_authority.prepare_materialization_batch_transaction_planning_attempt(
+                        boot_transaction
+                    )
+                    try:
+                        planning_result = lifecycle_authority.claim_materialization_batch_transaction_for_planning(
+                            boot_transaction,
+                            attempt=boot_planning_attempt,
+                        )
+                    except BaseException as error:
+                        try:
+                            boot_planning_capability = lifecycle_authority.reconcile_materialization_batch_transaction_planning_claim(
+                                boot_transaction,
+                                attempt=boot_planning_attempt,
+                            )
+                        except StateError:
+                            raise error from None
+                        if boot_planning_capability is None:
+                            raise
+                        lost_planning_return = error
+                    else:
+                        if type(planning_result) is LifecycleMaterializationBatchPlanningCapability:
+                            boot_planning_capability = planning_result
+                        else:
+                            boot_terminal = planning_result
+                    if boot_terminal is not None:
+                        boot_terminal = (
+                            lifecycle_authority.reconcile_materialization_batch_transaction(
+                                boot_transaction
+                            )
+                        )
+                if boot_terminal is not None:
+                    self._apply_boot_materialization_external_result(boot_terminal.external_result)
+                    self._boot_materialization_terminal_identity = boot_terminal
+                    self._boot_materialization_terminal_result = boot_terminal
+        batch_builder: MaterializationBatchBuilder | None = None
+        staged_machine_ids: dict[str, str] = {}
+        staged_system_pids: dict[str, dict[str, int]] = {}
+        if lifecycle_authority is None:
+            self._machine_ids = {}
 
-            self._system_pids[system.hostname] = pids
+        completed = False
+        try:
+            if (
+                lifecycle_authority is not None
+                and boot_terminal is None
+                and not paged_boot_completed
+            ):
+                assert fleet_spec is not None
+                if original_time != fleet_spec.state_time:
+                    raise StateError(
+                        "Pending boot materialization cannot cross a State-time change"
+                    )
+                batch_builder = self.state_manager.begin_materialization_batch()
+            if boot_terminal is None and not paged_boot_completed:
+                if lifecycle_authority is None:
+                    from evidenceforge.generation.activity import _get_os_category
 
-            # Register boot time for entity lifecycle validation
-            if boot_time is not None:
-                self.state_manager.register_boot_time(system.hostname, boot_time)
+                    for system in self.scenario.environment.systems:
+                        pids: dict[str, int] = {}
+                        boot_uptime = getattr(self, "_kernel_boot_uptimes", {}).get(system.hostname)
+                        boot_time = (
+                            self.start_time - timedelta(seconds=boot_uptime)
+                            if self.start_time and boot_uptime is not None
+                            else original_time
+                        )
+                        if boot_time is not None:
+                            self.state_manager.set_current_time(boot_time)
+                        os_category = _get_os_category(system.os)
+                        if os_category == "windows":
+                            self._seed_windows_process_tree(
+                                system,
+                                pids,
+                                _batch_builder=None,
+                                _boot_base=boot_time,
+                            )
+                        elif os_category == "macos":
+                            self._seed_macos_process_tree(system, pids)
+                        else:
+                            self._seed_linux_process_tree(
+                                system,
+                                pids,
+                                _batch_builder=None,
+                                _boot_base=boot_time,
+                            )
+                            self._machine_ids[system.hostname] = hashlib.md5(
+                                f"machine_id_{system.hostname}".encode(),
+                                usedforsecurity=False,
+                            ).hexdigest()
+                        self._system_pids[system.hostname] = pids
+                        if boot_time is not None:
+                            self.state_manager.register_boot_time(
+                                system.hostname,
+                                boot_time,
+                            )
+                else:
+                    assert fleet_spec is not None
+                    for host_spec in fleet_spec.hosts:
+                        assert batch_builder is not None
+                        staged_system_pids[host_spec.hostname] = self._plan_boot_host_spec(
+                            batch_builder,
+                            host_spec,
+                        )
+                        if host_spec.machine_id:
+                            staged_machine_ids[host_spec.hostname] = host_spec.machine_id
 
-        if original_time is not None:
-            self.state_manager.set_current_time(original_time)
+                if lifecycle_authority is not None:
+                    assert batch_builder is not None
+                    assert boot_transaction is not None
+                    assert fleet_spec is not None
+                    published_system_pids = {
+                        hostname: dict(members) for hostname, members in boot_existing_system_pids
+                    }
+                    published_system_pids.update(
+                        {
+                            **staged_system_pids,
+                        }
+                    )
+                    external_result = self._boot_materialization_external_result(
+                        staged_machine_ids,
+                        published_system_pids,
+                    )
+                    batch_plan = batch_builder.seal()
+                    lifecycle_authority.materialize_batch(
+                        batch_plan,
+                        transaction=boot_transaction,
+                        external_result=external_result,
+                        planning_capability=boot_planning_capability,
+                    )
+                    boot_planning_capability = None
+                    boot_terminal = lifecycle_authority.reconcile_materialization_batch_transaction(
+                        boot_transaction
+                    )
+                    if boot_terminal is None:
+                        raise StateError("Boot materialization committed without a terminal result")
+                    if lost_planning_return is not None:
+                        raise lost_planning_return
+                    self._apply_boot_materialization_external_result(boot_terminal.external_result)
+                    self._boot_materialization_terminal_identity = boot_terminal
+                    self._boot_materialization_terminal_result = boot_terminal
+            completed = True
+        finally:
+            if (
+                boot_planning_capability is not None
+                and lifecycle_authority is not None
+                and boot_transaction is not None
+            ):
+                lifecycle_authority.release_materialization_batch_transaction_planning_claim(
+                    boot_transaction,
+                    boot_planning_capability,
+                )
+            if completed and original_time is not None and lifecycle_authority is None:
+                self.state_manager.set_current_time(original_time)
 
         total = sum(len(p) for p in self._system_pids.values())
         logger.info(f"Seeded {total} system processes across {len(self._system_pids)} systems")
@@ -613,84 +1850,155 @@ class EmitterSetupMixin:
         scanner_rng = random.Random(_stable_seed("external_scanners"))
         prolific = []
         for _ in range(scanner_rng.randint(8, 15)):
-            ip = self._generate_external_client_ip(scanner_rng)
+            ip = self._generate_external_client_ip(scanner_rng, role="scanner")
             weight = scanner_rng.randint(45, 2000)
             prolific.append((ip, weight))
         tail = [
-            (self._generate_external_client_ip(scanner_rng), 1)
+            (self._generate_external_client_ip(scanner_rng, role="scanner"), 1)
             for _ in range(scanner_rng.randint(30, 80))
         ]
         pool = prolific + tail
         self._external_scanner_ips = [ip for ip, _ in pool]
         self._external_scanner_weights = [w for _, w in pool]
 
-        # Register system IP→FQDN mappings so DNS queries use correct hostnames
-        # (e.g., DC-01.meridian-healthcare.com instead of host-10.corp.local)
-        from evidenceforge.generation.activity.network import REVERSE_DNS, reset_reverse_dns
-
-        reset_reverse_dns()
-        ad_domain = self._resolve_ad_domain()
-        for system in self.scenario.environment.systems:
-            fqdn = f"{system.hostname}.{ad_domain}"
-            REVERSE_DNS[system.ip] = fqdn
-
         # Share system PIDs with activity generator for dynamic ParentProcessName
         self.activity_generator._system_pids = self._system_pids
         self.activity_generator._all_system_ips = [s.ip for s in self.scenario.environment.systems]
         self.activity_generator._db_servers = self._infra_ips.get("db_servers", [])
-        self.activity_generator._dns_server_ips = self._infra_ips.get("dns", ["10.0.0.1"])
+        self.activity_generator._dns_server_ips = self._infra_ips.get("dns", [])
+        world_model = getattr(self, "world_model", None)
+        self.activity_generator._dns_server_ips_are_public_fallback = bool(
+            world_model is not None and not world_model.dns_servers
+        )
         self.activity_generator._exchange_ip = self._infra_ips.get("exchange")
         self.activity_generator._dc_hostnames = self._infra_ips.get("dc_hostnames", [])
         self.activity_generator._dc_ips = self._infra_ips.get("dc", [])
         self.activity_generator._dc_systems = [
             s for s in self.scenario.environment.systems if s.type == "domain_controller"
         ]
+        if (
+            lifecycle_authority is not None
+            and boot_transaction is not None
+            and boot_terminal is not None
+        ):
+            lifecycle_authority.acknowledge_materialization_batch_transaction_if_retained(
+                boot_transaction,
+                boot_terminal,
+            )
 
-    def _seed_windows_process_tree(self, system: System, pids: dict[str, int]) -> None:
-        """Seed Windows system process tree in StateManager."""
+    def _seed_windows_process_tree(
+        self,
+        system: System,
+        pids: dict[str, int],
+        *,
+        _batch_builder: MaterializationBatchBuilder | None = None,
+        _boot_base: datetime | None = None,
+    ) -> None:
+        """Seed a Windows boot tree; direct strict calls are fixture-only."""
         sm = self.state_manager
+        lifecycle_authority = self._boot_lifecycle_authority()
         hn = system.hostname
-        boot_base = sm.state.current_time
+        boot_base = _boot_base if _batch_builder is not None else sm.state.current_time
         boot_rng = random.Random(_stable_seed(f"windows_boot_sequence:{hn}"))
         boot_elapsed = 0.0
+        owns_batch = lifecycle_authority is not None and _batch_builder is None
+        batch_builder = sm.begin_materialization_batch() if owns_batch else _batch_builder
+        boot_pids = pids if lifecycle_authority is None else {}
+        process_plans_by_pid: dict[int, ProcessMaterializationPlan] = {}
+        if batch_builder is not None and boot_base is not None:
+            batch_builder.plan_boot_time(hn, boot_base)
 
-        def _advance_boot_clock() -> None:
+        def _advance_boot_clock() -> datetime | None:
             nonlocal boot_elapsed
             if boot_base is None:
-                return
+                return None
             boot_elapsed += boot_rng.uniform(0.08, 2.75)
-            sm.set_current_time(boot_base + timedelta(seconds=boot_elapsed))
+            process_time = boot_base + timedelta(seconds=boot_elapsed)
+            if lifecycle_authority is None:
+                sm.set_current_time(process_time)
+            return process_time
 
-        def _c(parent, image, cmd, user):
-            _advance_boot_clock()
+        def _c(parent: int, image: str, cmd: str, user: str, logon_id: str = "") -> int:
+            process_time = _advance_boot_clock()
             image = normalize_defender_platform_path(image, hn)
-            return sm.create_process(hn, parent, image, cmd, user, "System")
+            if lifecycle_authority is None:
+                # Compatibility fixtures deliberately omit the engine owner.
+                return sm.create_process(
+                    hn,
+                    parent,
+                    image,
+                    cmd,
+                    user,
+                    "System",
+                    logon_id=logon_id,
+                )
+            assert batch_builder is not None
+            plan = batch_builder.plan_process(
+                system=hn,
+                parent_pid=parent,
+                image=image,
+                command_line=cmd,
+                username=user,
+                integrity_level="System",
+                os_category="windows",
+                logon_id=logon_id,
+                start_time=process_time,
+                parent_plan=process_plans_by_pid.get(parent),
+            )
+            process_plans_by_pid[plan.identity.pid] = plan
+            return plan.identity.pid
 
-        # PID 4 is always the Windows System process (parent of smss.exe).
-        # Register it directly — create_process() auto-allocates PIDs so we
-        # bypass it to hardcode PID 4 as Windows requires.
-        from evidenceforge.models.state import RunningProcess
-
-        sm.state.running_processes[(hn, 4)] = RunningProcess(
-            pid=4,
-            parent_pid=0,
-            image="System",
-            command_line="",
-            username="SYSTEM",
-            system=hn,
-            start_time=sm.state.current_time,
-            integrity_level="System",
+        # PID 4 is always the Windows System process. Keep the fixed native PID
+        # while registering it through the same canonical identity boundary.
+        if lifecycle_authority is None:
+            sm.register_process(
+                system=hn,
+                pid=4,
+                parent_pid=0,
+                image="System",
+                command_line="",
+                username="SYSTEM",
+                integrity_level="System",
+                os_category="windows",
+            )
+            boot_pids["system"] = 4
+        else:
+            assert batch_builder is not None
+            plan = batch_builder.plan_process(
+                system=hn,
+                fixed_pid=4,
+                parent_pid=0,
+                image="System",
+                command_line="",
+                username="SYSTEM",
+                integrity_level="System",
+                os_category="windows",
+                start_time=boot_base,
+            )
+            process_plans_by_pid[plan.identity.pid] = plan
+            boot_pids["system"] = plan.identity.pid
+        boot_pids["smss"] = _c(4, r"C:\Windows\System32\smss.exe", "smss.exe", "SYSTEM")
+        boot_pids["csrss_s0"] = _c(
+            boot_pids["smss"],
+            r"C:\Windows\System32\csrss.exe",
+            "csrss.exe",
+            "SYSTEM",
         )
-        pids["system"] = 4
-        pids["smss"] = _c(4, r"C:\Windows\System32\smss.exe", "smss.exe", "SYSTEM")
-        pids["csrss_s0"] = _c(pids["smss"], r"C:\Windows\System32\csrss.exe", "csrss.exe", "SYSTEM")
-        pids["wininit"] = _c(
-            pids["smss"], r"C:\Windows\System32\wininit.exe", "wininit.exe", "SYSTEM"
+        boot_pids["wininit"] = _c(
+            boot_pids["smss"], r"C:\Windows\System32\wininit.exe", "wininit.exe", "SYSTEM"
         )
-        pids["services"] = _c(
-            pids["wininit"], r"C:\Windows\System32\services.exe", "services.exe", "SYSTEM"
+        boot_pids["services"] = _c(
+            boot_pids["wininit"],
+            r"C:\Windows\System32\services.exe",
+            "services.exe",
+            "SYSTEM",
         )
-        pids["lsass"] = _c(pids["wininit"], r"C:\Windows\System32\lsass.exe", "lsass.exe", "SYSTEM")
+        boot_pids["lsass"] = _c(
+            boot_pids["wininit"],
+            r"C:\Windows\System32\lsass.exe",
+            "lsass.exe",
+            "SYSTEM",
+        )
 
         svchost_groups = [
             ("svchost_dcom", "svchost.exe -k DcomLaunch", "SYSTEM"),
@@ -703,82 +2011,143 @@ class EmitterSetupMixin:
             ("svchost_wusvcs", "svchost.exe -k wusvcs", "SYSTEM"),
         ]
         for name, cmdline, user in svchost_groups:
-            pids[name] = _c(pids["services"], r"C:\Windows\System32\svchost.exe", cmdline, user)
+            boot_pids[name] = _c(
+                boot_pids["services"],
+                r"C:\Windows\System32\svchost.exe",
+                cmdline,
+                user,
+            )
+
+        # The Schedule service is part of the shared netsvcs host on this modeled
+        # Windows profile. Keep a semantic alias rather than inventing another
+        # svchost instance and perturbing unrelated process-allocation streams.
+        boot_pids["svchost_schedule"] = boot_pids["svchost_netsvcs"]
+
+        from evidenceforge.generation.activity.system_processes import (
+            get_scheduled_task_entries,
+        )
+
+        environment = getattr(getattr(self, "scenario", None), "environment", None)
+        requires_taskeng = bool(getattr(environment, "service_accounts", [])) or any(
+            str(entry.get("parent") or "") == "taskeng"
+            for entry in get_scheduled_task_entries(system)
+        )
+        if requires_taskeng:
+            task_identity = uuid.UUID(
+                int=(
+                    (_stable_seed(f"task_scheduler_guid_hi:{hn}") << 64)
+                    | _stable_seed(f"task_scheduler_guid_lo:{hn}")
+                )
+            )
+            boot_pids["taskeng"] = _c(
+                boot_pids["svchost_schedule"],
+                r"C:\Windows\System32\taskeng.exe",
+                f"taskeng.exe {{{str(task_identity).upper()}}}",
+                "SYSTEM",
+            )
 
         if (system.type or "").lower() == "domain_controller":
-            pids["dns"] = _c(pids["services"], r"C:\Windows\System32\dns.exe", "dns.exe", "SYSTEM")
+            boot_pids["dns"] = _c(
+                boot_pids["services"],
+                r"C:\Windows\System32\dns.exe",
+                "dns.exe",
+                "SYSTEM",
+            )
 
-        pids["msmpeng"] = _c(
-            pids["services"],
+        boot_pids["msmpeng"] = _c(
+            boot_pids["services"],
             r"C:\ProgramData\Microsoft\Windows Defender\Platform\MsMpEng.exe",
             "MsMpEng.exe",
             "SYSTEM",
         )
-        pids["search_indexer"] = _c(
-            pids["services"],
+        boot_pids["search_indexer"] = _c(
+            boot_pids["services"],
             r"C:\Windows\System32\SearchIndexer.exe",
             "SearchIndexer.exe",
             "SYSTEM",
+            "0x3e7",
         )
-        pids["wmiprvse"] = _c(
-            pids["svchost_dcom"],
+        boot_pids["wmiprvse"] = _c(
+            boot_pids["svchost_dcom"],
             r"C:\Windows\System32\wbem\WmiPrvSE.exe",
             "WmiPrvSE.exe -Embedding",
             "NETWORK SERVICE",
         )
-        pids["dllhost"] = _c(
-            pids["svchost_dcom"],
+        boot_pids["dllhost"] = _c(
+            boot_pids["svchost_dcom"],
             r"C:\Windows\System32\dllhost.exe",
             "dllhost.exe /Processid:{02D4B3F1-FD88-11D1-960D-00805FC79235}",
             "SYSTEM",
         )
-        pids["search_protocol_host"] = _c(
-            pids["search_indexer"],
+        boot_pids["search_protocol_host"] = _c(
+            boot_pids["search_indexer"],
             r"C:\Windows\System32\SearchProtocolHost.exe",
             "SearchProtocolHost.exe Global\\UsGthrFltPipeMssGthrPipe",
             "SYSTEM",
         )
-        pids["mpcmdrun"] = _c(
-            pids["msmpeng"],
+        boot_pids["mpcmdrun"] = _c(
+            boot_pids["msmpeng"],
             r"C:\ProgramData\Microsoft\Windows Defender\Platform\MpCmdRun.exe",
             "MpCmdRun.exe -Scan -ScanType 1",
             "SYSTEM",
         )
-        pids["msiexec"] = _c(
-            pids["services"],
+        boot_pids["msiexec"] = _c(
+            boot_pids["services"],
             r"C:\Windows\System32\msiexec.exe",
             "msiexec.exe /V",
             "SYSTEM",
         )
-        pids["taskhostw"] = _c(
-            pids["services"], r"C:\Windows\System32\taskhostw.exe", "taskhostw.exe", "SYSTEM"
+        boot_pids["taskhostw"] = _c(
+            boot_pids["svchost_schedule"],
+            r"C:\Windows\System32\taskhostw.exe",
+            "taskhostw.exe",
+            "SYSTEM",
         )
 
-        pids["csrss_s1"] = _c(pids["smss"], r"C:\Windows\System32\csrss.exe", "csrss.exe", "SYSTEM")
-        pids["winlogon"] = _c(
-            pids["smss"], r"C:\Windows\System32\winlogon.exe", "winlogon.exe", "SYSTEM"
+        boot_pids["csrss_s1"] = _c(
+            boot_pids["smss"],
+            r"C:\Windows\System32\csrss.exe",
+            "csrss.exe",
+            "SYSTEM",
         )
-        pids["userinit"] = _c(
-            pids["winlogon"], r"C:\Windows\System32\userinit.exe", "userinit.exe", "SYSTEM"
+        boot_pids["winlogon"] = _c(
+            boot_pids["smss"],
+            r"C:\Windows\System32\winlogon.exe",
+            "winlogon.exe",
+            "SYSTEM",
+        )
+        boot_pids["userinit"] = _c(
+            boot_pids["winlogon"],
+            r"C:\Windows\System32\userinit.exe",
+            "userinit.exe",
+            "SYSTEM",
         )
         # User-context processes run under the logged-in user, not SYSTEM.
         # Only seed them for workstations with an assigned user; servers/DCs
         # start explorer only when an admin logs in interactively.
         _desktop_user = getattr(system, "assigned_user", None)
         if _desktop_user:
-            pids["explorer"] = _c(
-                pids["userinit"], r"C:\Windows\explorer.exe", "explorer.exe", _desktop_user
+            boot_pids["explorer"] = _c(
+                boot_pids["userinit"],
+                r"C:\Windows\explorer.exe",
+                "explorer.exe",
+                _desktop_user,
             )
-            pids["runtime_broker"] = _c(
-                pids["svchost_local_system"],
+            boot_pids["runtime_broker"] = _c(
+                boot_pids["svchost_local_system"],
                 r"C:\Windows\System32\RuntimeBroker.exe",
                 "RuntimeBroker.exe",
                 _desktop_user,
             )
         else:
             # Servers/DCs: no persistent desktop session at boot
-            pids["explorer"] = pids["winlogon"]  # Alias for fallback lookups
-        pids["dwm"] = _c(pids["csrss_s0"], r"C:\Windows\System32\dwm.exe", "dwm.exe", "SYSTEM")
+            boot_pids["explorer"] = boot_pids["winlogon"]  # Alias for fallback lookups
+        boot_pids["dwm"] = _c(
+            boot_pids["csrss_s0"],
+            r"C:\Windows\System32\dwm.exe",
+            "dwm.exe",
+            "SYSTEM",
+        )
 
         roles = {role.lower() for role in (system.roles or [])}
         service_defaults = getattr(self, "_system_service_defaults", {})
@@ -789,85 +2158,159 @@ class EmitterSetupMixin:
             has_database_role=bool(roles & {"database", "db_server"}),
         )
         if "mssql" in db_services:
-            pids["sqlservr"] = _c(
-                pids["services"],
+            boot_pids["sqlservr"] = _c(
+                boot_pids["services"],
                 r"C:\Program Files\Microsoft SQL Server\MSSQL16.MSSQLSERVER\MSSQL\Binn\sqlservr.exe",
                 "sqlservr.exe -sMSSQLSERVER",
                 r"NT SERVICE\MSSQLSERVER",
             )
-        if boot_base is not None:
-            sm.set_current_time(boot_base)
+        if lifecycle_authority is None:
+            if boot_base is not None:
+                sm.set_current_time(boot_base)
+            return
 
-    def _seed_linux_process_tree(self, system: System, pids: dict[str, int]) -> None:
-        """Seed Linux system process tree in StateManager."""
+        assert batch_builder is not None
+        if owns_batch:
+            # Fixture-only direct callers own a one-host batch. Production injects
+            # the single fleet builder from _seed_system_process_trees().
+            try:
+                lifecycle_authority.materialize_batch(batch_builder.seal())
+            finally:
+                if boot_base is not None and sm.state.current_time != boot_base:
+                    sm.set_current_time(boot_base)
+        pids.update(boot_pids)
+
+    def _seed_linux_process_tree(
+        self,
+        system: System,
+        pids: dict[str, int],
+        *,
+        _batch_builder: MaterializationBatchBuilder | None = None,
+        _boot_base: datetime | None = None,
+    ) -> None:
+        """Seed a Linux boot tree; direct strict calls are fixture-only."""
         sm = self.state_manager
+        lifecycle_authority = self._boot_lifecycle_authority()
         hn = system.hostname
         os_str = system.os.lower()
 
         is_rhel = any(d in os_str for d in ("centos", "rhel", "red hat", "rocky", "alma"))
-        boot_base = sm.state.current_time
+        boot_base = _boot_base if _batch_builder is not None else sm.state.current_time
         boot_rng = random.Random(_stable_seed(f"linux_boot_sequence:{hn}"))
         boot_elapsed = 0.0
+        owns_batch = lifecycle_authority is not None and _batch_builder is None
+        batch_builder = sm.begin_materialization_batch() if owns_batch else _batch_builder
+        boot_pids = pids if lifecycle_authority is None else {}
+        process_plans_by_pid: dict[int, ProcessMaterializationPlan] = {}
+        if batch_builder is not None and boot_base is not None:
+            batch_builder.plan_boot_time(hn, boot_base)
 
-        def _advance_boot_clock() -> None:
+        def _advance_boot_clock() -> datetime | None:
             nonlocal boot_elapsed
             if boot_base is None:
-                return
+                return None
             boot_elapsed += boot_rng.uniform(0.05, 1.9)
-            sm.set_current_time(boot_base + timedelta(seconds=boot_elapsed))
+            process_time = boot_base + timedelta(seconds=boot_elapsed)
+            if lifecycle_authority is None:
+                sm.set_current_time(process_time)
+            return process_time
 
-        def _c(parent, image, cmd, user):
-            _advance_boot_clock()
-            return sm.create_process(hn, parent, image, cmd, user, "System")
+        def _c(parent: int, image: str, cmd: str, user: str) -> int:
+            process_time = _advance_boot_clock()
+            if lifecycle_authority is None:
+                # Compatibility fixtures deliberately omit the engine owner.
+                return sm.create_process(hn, parent, image, cmd, user, "System")
+            assert batch_builder is not None
+            plan = batch_builder.plan_process(
+                system=hn,
+                parent_pid=parent,
+                image=image,
+                command_line=cmd,
+                username=user,
+                integrity_level="System",
+                os_category="linux",
+                start_time=process_time,
+                parent_plan=process_plans_by_pid.get(parent),
+            )
+            process_plans_by_pid[plan.identity.pid] = plan
+            return plan.identity.pid
 
-        from evidenceforge.models.state import RunningProcess
-
-        systemd_object_id = stable_uuid("linux-systemd", hn)
-        sm.state.running_processes[(hn, 1)] = RunningProcess(
-            pid=1,
-            parent_pid=0,
-            image="/usr/lib/systemd/systemd",
-            command_line="/usr/lib/systemd/systemd --system --deserialize 26",
-            username="root",
-            system=hn,
-            start_time=sm.state.current_time,
-            integrity_level="System",
-            ecar_object_id=systemd_object_id,
-        )
-        sm._process_object_ids[(hn, 1)] = systemd_object_id
-        pids["systemd"] = 1
+        if lifecycle_authority is None:
+            sm.register_process(
+                system=hn,
+                pid=1,
+                parent_pid=0,
+                image="/usr/lib/systemd/systemd",
+                command_line="/usr/lib/systemd/systemd --system --deserialize 26",
+                username="root",
+                integrity_level="System",
+                os_category="linux",
+            )
+            boot_pids["systemd"] = 1
+        else:
+            assert batch_builder is not None
+            plan = batch_builder.plan_process(
+                system=hn,
+                fixed_pid=1,
+                parent_pid=0,
+                image="/usr/lib/systemd/systemd",
+                command_line="/usr/lib/systemd/systemd --system --deserialize 26",
+                username="root",
+                integrity_level="System",
+                os_category="linux",
+                start_time=boot_base,
+            )
+            process_plans_by_pid[plan.identity.pid] = plan
+            boot_pids["systemd"] = plan.identity.pid
 
         journal_path = "/usr/lib/systemd/systemd-journald"
-        pids["journald"] = _c(pids["systemd"], journal_path, journal_path, "root")
+        boot_pids["journald"] = _c(boot_pids["systemd"], journal_path, journal_path, "root")
 
         udev_path = "/usr/lib/systemd/systemd-udevd" if is_rhel else "/lib/systemd/systemd-udevd"
-        pids["udevd"] = _c(pids["systemd"], udev_path, udev_path, "root")
+        boot_pids["udevd"] = _c(boot_pids["systemd"], udev_path, udev_path, "root")
 
-        pids["rsyslogd"] = _c(pids["systemd"], "/usr/sbin/rsyslogd", "rsyslogd -n", "syslog")
-        pids["networkmanager"] = _c(
-            pids["systemd"],
+        boot_pids["rsyslogd"] = _c(
+            boot_pids["systemd"], "/usr/sbin/rsyslogd", "rsyslogd -n", "syslog"
+        )
+        boot_pids["networkmanager"] = _c(
+            boot_pids["systemd"],
             "/usr/sbin/NetworkManager",
             "/usr/sbin/NetworkManager --no-daemon",
             "root",
         )
-        pids["dbus"] = _c(
-            pids["systemd"], "/usr/bin/dbus-daemon", "/usr/bin/dbus-daemon --system", "messagebus"
+        boot_pids["dbus"] = _c(
+            boot_pids["systemd"],
+            "/usr/bin/dbus-daemon",
+            "/usr/bin/dbus-daemon --system",
+            "messagebus",
         )
 
         logind_path = "/usr/lib/systemd/systemd-logind"
-        pids["logind"] = _c(pids["systemd"], logind_path, logind_path, "root")
+        boot_pids["logind"] = _c(boot_pids["systemd"], logind_path, logind_path, "root")
 
-        pids["sshd"] = _c(pids["systemd"], "/usr/sbin/sshd", "/usr/sbin/sshd -D", "root")
+        boot_pids["sshd"] = _c(boot_pids["systemd"], "/usr/sbin/sshd", "/usr/sbin/sshd -D", "root")
 
         roles = {role.lower() for role in (system.roles or [])}
         service_defaults = getattr(self, "_system_service_defaults", {})
         services = tuple(service_defaults.get(system.hostname, system.services or ()))
         service_tokens = {svc.lower() for svc in services}
+        world_model = getattr(self, "world_model", None)
+        host_world = getattr(world_model, "hosts", {}).get(system.hostname)
+        if host_world is not None and host_world.supports(HostCapability.SMB_SERVER):
+            server_profile = select_server_profile("linux", services)
+            listener = render_smb_process(server_profile.listener)
+            boot_pids["smbd"] = _c(
+                boot_pids["systemd"],
+                listener.image,
+                listener.command_line,
+                listener.username,
+            )
+            boot_pids["smbd_master"] = boot_pids["smbd"]
         proxy_markers = {"forward_proxy", "squid", "proxy"}
         if roles & proxy_markers or service_tokens & proxy_markers:
             squid_user = "squid" if is_rhel else "proxy"
-            pids["squid"] = _c(
-                pids["systemd"],
+            boot_pids["squid"] = _c(
+                boot_pids["systemd"],
                 "/usr/sbin/squid",
                 "/usr/sbin/squid --foreground -YC",
                 squid_user,
@@ -876,15 +2319,15 @@ class EmitterSetupMixin:
         web_markers = {"web_server", "apache", "apache2", "httpd", "nginx"}
         if roles & web_markers or service_tokens & web_markers or "web" in system.hostname.lower():
             if is_rhel:
-                pids["httpd"] = _c(
-                    pids["systemd"],
+                boot_pids["httpd"] = _c(
+                    boot_pids["systemd"],
                     "/usr/sbin/httpd",
                     "/usr/sbin/httpd -DFOREGROUND",
                     "apache",
                 )
             else:
-                pids["apache2"] = _c(
-                    pids["systemd"],
+                boot_pids["apache2"] = _c(
+                    boot_pids["systemd"],
                     "/usr/sbin/apache2",
                     "/usr/sbin/apache2 -DFOREGROUND",
                     "www-data",
@@ -896,15 +2339,15 @@ class EmitterSetupMixin:
             has_database_role=bool(roles & {"database", "db_server"}),
         )
         if "mysql" in db_services:
-            pids["mysqld"] = _c(
-                pids["systemd"],
+            boot_pids["mysqld"] = _c(
+                boot_pids["systemd"],
                 "/usr/sbin/mysqld",
                 "/usr/sbin/mysqld --daemonize --pid-file=/run/mysqld/mysqld.pid",
                 "mysql",
             )
         if "postgresql" in db_services:
-            pids["postgres"] = _c(
-                pids["systemd"],
+            boot_pids["postgres"] = _c(
+                boot_pids["systemd"],
                 "/usr/bin/postgres",
                 "/usr/bin/postgres -D /var/lib/pgsql/data",
                 "postgres",
@@ -912,23 +2355,37 @@ class EmitterSetupMixin:
 
         cron_name = "/usr/sbin/crond" if is_rhel else "/usr/sbin/cron"
         cron_cmd = "/usr/sbin/crond -n" if is_rhel else "/usr/sbin/cron -f"
-        pids["cron"] = _c(pids["systemd"], cron_name, cron_cmd, "root")
+        boot_pids["cron"] = _c(boot_pids["systemd"], cron_name, cron_cmd, "root")
 
-        pids["agetty1"] = _c(
-            pids["systemd"], "/sbin/agetty", "/sbin/agetty --noclear tty1 linux", "root"
+        boot_pids["agetty1"] = _c(
+            boot_pids["systemd"],
+            "/sbin/agetty",
+            "/sbin/agetty --noclear tty1 linux",
+            "root",
         )
-        pids["agetty2"] = _c(
-            pids["systemd"], "/sbin/agetty", "/sbin/agetty --noclear tty2 linux", "root"
+        boot_pids["agetty2"] = _c(
+            boot_pids["systemd"],
+            "/sbin/agetty",
+            "/sbin/agetty --noclear tty2 linux",
+            "root",
         )
-        pids["snapd"] = _c(pids["systemd"], "/usr/lib/snapd/snapd", "/usr/lib/snapd/snapd", "root")
+        boot_pids["snapd"] = _c(
+            boot_pids["systemd"],
+            "/usr/lib/snapd/snapd",
+            "/usr/lib/snapd/snapd",
+            "root",
+        )
         # NTP: Ubuntu uses systemd-timesyncd, RHEL uses chronyd
         if is_rhel:
-            pids["chronyd"] = _c(
-                pids["systemd"], "/usr/sbin/chronyd", "/usr/sbin/chronyd -F 2", "chrony"
+            boot_pids["chronyd"] = _c(
+                boot_pids["systemd"],
+                "/usr/sbin/chronyd",
+                "/usr/sbin/chronyd -F 2",
+                "chrony",
             )
         else:
-            pids["timesyncd"] = _c(
-                pids["systemd"],
+            boot_pids["timesyncd"] = _c(
+                boot_pids["systemd"],
                 "/usr/lib/systemd/systemd-timesyncd",
                 "/usr/lib/systemd/systemd-timesyncd",
                 "systemd-timesync",
@@ -936,136 +2393,64 @@ class EmitterSetupMixin:
 
         # DNS: Ubuntu uses systemd-resolved; RHEL apps resolve directly via glibc
         if not is_rhel:
-            pids["systemd_resolved"] = _c(
-                pids["systemd"],
+            boot_pids["systemd_resolved"] = _c(
+                boot_pids["systemd"],
                 "/usr/lib/systemd/systemd-resolved",
                 "/usr/lib/systemd/systemd-resolved",
                 "systemd-resolve",
             )
 
-        pids["bash"] = _c(pids["sshd"], "/bin/bash", "-bash", "root")
-        if boot_base is not None:
-            sm.set_current_time(boot_base)
+        boot_pids["bash"] = _c(boot_pids["sshd"], "/bin/bash", "-bash", "root")
+        if lifecycle_authority is None:
+            if boot_base is not None:
+                sm.set_current_time(boot_base)
+            return
+
+        assert batch_builder is not None
+        if owns_batch:
+            # Fixture-only direct callers own a one-host batch. Production injects
+            # the single fleet builder from _seed_system_process_trees().
+            try:
+                lifecycle_authority.materialize_batch(batch_builder.seal())
+            finally:
+                if boot_base is not None and sm.state.current_time != boot_base:
+                    sm.set_current_time(boot_base)
+        pids.update(boot_pids)
 
     def _seed_macos_process_tree(self, system: System, pids: dict[str, int]) -> None:
-        """Seed macOS system process tree in StateManager."""
+        """Seed a macOS boot tree directly into State; fixture-only compatibility path.
+
+        Engine-owned generation plans the same forest through
+        ``_build_macos_boot_host_spec`` and the lifecycle materialization batch.
+        """
         sm = self.state_manager
-        hn = system.hostname
         boot_base = sm.state.current_time
-        boot_rng = random.Random(_stable_seed(f"macos_boot_sequence:{hn}"))
-        boot_elapsed = 0.0
-
-        def _advance_boot_clock() -> None:
-            nonlocal boot_elapsed
-            if boot_base is None:
-                return
-            boot_elapsed += boot_rng.uniform(0.05, 1.9)
-            sm.set_current_time(boot_base + timedelta(seconds=boot_elapsed))
-
-        def _c(parent, image, cmd, user):
-            _advance_boot_clock()
-            return sm.create_process(hn, parent, image, cmd, user, "System", os_category="macos")
-
-        from evidenceforge.models.state import RunningProcess
-
-        # launchd is macOS's PID 1 — the sole process spawned directly by the
-        # kernel, and the ancestor of every other user-space process (both
-        # system daemons in the system domain and, later, per-user Aqua
-        # session jobs). Register it directly (bypassing create_process(), as
-        # the Linux/Windows trees do for their own PID-1/PID-4 roots) since
-        # its PID is fixed by convention, not allocated.
-        launchd_object_id = stable_uuid("macos-launchd", hn)
-        sm.state.running_processes[(hn, 1)] = RunningProcess(
-            pid=1,
-            parent_pid=0,
-            image="/sbin/launchd",
-            command_line="/sbin/launchd",
-            username="root",
-            system=hn,
-            start_time=sm.state.current_time,
-            integrity_level="System",
-            ecar_object_id=launchd_object_id,
-        )
-        sm._process_object_ids[(hn, 1)] = launchd_object_id
-        pids["launchd"] = 1
-
-        pids["windowserver"] = _c(
-            pids["launchd"],
-            "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
-            "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon",
-            "_windowserver",
-        )
-        # macOS's session root — the analog of Windows' winlogon. Owns the
-        # login UI and (once a user authenticates) becomes the durable
-        # interactive-session anchor that WorldModel's
-        # _find_reusable_interactive_session() already treats as
-        # loginwindow-rooted.
-        pids["loginwindow"] = _c(
-            pids["launchd"],
-            "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow",
-            "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow",
-            "root",
-        )
-        pids["cfprefsd"] = _c(
-            pids["launchd"], "/usr/sbin/cfprefsd", "/usr/sbin/cfprefsd daemon", "root"
-        )
-        pids["user_event_agent"] = _c(
-            pids["launchd"],
-            "/usr/libexec/UserEventAgent",
-            "/usr/libexec/UserEventAgent (System)",
-            "root",
-        )
-        # Unified logging (logd) and its legacy BSD syslog compatibility shim
-        # (syslogd) both run persistently, mirroring the Linux tree's
-        # systemd-journald + rsyslogd pairing.
-        pids["logd"] = _c(pids["launchd"], "/usr/libexec/logd", "/usr/libexec/logd", "root")
-        pids["syslogd"] = _c(pids["launchd"], "/usr/sbin/syslogd", "/usr/sbin/syslogd", "root")
-        pids["trustd"] = _c(
-            pids["launchd"], "/usr/libexec/trustd", "/usr/libexec/trustd --agent", "_trustd"
-        )
-        pids["opendirectoryd"] = _c(
-            pids["launchd"], "/usr/libexec/opendirectoryd", "/usr/libexec/opendirectoryd", "root"
-        )
-        pids["notifyd"] = _c(
-            pids["launchd"], "/usr/libexec/notifyd", "/usr/libexec/notifyd", "root"
-        )
-        pids["mdnsresponder"] = _c(
-            pids["launchd"], "/usr/sbin/mDNSResponder", "/usr/sbin/mDNSResponder", "_mdnsresponder"
-        )
-        # Background Task Management: discovers LaunchAgent/LaunchDaemon plists
-        # and reports ES btm_launch_item_add events.
-        pids["backgroundtaskmanagementd"] = _c(
-            pids["launchd"],
-            "/System/Library/PrivateFrameworks/BackgroundTaskManagement.framework/"
-            "Versions/A/Resources/backgroundtaskmanagementd",
-            "/System/Library/PrivateFrameworks/BackgroundTaskManagement.framework/"
-            "Versions/A/Resources/backgroundtaskmanagementd",
-            "root",
-        )
-
-        # Spotlight: mds is the metadata server; mdworker instances are its
-        # on-demand indexing workers.
-        pids["mds"] = _c(
-            pids["launchd"],
-            "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds",
-            "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds",
-            "root",
-        )
-        pids["mdworker"] = _c(
-            pids["mds"],
-            "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/"
-            "Metadata.framework/Versions/A/Support/mdworker_shared",
-            "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/"
-            "Metadata.framework/Versions/A/Support/mdworker_shared -s mdworker",
-            "_spotlight",
-        )
-
-        # Remote Login (sshd), matching WorldModel's macOS SSH support — a
-        # root shell parented under it stands in for an active console/SSH
-        # session, mirroring the Linux tree's sshd->bash pairing.
-        pids["sshd"] = _c(pids["launchd"], "/usr/sbin/sshd", "/usr/sbin/sshd -i", "root")
-        pids["zsh"] = _c(pids["sshd"], "/bin/zsh", "-zsh", "root")
-
+        host_spec = self._build_macos_boot_host_spec(system, boot_base)
+        for member in host_spec.processes:
+            if member.start_time is not None:
+                sm.set_current_time(member.start_time)
+            if member.parent_alias is None:
+                assert member.fixed_pid is not None
+                sm.register_process(
+                    system=host_spec.hostname,
+                    pid=member.fixed_pid,
+                    parent_pid=0,
+                    image=member.image,
+                    command_line=member.command_line,
+                    username=member.username,
+                    integrity_level=member.integrity_level,
+                    os_category=member.os_category,
+                )
+                pids[member.alias] = member.fixed_pid
+                continue
+            pids[member.alias] = sm.create_process(
+                host_spec.hostname,
+                pids[member.parent_alias],
+                member.image,
+                member.command_line,
+                member.username,
+                member.integrity_level,
+            )
         if boot_base is not None:
             sm.set_current_time(boot_base)
 
@@ -1098,24 +2483,41 @@ class EmitterSetupMixin:
                 return seg
         return None
 
-    def _generate_external_client_ip(self, rng) -> str:
-        """Generate a random external (non-RFC1918) IP for web server clients.
+    def _generate_external_client_ip(self, rng, *, role: str = "human") -> str:
+        """Bind a role-scoped public identity outside the scenario's address space.
 
-        Excludes non-global special-use ranges and the scenario's own
-        org CIDRs (internal segments + public_cidrs) so generated external
-        client IPs never accidentally land inside the org's address space.
+        Stable semantic keys come from the caller's scoped RNG, preserving serial/parallel
+        determinism without sharing mutable registry state.
         """
         import ipaddress as _ipa_ext
 
         org_nets = getattr(self, "_org_cidr_networks", [])
-        for _ in range(1000):  # safety bound
-            ip = f"{rng.randint(1, 223)}.{rng.randint(0, 255)}.{rng.randint(0, 255)}.{rng.randint(1, 254)}"
-            addr = _ipa_ext.ip_address(ip)
-            if not addr.is_global:
-                continue
-            # Exclude org's own CIDRs
-            if org_nets:
-                if any(addr in net for net in org_nets):
+        registry = getattr(self, "public_identity_registry", None)
+        if not isinstance(registry, PublicIdentityRegistry):
+            excluded_nets = [
+                _ipa_ext.ip_network(cidr, strict=False) for cidr in external_client_excluded_cidrs()
+            ]
+            for _ in range(1000):
+                ip = (
+                    f"{rng.randint(1, 223)}.{rng.randint(0, 255)}."
+                    f"{rng.randint(0, 255)}.{rng.randint(1, 254)}"
+                )
+                addr = _ipa_ext.ip_address(ip)
+                if not addr.is_global or any(addr in net for net in excluded_nets):
                     continue
+                if not any(addr in net for net in org_nets):
+                    return ip
             return ip
-        return ip  # fallback after safety bound
+
+        ip = ""
+        for _ in range(1000):
+            semantic_key = f"runtime:{role}:{rng.getrandbits(128):032x}"
+            ip = registry.bind(
+                role,
+                semantic_key,
+                prefer_fixed=role not in {"scanner", "human", "ordinary_responder"},
+            ).ip
+            addr = _ipa_ext.ip_address(ip)
+            if not any(addr in net for net in org_nets):
+                return ip
+        return ip

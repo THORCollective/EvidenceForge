@@ -23,7 +23,7 @@
 """Unit tests for Phase 5.2.2: Failed logon generation."""
 
 import random
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock
 
 import pytest
@@ -153,6 +153,26 @@ class TestFailedLogonWindows:
         sessions = state_manager.get_sessions_for_user("alice.smith")
         assert len(sessions) == 0
 
+    def test_same_timestamp_attempts_have_distinct_action_relative_identity(
+        self, activity_gen, test_user, win_system, timestamp, state_manager, mock_emitters
+    ):
+        """Identical retries share an action family but receive distinct peer ordinals."""
+        state_manager.set_current_time(timestamp)
+
+        activity_gen.generate_failed_logon(test_user, win_system, timestamp)
+        activity_gen.generate_failed_logon(test_user, win_system, timestamp)
+
+        events = [
+            call.args[0]
+            for call in mock_emitters["ecar"].emit.call_args_list
+            if call.args[0].event_type == "failed_logon"
+        ]
+        assert len(events) == 2
+        assert events[0].occurrence_key.action_id == events[1].occurrence_key.action_id
+        assert events[0].occurrence_key.instance_key == "attempt:0"
+        assert events[1].occurrence_key.instance_key == "attempt:1"
+        assert events[0].identity_plan.object_id != events[1].identity_plan.object_id
+
     def test_subject_is_null_for_failed_logon(
         self, activity_gen, test_user, win_system, timestamp, state_manager, mock_emitters
     ):
@@ -266,6 +286,33 @@ class TestFailedLogonFormatValidation:
         result = validate_event(fmt_def, event, variant_name="failed_logon")
         assert result.valid, f"Validation errors: {result.errors}"
 
+    def test_4771_rejects_missing_ip_sentinel(self):
+        """A 4771 client address must be a source-native IP, including for localhost."""
+        fmt_def = load_format("windows_event_security")
+        event = {
+            "EventID": 4771,
+            "TimeCreated": "2024-03-15T10:00:00Z",
+            "Computer": "DC-01.corp.local",
+            "Channel": "Security",
+            "Level": 0,
+            "EventRecordID": 1001,
+            "ExecutionProcessID": 624,
+            "ExecutionThreadID": 100,
+            "TargetUserName": "alice.smith",
+            "TargetSid": "S-1-5-21-123-456-789-1001",
+            "ServiceName": "krbtgt/CORP.LOCAL",
+            "TicketOptions": "0x40810010",
+            "Status": "0x18",
+            "PreAuthType": 2,
+            "IpAddress": "-",
+            "IpPort": 0,
+        }
+
+        result = validate_event(fmt_def, event, variant_name="kerberos_preauth_failed")
+
+        assert not result.valid
+        assert any(error.startswith("IpAddress:") for error in result.errors)
+
 
 class TestFailedLogonRate:
     """Test that baseline activity includes ~10% failed logons."""
@@ -370,13 +417,20 @@ class TestFailedLogonDC:
             hostname="DC-01", ip="10.0.10.100", os="Windows Server 2019", type="domain_controller"
         )
         user = User(username="alice", full_name="Alice", email="a@t.com", enabled=True)
+        source = System(
+            hostname="LT-SOURCE",
+            ip="10.0.10.2",
+            os="Linux Ubuntu 22.04",
+            type="workstation",
+        )
+        ag._ip_to_system[source.ip] = source
 
         ag.generate_failed_logon(
             user=user,
             system=wks,
             time=timestamp,
             logon_type=3,
-            source_ip="10.0.10.1",
+            source_ip=source.ip,
             dc_system=dc,
         )
 
@@ -391,6 +445,7 @@ class TestFailedLogonDC:
         assert "ntlm_validation" in event_types, "Missing 4776 on DC"
         ntlm_event = next(e for e in dc_events if e.event_type == "ntlm_validation")
         assert ntlm_event.auth.failure_status != "0x0"
+        assert ntlm_event.auth.source_ip == "LT-SOURCE"
 
     def test_failed_logon_can_emit_kerberos_without_ntlm(
         self, state_manager, mock_emitters, timestamp, monkeypatch
@@ -441,6 +496,13 @@ class TestFailedLogonDC:
         }
         assert "kerberos_preauth_failed" in event_types
         assert "ntlm_validation" not in event_types
+        kerberos_event = next(
+            call[0][0]
+            for call in mock_emitters["windows_event_security"].emit.call_args_list
+            if call[0][0].event_type == "kerberos_preauth_failed"
+        )
+        assert kerberos_event.kerberos.source_ip == "::ffff:45.83.221.45"
+        assert kerberos_event.kerberos.source_port > 0
 
     def test_failed_logon_network_evidence_is_not_syn_only(
         self, state_manager, mock_emitters, timestamp, monkeypatch
@@ -487,6 +549,24 @@ class TestFailedLogonDC:
         ]
         assert network_events
         assert all(event.network.conn_state != "S0" for event in network_events)
+        assert all(0.02 <= event.network.duration <= 1.5 for event in network_events)
+        failed_event = next(
+            call[0][0]
+            for call in mock_emitters["ecar"].emit.call_args_list
+            if call[0][0].event_type == "failed_logon"
+        )
+        assert failed_event.remote_auth is not None
+        assert failed_event.remote_auth.outcome == "failure"
+        assert failed_event.remote_auth.logon_id == ""
+        assert failed_event.remote_auth.session_object_id == ""
+        transport = failed_event.remote_auth.primary_transport
+        assert transport is not None
+        assert transport.transaction_id == network_events[0].network.stable_id
+        assert network_events[0].lifecycle.parent_group_id == failed_event.remote_auth.stable_id
+        ecar_event_types = [
+            call[0][0].event_type for call in mock_emitters["ecar"].emit.call_args_list
+        ]
+        assert ecar_event_types.index("connection") < ecar_event_types.index("failed_logon")
 
     def test_known_user_failed_logon_uses_wrong_password_substatus(
         self, state_manager, mock_emitters, timestamp
@@ -525,6 +605,82 @@ class TestFailedLogonDC:
         assert event.auth.workstation_name == "WKS-01"
         assert event.auth.source_ip == "-"
         assert event.auth.process_name == r"C:\Windows\System32\winlogon.exe"
+
+    def test_duplicate_interactive_attempt_is_suppressed(
+        self, state_manager, mock_emitters, timestamp
+    ):
+        """Overlapping producers should not emit two native rows for one attempt."""
+        ag = ActivityGenerator(state_manager, mock_emitters)
+        user = User(username="alice", full_name="Alice", email="a@t.com", enabled=True)
+        wks = System(hostname="WKS-01", ip="10.0.10.1", os="Windows 10", type="workstation")
+
+        ag.generate_failed_logon(user=user, system=wks, time=timestamp, logon_type=2)
+        ag.generate_failed_logon(
+            user=user,
+            system=wks,
+            time=timestamp + timedelta(milliseconds=350),
+            logon_type=2,
+        )
+
+        events = [
+            call.args[0]
+            for call in mock_emitters["windows_event_security"].emit.call_args_list
+            if call.args[0].event_type == "failed_logon"
+        ]
+        assert len(events) == 1
+
+    def test_distinct_interactive_attempts_have_human_scale_cadence(
+        self, state_manager, mock_emitters, timestamp
+    ):
+        """Distinct local retries should not render at machine-speed cadence."""
+        ag = ActivityGenerator(state_manager, mock_emitters)
+        user = User(username="alice", full_name="Alice", email="a@t.com", enabled=True)
+        wks = System(hostname="WKS-01", ip="10.0.10.1", os="Windows 10", type="workstation")
+
+        ag.generate_failed_logon(user=user, system=wks, time=timestamp, logon_type=2)
+        ag.generate_failed_logon(
+            user=user,
+            system=wks,
+            time=timestamp + timedelta(seconds=1),
+            logon_type=2,
+        )
+
+        events = [
+            call.args[0]
+            for call in mock_emitters["windows_event_security"].emit.call_args_list
+            if call.args[0].event_type == "failed_logon"
+        ]
+        assert len(events) == 2
+        assert events[1].timestamp - events[0].timestamp >= timedelta(seconds=2)
+
+    def test_batch_failed_logon_uses_task_scheduler_shape(
+        self, state_manager, mock_emitters, timestamp
+    ):
+        """Type-4 failures should not inherit NtLmSsp/LSASS network semantics."""
+        ag = ActivityGenerator(state_manager, mock_emitters)
+        user = User(username="svc_report", full_name="Report", email="r@t.com", enabled=False)
+        server = System(
+            hostname="SRV-01",
+            ip="10.0.20.10",
+            os="Windows Server 2022",
+            type="server",
+        )
+
+        ag.generate_failed_logon(
+            user=user,
+            system=server,
+            time=timestamp,
+            logon_type=4,
+            source_ip=server.ip,
+        )
+
+        event = mock_emitters["windows_event_security"].emit.call_args.args[0]
+        assert event.auth.logon_process == "Advapi"
+        assert event.auth.auth_package == "Negotiate"
+        assert event.auth.process_name == r"C:\Windows\System32\svchost.exe"
+        assert event.auth.source_ip == "-"
+        assert event.auth.source_port == 0
+        assert event.auth.workstation_name == "-"
 
     def test_no_dc_no_extra_events(self, state_manager, mock_emitters, timestamp):
         """Without dc_system, only workstation events are emitted."""

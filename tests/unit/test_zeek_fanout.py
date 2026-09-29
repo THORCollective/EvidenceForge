@@ -20,20 +20,19 @@
 #
 # SPDX-License-Identifier: MIT
 
-"""Tests for SecurityEvent fan-out across multiple Zeek emitters."""
+"""Tests for OccurrenceBuilder fan-out across multiple Zeek emitters."""
 
 import json
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-from evidenceforge.events.base import SecurityEvent
+from evidenceforge.events.base import OccurrenceBuilder
 from evidenceforge.events.contexts import (
     DhcpContext,
     DnsContext,
     FileTransferContext,
     HttpContext,
-    NetworkContext,
     SslContext,
 )
 from evidenceforge.formats import load_format
@@ -42,6 +41,7 @@ from evidenceforge.generation.emitters.zeek_dhcp import ZeekDhcpEmitter
 from evidenceforge.generation.emitters.zeek_files import ZeekFilesEmitter
 from evidenceforge.generation.emitters.zeek_http import ZeekHttpEmitter
 from evidenceforge.generation.emitters.zeek_ssl import ZeekSslEmitter
+from tests.network_factories import network_plan
 
 
 class TestSslFanOut:
@@ -54,10 +54,10 @@ class TestSslFanOut:
             conn_emitter = ZeekEmitter(load_format("zeek_conn"), base, sensor_hostnames=["s1"])
             ssl_emitter = ZeekSslEmitter(load_format("zeek_ssl"), base, sensor_hostnames=["s1"])
 
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.10.50",
                     src_port=54321,
                     dst_ip="93.184.216.34",
@@ -112,7 +112,7 @@ class TestSslFanOut:
                 ssl_data = json.loads(f.readline())
 
             assert conn_data["uid"] == ssl_data["uid"]
-            assert conn_data["uid"] != "CTestFanout12345"
+            assert conn_data["uid"] == "CTestFanout12345"
             assert conn_data["uid"].startswith("C")
 
 
@@ -129,10 +129,10 @@ class TestDhcpFanOut:
             dhcp_emitter = ZeekDhcpEmitter(
                 load_format("zeek_dhcp"), base, sensor_hostnames=["core-tap"]
             )
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                 event_type="dhcp_lease",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.10.50",
                     src_port=68,
                     dst_ip="10.0.0.1",
@@ -196,10 +196,10 @@ class TestHttpFilesFanOut:
                 load_format("zeek_files"), base, sensor_hostnames=["s1"]
             )
 
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.10.50",
                     src_port=54321,
                     dst_ip="93.184.216.34",
@@ -271,11 +271,11 @@ class TestHttpFilesFanOut:
 
             # UID consistency
             assert conn_data["uid"] == http_data["uid"] == files_data["conn_uids"][0]
-            assert conn_data["uid"] != "CTestHttpFiles01"
+            assert conn_data["uid"] == "CTestHttpFiles01"
             assert conn_data["uid"].startswith("C")
 
             # File cross-reference: files fuid appears in http resp_fuids
-            assert files_data["fuid"] != "FTestFile01234567"
+            assert files_data["fuid"] == "FTestFile01234567"
             assert files_data["fuid"].startswith("F")
             assert files_data["fuid"] in http_data["resp_fuids"]
 
@@ -284,16 +284,16 @@ class TestNoFanOutWithoutContext:
     """Only conn.log emitted when no SSL/HTTP/files context present."""
 
     def test_network_only_no_ssl_http_files(self):
-        """Event with only NetworkContext → only conn emitter handles it."""
+        """Event with only NetworkTransactionPlan → only conn emitter handles it."""
         conn_emitter = ZeekEmitter(load_format("zeek_conn"), Path("/tmp/test.json"))
         ssl_emitter = ZeekSslEmitter(load_format("zeek_ssl"), Path("/tmp/test.json"))
         http_emitter = ZeekHttpEmitter(load_format("zeek_http"), Path("/tmp/test.json"))
         files_emitter = ZeekFilesEmitter(load_format("zeek_files"), Path("/tmp/test.json"))
 
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.0.1",
                 src_port=50000,
                 dst_ip="8.8.8.8",
@@ -318,10 +318,10 @@ class TestMultiSensorFanOut:
             base = Path(tmpdir)
             conn_emitter = ZeekEmitter(load_format("zeek_conn"), base / "conn.json")
 
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.0.1",
                     src_port=50000,
                     dst_ip="198.51.100.10",
@@ -335,7 +335,7 @@ class TestMultiSensorFanOut:
                     orig_pkts=1,
                     resp_pkts=0,
                     orig_ip_bytes=40,
-                    resp_ip_bytes=40,
+                    resp_ip_bytes=0,
                     ip_proto=6,
                 ),
             )
@@ -358,10 +358,10 @@ class TestMultiSensorFanOut:
                 load_format("zeek_ssl"), base, sensor_hostnames=["fw01", "fw02"]
             )
 
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.0.1",
                     src_port=50000,
                     dst_ip="8.8.8.8",
@@ -388,8 +388,8 @@ class TestMultiSensorFanOut:
                 assert (base / sensor / "conn.json").exists()
                 assert (base / sensor / "ssl.json").exists()
 
-            # Each real Zeek sensor generates its own UID namespace, while
-            # preserving correlation within that sensor's Zeek log family.
+            # Direct emitters preserve canonical identity. Sensor-local identity
+            # is introduced only by a frozen NetworkSensorObservation.
             with open(base / "fw01" / "conn.json") as f:
                 uid1 = json.loads(f.readline())["uid"]
             with open(base / "fw01" / "ssl.json") as f:
@@ -400,24 +400,24 @@ class TestMultiSensorFanOut:
                 ssl_uid2 = json.loads(f.readline())["uid"]
             assert uid1 == ssl_uid1
             assert uid2 == ssl_uid2
-            assert uid1 != "CMultiSensor1234"
-            assert uid2 != "CMultiSensor1234"
-            assert uid2 != uid1
+            assert uid1 == "CMultiSensor1234"
+            assert uid2 == "CMultiSensor1234"
+            assert uid2 == uid1
             assert uid1.startswith("C")
             assert uid2.startswith("C")
 
-    def test_lossy_secondary_sensor_varies_observation_counters(self):
-        """Explicit capture loss may vary counters without impossible packet accounting."""
+    def test_missed_bytes_do_not_trigger_emitter_loss_synthesis(self):
+        """A counter alone cannot replace an explicit capture-loss observation."""
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
             conn_emitter = ZeekEmitter(
                 load_format("zeek_conn"), base, sensor_hostnames=["core", "dmz"]
             )
 
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.0.1",
                     src_port=50000,
                     dst_ip="198.51.100.10",
@@ -445,7 +445,7 @@ class TestMultiSensorFanOut:
 
             core = json.loads((base / "core" / "conn.json").read_text())
             dmz = json.loads((base / "dmz" / "conn.json").read_text())
-            varied_fields = {
+            accounting_fields = {
                 "duration",
                 "orig_bytes",
                 "resp_bytes",
@@ -454,7 +454,7 @@ class TestMultiSensorFanOut:
                 "orig_ip_bytes",
                 "resp_ip_bytes",
             }
-            assert any(core[field] != dmz[field] for field in varied_fields)
+            assert all(core[field] == dmz[field] for field in accounting_fields)
             assert dmz["orig_ip_bytes"] >= dmz["orig_bytes"] + dmz["orig_pkts"] * 40
             assert dmz["resp_ip_bytes"] >= dmz["resp_bytes"] + dmz["resp_pkts"] * 40
 
@@ -466,10 +466,10 @@ class TestMultiSensorFanOut:
                 load_format("zeek_conn"), base, sensor_hostnames=["core", "dmz"]
             )
 
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.0.1",
                     src_port=50000,
                     dst_ip="10.0.0.53",
@@ -515,10 +515,9 @@ class TestMultiSensorFanOut:
                 "orig_ip_bytes",
                 "resp_ip_bytes",
             )
-            assert core["uid"] != dmz["uid"]
-            assert core["ts"] != dmz["ts"]
+            assert core["uid"] == dmz["uid"]
+            assert core["ts"] == dmz["ts"]
             assert all(core[field] == dmz[field] for field in locked_fields)
-            assert dmz["duration"] > core["duration"]
-            assert dmz["duration"] - core["duration"] <= 0.05
+            assert dmz["duration"] == core["duration"]
             assert core["orig_ip_bytes"] - core["orig_bytes"] == 28
             assert core["resp_ip_bytes"] - core["resp_bytes"] == 28

@@ -31,15 +31,15 @@ Sub-scores (weights sum to 1.0):
   anomaly_rate        (0.10): Realistic 1-5% anomalous-but-benign event rate.
 """
 
+import hashlib
+import itertools
 import logging
 import math
-import random
 from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from typing import Any
 
 from evidenceforge.evaluation._shared import (
-    _condition_matches,
     _extract_hostname,
     _extract_username,
     _jensen_shannon_divergence,
@@ -56,6 +56,7 @@ from evidenceforge.evaluation.models import PillarScore, SubScore
 from evidenceforge.evaluation.parsers import ParsedRecord
 from evidenceforge.evaluation.rules import load_rules_file
 from evidenceforge.evaluation.visibility import VisibilityModel
+from evidenceforge.events.ids_evaluation import new_ids_digest, update_ids_digest
 from evidenceforge.models.scenario import Scenario
 
 logger = logging.getLogger(__name__)
@@ -85,34 +86,39 @@ class PlausibilityScorer(DimensionScorer):
         context: EvaluationContext | None = None,
         progress: ProgressCallback = _noop_callback,
     ) -> PillarScore:
+        context = context or EvaluationContext()
         enabled = {log_spec["format"] for log_spec in scenario.output.logs if "format" in log_spec}
         vis = VisibilityModel(scenario, enabled)
 
-        progress("sub_score_start", {"name": "Value & OS Plausibility", "step": 1, "total": 6})
+        progress("sub_score_start", {"name": "Value & OS Plausibility", "step": 1, "total": 7})
         s1 = self._score_value_plausibility(records, vis)
         progress("sub_score_done", {"name": "Value & OS Plausibility", "score": s1.score})
 
-        progress("sub_score_start", {"name": "Co-occurrence Rules", "step": 2, "total": 6})
+        progress("sub_score_start", {"name": "Co-occurrence Rules", "step": 2, "total": 7})
         s2 = self._score_co_occurrence(records)
         progress("sub_score_done", {"name": "Co-occurrence Rules", "score": s2.score})
 
-        progress("sub_score_start", {"name": "Distribution Fit", "step": 3, "total": 6})
+        progress("sub_score_start", {"name": "Distribution Fit", "step": 3, "total": 7})
         s3 = self._score_distribution_fit(records)
         progress("sub_score_done", {"name": "Distribution Fit", "score": s3.score})
 
-        progress("sub_score_start", {"name": "Cross-Source Field Agreement", "step": 4, "total": 6})
+        progress("sub_score_start", {"name": "Cross-Source Field Agreement", "step": 4, "total": 7})
         s4 = self._score_field_agreement(records)
         progress("sub_score_done", {"name": "Cross-Source Field Agreement", "score": s4.score})
 
-        progress("sub_score_start", {"name": "User Behavioral Diversity", "step": 5, "total": 6})
+        progress("sub_score_start", {"name": "User Behavioral Diversity", "step": 5, "total": 7})
         s5 = self._score_user_diversity(records)
         progress("sub_score_done", {"name": "User Behavioral Diversity", "score": s5.score})
 
-        progress("sub_score_start", {"name": "Anomaly Rate", "step": 6, "total": 6})
+        progress("sub_score_start", {"name": "Anomaly Rate", "step": 6, "total": 7})
         s6 = self._score_anomaly_rate(records, scenario)
         progress("sub_score_done", {"name": "Anomaly Rate", "score": s6.score})
 
-        sub_scores = [s1, s2, s3, s4, s5, s6]
+        progress("sub_score_start", {"name": "IDS Correlation Integrity", "step": 7, "total": 7})
+        s7 = self._score_ids_integrity(records, scenario, context)
+        progress("sub_score_done", {"name": "IDS Correlation Integrity", "score": s7.score})
+
+        sub_scores = [s1, s2, s3, s4, s5, s6, s7]
         dim_score = aggregate_sub_scores(sub_scores)
 
         return PillarScore(
@@ -195,7 +201,16 @@ class PlausibilityScorer(DimensionScorer):
                         f"({vis.get_os_category(hostname)})"
                     )
 
-        score = (100.0 * plausible / total) if total > 0 else 100.0
+        if total == 0:
+            return SubScore(
+                name="Value & OS Plausibility",
+                key="value_plausibility",
+                weight=0.25,
+                score=None,
+                skipped=True,
+                details="No records expose a checkable host or OS/value contract",
+            )
+        score = 100.0 * plausible / total
         return SubScore(
             name="Value & OS Plausibility",
             key="value_plausibility",
@@ -208,31 +223,68 @@ class PlausibilityScorer(DimensionScorer):
     # --- Sub-score 2: Co-occurrence Rules ---
 
     def _score_co_occurrence(self, records: dict[str, list[ParsedRecord]]) -> SubScore:
-        co_rules = load_rules_file("co_occurrence.yaml")
+        from evidenceforge.evaluation.pillars.parseability import (
+            _get_variant,
+            _normalize_for_validation,
+        )
+        from evidenceforge.evaluation.validation_routes import (
+            get_validation_route,
+            require_evaluated,
+        )
+        from evidenceforge.formats.loader import load_format
+        from evidenceforge.formats.rules import evaluate_rule, rule_fields
+        from evidenceforge.formats.validator import validate_field
+
         total_applicable = 0
         passing = 0
         failures: list[str] = []
-        max_sample = 2000
-
         for format_name, record_list in records.items():
-            rules = co_rules.get(format_name, [])
-            if not rules:
+            route = get_validation_route(format_name)
+            if route.kind == "artifact":
+                continue  # Structural checks run in parseability; email joins run below.
+            definition = load_format(route.validator)
+            diagnostic_rules = [r for r in definition.validators or [] if r.severity == "warning"]
+            if not diagnostic_rules:
                 continue
-            valid = [r for r in record_list if not r.parse_errors]
-            if len(valid) > max_sample:
-                valid = random.sample(valid, max_sample)
+            diagnostic_fields = {name for rule in diagnostic_rules for name in rule_fields(rule)}
+            for record in record_list:
+                if record.parse_errors:
+                    continue
+                normalized = _normalize_for_validation(format_name, record.fields, record.timestamp)
+                variant = _get_variant(format_name, record)
+                fields = definition.validation_fields(variant) or {}
+                invalid_fields = {
+                    name
+                    for name, field in fields.items()
+                    if name in diagnostic_fields
+                    and (
+                        (field.required and name not in normalized)
+                        or (
+                            name in normalized and not validate_field(field, normalized[name]).valid
+                        )
+                    )
+                }
+                for rule in diagnostic_rules:
+                    finding = evaluate_rule(rule, normalized, format_name, variant, invalid_fields)
+                    require_evaluated(finding)
+                    if finding.severity != "warning" or finding.outcome == "not_applicable":
+                        continue
+                    total_applicable += 1
+                    if finding.outcome == "pass":
+                        passing += 1
+                    elif len(failures) < 10:
+                        failures.append(f"[{format_name}] {finding.rule_id}: {finding.message}")
 
-            for record in valid:
-                for rule in rules:
-                    if _condition_matches(rule.get("condition", {}), record.fields):
-                        total_applicable += 1
-                        checks = rule.get("checks", [])
-                        if all(_check_passes(chk, record.fields) for chk in checks):
-                            passing += 1
-                        elif len(failures) < 10:
-                            failures.append(f"[{format_name}] Rule '{rule['name']}' failed")
-
-        score = (100.0 * passing / total_applicable) if total_applicable > 0 else 100.0
+        if total_applicable == 0:
+            return SubScore(
+                name="Co-occurrence Rules",
+                key="co_occurrence",
+                weight=0.20,
+                score=None,
+                skipped=True,
+                details="No configured co-occurrence rule applies to this dataset",
+            )
+        score = 100.0 * passing / total_applicable
         return SubScore(
             name="Co-occurrence Rules",
             key="co_occurrence",
@@ -287,12 +339,13 @@ class PlausibilityScorer(DimensionScorer):
                 divergence_scores.append(field_score)
                 details_parts.append(f"{format_name}.{field_name}: {field_score:.0f}")
 
-        score = sum(divergence_scores) / len(divergence_scores) if divergence_scores else 100.0
+        score = sum(divergence_scores) / len(divergence_scores) if divergence_scores else None
         return SubScore(
             name="Distribution Fit",
             key="distribution_fit",
             weight=0.15,
             score=score,
+            skipped=not divergence_scores,
             details="; ".join(details_parts) if details_parts else "No distribution profiles",
         )
 
@@ -305,7 +358,8 @@ class PlausibilityScorer(DimensionScorer):
                 name="Cross-Source Field Agreement",
                 key="field_agreement",
                 weight=0.15,
-                score=100.0,
+                score=None,
+                skipped=True,
                 details="No pair definitions loaded",
             )
 
@@ -344,7 +398,30 @@ class PlausibilityScorer(DimensionScorer):
         if len(failures) < 10:
             failures.extend(email_failures[: 10 - len(failures)])
 
-        score = (100.0 * total_agreeing / total_matched) if total_matched > 0 else 100.0
+        http_matched, http_agreeing, http_failures = _score_http_file_consistency(records)
+        total_matched += http_matched
+        total_agreeing += http_agreeing
+        if len(failures) < 10:
+            failures.extend(http_failures[: 10 - len(failures)])
+
+        crypto_matched, crypto_agreeing, crypto_failures = (
+            _score_cryptographic_protocol_consistency(records)
+        )
+        total_matched += crypto_matched
+        total_agreeing += crypto_agreeing
+        if len(failures) < 10:
+            failures.extend(crypto_failures[: 10 - len(failures)])
+
+        if total_matched == 0:
+            return SubScore(
+                name="Cross-Source Field Agreement",
+                key="field_agreement",
+                weight=0.15,
+                score=None,
+                skipped=True,
+                details="No configured cross-source pivots were jointly observable",
+            )
+        score = 100.0 * total_agreeing / total_matched
         return SubScore(
             name="Cross-Source Field Agreement",
             key="field_agreement",
@@ -357,8 +434,6 @@ class PlausibilityScorer(DimensionScorer):
     # --- Sub-score 5: User Behavioral Diversity ---
 
     def _score_user_diversity(self, records: dict[str, list[ParsedRecord]]) -> SubScore:
-        import itertools
-
         user_types: dict[str, Counter] = defaultdict(Counter)
         for _fmt, record_list in records.items():
             for record in record_list:
@@ -377,22 +452,19 @@ class PlausibilityScorer(DimensionScorer):
                 details="Fewer than 2 users with sufficient data — skipped",
             )
 
-        user_list = list(users_with_data.keys())
+        user_list = sorted(users_with_data)
         total_pairs = len(user_list) * (len(user_list) - 1) // 2
         max_pairs = 200
 
         if total_pairs <= max_pairs:
             pairs = list(itertools.combinations(range(len(user_list)), 2))
         else:
-            pairs_set: set = set()
-            while len(pairs_set) < max_pairs:
-                import random as _rng
-
-                i = _rng.randrange(len(user_list))
-                j = _rng.randrange(len(user_list))
-                if i != j:
-                    pairs_set.add((min(i, j), max(i, j)))
-            pairs = list(pairs_set)
+            pairs = sorted(
+                itertools.combinations(range(len(user_list)), 2),
+                key=lambda pair: hashlib.sha256(
+                    f"{user_list[pair[0]]}\0{user_list[pair[1]]}".encode()
+                ).digest(),
+            )[:max_pairs]
 
         similarities: list[float] = []
         for i, j in pairs:
@@ -453,8 +525,161 @@ class PlausibilityScorer(DimensionScorer):
             details=f"{anomalous}/{total} events anomalous ({rate:.1%}), target 1-5%",
         )
 
+    def _score_ids_integrity(
+        self,
+        records: dict[str, list[ParsedRecord]],
+        scenario: Scenario,
+        context: EvaluationContext,
+    ) -> SubScore:
+        """Reconcile rendered alerts with canonical sensor-local IDS ground truth."""
+
+        document = context.ground_truth
+        if document is None or document.ids_evaluation is None:
+            if _scenario_has_ids_attachments(scenario):
+                return SubScore(
+                    name="IDS Correlation Integrity",
+                    key="ids_integrity",
+                    weight=0.0,
+                    score=0.0,
+                    details="Authored ids_alerts require GROUND_TRUTH.json ids_evaluation",
+                    sample_failures=["Missing or invalid IDS evaluation ground truth"],
+                )
+            return SubScore(
+                name="IDS Correlation Integrity",
+                key="ids_integrity",
+                weight=0.0,
+                score=None,
+                skipped=True,
+                details="Legacy dataset has no IDS evaluation summary; check skipped",
+            )
+
+        checks = 0
+        passing = 0
+        failures: list[str] = []
+
+        def check(condition: bool, message: str) -> None:
+            nonlocal checks, passing
+            checks += 1
+            if condition:
+                passing += 1
+            elif len(failures) < 10:
+                failures.append(message)
+
+        for event in document.events:
+            for attachment in event.attributes.ids_alerts or []:
+                candidate = int(attachment.get("candidate", 0))
+                emitted = int(attachment.get("emitted", 0))
+                filtered = int(attachment.get("policy_filtered", 0))
+                check(
+                    candidate == emitted + filtered,
+                    f"{event.storyline_id} SID {attachment.get('sid')} totals disagree",
+                )
+
+        actual: dict[str, dict[str, dict[str, Any]]] = {}
+        for record in records.get("snort_alert", []):
+            if record.parse_errors or record.timestamp is None:
+                continue
+            sensor = record.source_instance or "__direct__"
+            key = f"{int(record.fields.get('gid', 1))}:{int(record.fields['sid'])}"
+            summary = actual.setdefault(sensor, {}).setdefault(
+                key,
+                {"emitted": 0, "digest": new_ids_digest()},
+            )
+            summary["emitted"] += 1
+            update_ids_digest(
+                summary["digest"],
+                sensor,
+                record.fields | {"timestamp": record.timestamp},
+            )
+
+        expected_keys = {
+            (sensor, key)
+            for sensor, signatures in document.ids_evaluation.sensors.items()
+            for key in signatures
+        }
+        actual_keys = {(sensor, key) for sensor, signatures in actual.items() for key in signatures}
+        for sensor, key in sorted(expected_keys | actual_keys):
+            expected = document.ids_evaluation.sensors.get(sensor, {}).get(key)
+            observed = actual.get(sensor, {}).get(key)
+            check(expected is not None, f"Unexpected Snort rows for {sensor} {key}")
+            check(observed is not None, f"Missing Snort rows for {sensor} {key}")
+            if expected is None or observed is None:
+                continue
+            check(
+                expected.emitted == observed["emitted"],
+                f"{sensor} {key} emitted {observed['emitted']} != expected {expected.emitted}",
+            )
+            check(
+                expected.emitted_sha256 == observed["digest"].hexdigest(),
+                f"{sensor} {key} normalized alert digest differs",
+            )
+
+        observation = document.ids_evaluation.observation
+        signatures = [
+            signature
+            for sensor_signatures in document.ids_evaluation.sensors.values()
+            for signature in sensor_signatures.values()
+        ]
+        rendered = sum(signature.emitted for signature in signatures)
+        policy_filtered = sum(signature.policy_filtered for signature in signatures)
+        check(
+            rendered == observation.get("visible", 0) + observation.get("delayed", 0),
+            "IDS visible/delayed totals do not equal rendered alerts",
+        )
+        check(
+            observation.get("filtered", 0) >= policy_filtered,
+            "IDS filtered observation total is lower than policy-filtered candidates",
+        )
+        source_observation: dict[str, int] = {}
+        for source_status in document.source_evidence_status.values():
+            for status, count in source_status.get("ids", {}).items():
+                source_observation[status] = source_observation.get(status, 0) + count
+        check(
+            source_observation == observation,
+            "IDS summary disagrees with ground-truth source_evidence_status",
+        )
+        if context.observation_manifest is not None:
+            check(
+                context.observation_manifest.source_summary.get("ids", {}) == observation,
+                "IDS summary disagrees with OBSERVATION_MANIFEST.json",
+            )
+
+        score = 100.0 * passing / checks if checks else 100.0
+        return SubScore(
+            name="IDS Correlation Integrity",
+            key="ids_integrity",
+            weight=0.0,
+            score=score,
+            details=f"{passing}/{checks} IDS integrity checks pass",
+            sample_failures=failures,
+        )
+
 
 # --- Module-level helpers ---
+
+
+def _stable_records(records: list[ParsedRecord], limit: int) -> list[ParsedRecord]:
+    """Select a repeatable bounded record sample independent of process RNG state."""
+
+    return sorted(
+        records,
+        key=lambda record: hashlib.sha256(
+            (
+                f"{record.source_format}\0{record.source_instance or ''}\0"
+                f"{record.line_number or 0}\0{record.raw}"
+            ).encode()
+        ).digest(),
+    )[:limit]
+
+
+def _scenario_has_ids_attachments(scenario: Scenario) -> bool:
+    """Return whether a typed storyline or red-herring event authors IDS attachments."""
+
+    return any(
+        bool(getattr(spec, "ids_alerts", None))
+        for cluster in (*(scenario.storyline or []), *(scenario.red_herrings or []))
+        for spec in cluster.events
+    )
 
 
 def _check_os_plausibility(record: ParsedRecord, fmt: str) -> bool | None:
@@ -471,36 +696,6 @@ def _check_os_plausibility(record: ParsedRecord, fmt: str) -> bool | None:
             return False
         return True
     return None
-
-
-def _check_passes(check: dict[str, Any], fields: dict[str, Any]) -> bool:
-    field_name = check.get("field", "")
-    value = fields.get(field_name)
-    if "present" in check:
-        return value is not None
-    if "not_equal" in check:
-        return value is not None and value != check["not_equal"]
-    if "equals" in check:
-        return value == check["equals"]
-    if "min_length" in check:
-        return isinstance(value, str) and len(value) >= check["min_length"]
-    if "min_value" in check or "max_value" in check:
-        try:
-            v = int(value) if not isinstance(value, (int, float)) else value
-            if "min_value" in check and v < check["min_value"]:
-                return False
-            if "max_value" in check and v > check["max_value"]:
-                return False
-            return True
-        except (ValueError, TypeError):
-            return False
-    if "in" in check:
-        return value in check["in"]
-    if "matches" in check:
-        import re
-
-        return bool(re.search(check["matches"], str(value or "")))
-    return True
 
 
 def _coerce_key(value: Any, reference: dict) -> Any:
@@ -715,6 +910,235 @@ def _score_email_evidence_consistency(
                 agreeing += 1
             elif len(failures) < 10:
                 failures.append(f"email artifact subject disagrees for msg_id {msg_id}")
+
+    return matched, agreeing, failures
+
+
+def _score_http_file_consistency(
+    records: dict[str, list[ParsedRecord]],
+) -> tuple[int, int, list[str]]:
+    """Return HTTP-to-files FUID, direction, MIME, size, and UID agreement."""
+
+    file_index = {
+        (record.source_instance, str(record.fields.get("fuid"))): record
+        for record in records.get("zeek_files", [])
+        if record.fields.get("fuid")
+    }
+    matched = 0
+    agreeing = 0
+    failures: list[str] = []
+
+    def check(condition: bool, message: str) -> None:
+        nonlocal matched, agreeing
+        matched += 1
+        if condition:
+            agreeing += 1
+        elif len(failures) < 10:
+            failures.append(message)
+
+    for http in records.get("zeek_http", []):
+        for side, is_orig, body_field in (
+            ("orig", True, "request_body_len"),
+            ("resp", False, "response_body_len"),
+        ):
+            fuids = http.fields.get(f"{side}_fuids") or []
+            if not isinstance(fuids, list):
+                fuids = [fuids]
+            mime_types = http.fields.get(f"{side}_mime_types") or []
+            filenames = http.fields.get(f"{side}_filenames") or []
+            referenced_files: list[ParsedRecord] = []
+            for fuid in fuids:
+                file_record = file_index.get((http.source_instance, str(fuid)))
+                check(file_record is not None, f"HTTP {side} fuid {fuid} has no files.log row")
+                if file_record is None:
+                    continue
+                referenced_files.append(file_record)
+                fields = file_record.fields
+                check(
+                    fields.get("is_orig") is is_orig, f"HTTP {side} fuid {fuid} direction differs"
+                )
+                conn_uids = fields.get("conn_uids") or []
+                check(http.fields.get("uid") in conn_uids, f"HTTP {side} fuid {fuid} UID differs")
+            body_len = http.fields.get(body_field)
+            if isinstance(body_len, int) and referenced_files:
+                ordinary = (
+                    len(referenced_files) == 1
+                    and referenced_files[0].fields.get("total_bytes") == body_len
+                )
+                if ordinary:
+                    check(
+                        referenced_files[0].fields.get("total_bytes") == body_len,
+                        f"HTTP {side} fuid {fuids[0]} size differs",
+                    )
+                else:
+                    observed_leaf_bytes = sum(
+                        int(record.fields.get("seen_bytes") or 0) for record in referenced_files
+                    )
+                    check(
+                        observed_leaf_bytes <= body_len,
+                        f"HTTP {side} multipart leaf bytes exceed the entity body",
+                    )
+
+            candidate_mimes = [
+                record.fields.get("mime_type")
+                for record in referenced_files
+                if record.fields.get("mime_type")
+            ]
+            candidate_filenames = [
+                record.fields.get("filename")
+                for record in referenced_files
+                if record.fields.get("filename")
+            ]
+            if mime_types:
+                check(
+                    all(
+                        candidate_mimes.count(value) >= mime_types.count(value)
+                        for value in mime_types
+                    ),
+                    f"HTTP {side} sparse MIME projection differs from files.log",
+                )
+            if filenames:
+                check(
+                    all(
+                        candidate_filenames.count(value) >= filenames.count(value)
+                        for value in filenames
+                    ),
+                    f"HTTP {side} sparse filename projection differs from files.log",
+                )
+    return matched, agreeing, failures
+
+
+def _score_cryptographic_protocol_consistency(
+    records: dict[str, list[ParsedRecord]],
+) -> tuple[int, int, list[str]]:
+    """Probe rendered DKIM, OCSP, and TLS-chain payload contracts."""
+
+    import base64
+    import binascii
+    from urllib.parse import unquote
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.ocsp import load_der_ocsp_request
+
+    matched = 0
+    agreeing = 0
+    failures: list[str] = []
+
+    for record in records.get("zeek_dns", []):
+        query = str(record.fields.get("query", "")).lower()
+        if "._domainkey." not in query:
+            continue
+        answers = record.fields.get("answers") or []
+        answers = answers if isinstance(answers, list) else [answers]
+        for answer in answers:
+            value = str(answer)
+            public_value = next(
+                (
+                    segment.split("=", 1)[1].strip()
+                    for segment in value.split(";")
+                    if segment.strip().lower().startswith("p=")
+                ),
+                "",
+            )
+            matched += 1
+            try:
+                padded = public_value + "=" * ((4 - len(public_value) % 4) % 4)
+                public_key = serialization.load_der_public_key(
+                    base64.b64decode(padded, validate=True)
+                )
+                valid = (
+                    isinstance(public_key, rsa.RSAPublicKey)
+                    and public_key.key_size >= 2048
+                    and public_key.public_numbers().e == 65537
+                )
+            except (ValueError, TypeError, binascii.Error):
+                valid = False
+            if valid:
+                agreeing += 1
+            elif len(failures) < 10:
+                failures.append(f"DKIM TXT key for {query} is not valid RSA SPKI")
+
+    ocsp_by_id = {
+        str(record.fields.get("id")): record
+        for record in records.get("zeek_ocsp", [])
+        if record.fields.get("id")
+    }
+    for record in records.get("zeek_http", []):
+        mime_types = record.fields.get("resp_mime_types") or []
+        if "application/ocsp-response" not in mime_types:
+            continue
+        fuids = record.fields.get("resp_fuids") or []
+        if not isinstance(fuids, list):
+            fuids = [fuids]
+        response = next((ocsp_by_id.get(str(fuid)) for fuid in fuids if fuid), None)
+        matched += 1
+        try:
+            encoded = unquote(str(record.fields.get("uri", "")).lstrip("/"))
+            request = load_der_ocsp_request(base64.b64decode(encoded, validate=True))
+            response_fields = response.fields if response is not None else {}
+            hash_algorithm = response_fields.get(
+                "hash_algorithm", response_fields.get("hashAlgorithm")
+            )
+            issuer_name_hash = response_fields.get(
+                "issuer_name_hash", response_fields.get("issuerNameHash")
+            )
+            issuer_key_hash = response_fields.get(
+                "issuer_key_hash", response_fields.get("issuerKeyHash")
+            )
+            serial_number = response_fields.get(
+                "serial_number", response_fields.get("serialNumber", "0")
+            )
+            valid = (
+                response is not None
+                and request.hash_algorithm.name == hash_algorithm
+                and request.issuer_name_hash.hex() == issuer_name_hash
+                and request.issuer_key_hash.hex() == issuer_key_hash
+                and request.serial_number == int(str(serial_number), 16)
+            )
+        except (ValueError, TypeError, binascii.Error):
+            valid = False
+        if valid:
+            agreeing += 1
+        elif len(failures) < 10:
+            failures.append("OCSP HTTP request does not match its ocsp.log response identity")
+
+    x509_by_id = {
+        str(record.fields.get("id")): record.fields
+        for record in records.get("zeek_x509", [])
+        if record.fields.get("id")
+    }
+    presentations: dict[tuple[str, str], tuple[str, ...]] = {}
+    for record in records.get("zeek_ssl", []):
+        fuids = record.fields.get("cert_chain_fuids") or []
+        if not isinstance(fuids, list) or not fuids:
+            continue
+        # A partial input sample cannot establish chain composition. This is
+        # common when evaluating a filtered source slice, so only score fully
+        # observable presentations rather than treating missing x509 rows as
+        # malformed cryptographic material.
+        if any(str(fuid) not in x509_by_id for fuid in fuids):
+            continue
+        chain = tuple(str(x509_by_id.get(str(fuid), {}).get("fingerprint", "")) for fuid in fuids)
+        if any(not fingerprint for fingerprint in chain):
+            continue
+        leaf_fingerprint = chain[0]
+        key = (str(record.fields.get("server_name", "")), leaf_fingerprint)
+        matched += 1
+        root_transmitted = any(
+            x509_by_id.get(str(fuid), {}).get("basic_constraints.ca") is True
+            and x509_by_id.get(str(fuid), {}).get("certificate.subject")
+            == x509_by_id.get(str(fuid), {}).get("certificate.issuer")
+            for fuid in fuids[1:]
+        )
+        previous = presentations.setdefault(key, chain)
+        valid = bool(leaf_fingerprint) and not root_transmitted and previous == chain
+        if valid:
+            agreeing += 1
+        elif len(failures) < 10:
+            failures.append(
+                "TLS chain presentation is unstable or includes a self-signed trust anchor"
+            )
 
     return matched, agreeing, failures
 

@@ -25,16 +25,15 @@
 import json
 import random
 import tempfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import yaml
+import pytest
 
-from evidenceforge.events.base import SecurityEvent
+from evidenceforge.events.base import OccurrenceBuilder
 from evidenceforge.events.contexts import (
     FileTransferContext,
     HttpContext,
-    NetworkContext,
     PeContext,
     SslContext,
     X509Context,
@@ -43,14 +42,17 @@ from evidenceforge.formats import load_format
 from evidenceforge.generation.actions.file_transfer import (
     HttpResponseFileTransferActionBundle,
     HttpResponseFileTransferRequest,
-    SmbFileTransferMetadataActionBundle,
-    SmbFileTransferMetadataRequest,
 )
 from evidenceforge.generation.emitters.zeek import ZeekEmitter
-from evidenceforge.generation.emitters.zeek_files import ZeekFilesEmitter
+from evidenceforge.generation.emitters.zeek_files import (
+    ZeekFilesEmitter,
+    _bounded_file_transfer_observation,
+    _related_http_analyzer_timestamp,
+)
 from evidenceforge.generation.emitters.zeek_http import ZeekHttpEmitter
-from evidenceforge.generation.emitters.zeek_pe import ZeekPeEmitter
+from evidenceforge.generation.emitters.zeek_pe import ZeekPeEmitter, _pe_analyzer_timestamp
 from evidenceforge.generation.emitters.zeek_ssl import ZeekSslEmitter
+from tests.network_factories import network_plan
 
 
 class _AlwaysPeRandom(random.Random):
@@ -87,6 +89,31 @@ class TestFilesFormatAccuracy:
         assert isinstance(real["seen_bytes"], int)
         assert isinstance(real["is_orig"], bool)
         assert isinstance(real["timedout"], bool)
+
+    @pytest.mark.parametrize(
+        ("field_name", "analyzer", "digest"),
+        (
+            ("md5", "MD5", "a" * 32),
+            ("sha1", "SHA1", "b" * 40),
+            ("sha256", "SHA256", "c" * 64),
+        ),
+    )
+    def test_digest_result_requires_matching_analyzer(
+        self,
+        field_name: str,
+        analyzer: str,
+        digest: str,
+    ) -> None:
+        """Canonical file analysis must not carry a digest without its provenance."""
+
+        with pytest.raises(ValueError, match=analyzer):
+            FileTransferContext(**{field_name: digest})
+
+        context = FileTransferContext(
+            analyzers=("MIME", analyzer.lower()),
+            **{field_name: digest},
+        )
+        assert context.analyzers == ("MIME", analyzer.lower())
 
     def test_emitter_output_fields(self):
         """Emitter produces all files.log fields with correct types."""
@@ -137,10 +164,10 @@ class TestFilesFormatAccuracy:
             output = Path(tmpdir) / "files.json"
             emitter = ZeekFilesEmitter(fmt, output)
             emitter.emit(
-                SecurityEvent(
+                OccurrenceBuilder(
                     timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                     event_type="connection",
-                    network=NetworkContext(
+                    network=network_plan(
                         zeek_uid="CInboundSmtpFile1",
                         src_ip="198.51.100.77",
                         src_port=25,
@@ -160,10 +187,10 @@ class TestFilesFormatAccuracy:
                 )
             )
             emitter.emit(
-                SecurityEvent(
+                OccurrenceBuilder(
                     timestamp=datetime(2024, 1, 15, 10, 0, 1, tzinfo=UTC),
                     event_type="connection",
-                    network=NetworkContext(
+                    network=network_plan(
                         zeek_uid="COutboundSmtpFile1",
                         src_ip="10.55.20.25",
                         src_port=25,
@@ -187,6 +214,12 @@ class TestFilesFormatAccuracy:
             rows = [json.loads(line) for line in output.read_text().splitlines()]
             assert rows[0]["local_orig"] is False
             assert rows[1]["local_orig"] is True
+            assert rows[0]["is_orig"] is True
+            assert rows[0]["tx_hosts"] == ["198.51.100.77"]
+            assert rows[0]["rx_hosts"] == ["10.55.10.31"]
+            assert rows[1]["is_orig"] is True
+            assert rows[1]["tx_hosts"] == ["10.55.20.25"]
+            assert rows[1]["rx_hosts"] == ["203.0.113.88"]
 
     def test_fuid_has_f_prefix(self):
         """fuid should start with 'F' prefix."""
@@ -203,10 +236,10 @@ class TestFilesCanHandle:
     def test_accepts_connection_with_file_transfer(self):
         fmt = load_format("zeek_files")
         emitter = ZeekFilesEmitter(fmt, Path("/tmp/test.json"))
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.0.1", src_port=50000, dst_ip="8.8.8.8", dst_port=80, protocol="tcp"
             ),
             file_transfer=FileTransferContext(fuid="FTest12345678901", source="HTTP"),
@@ -216,10 +249,10 @@ class TestFilesCanHandle:
     def test_accepts_smb_file_transfer_source(self):
         fmt = load_format("zeek_files")
         emitter = ZeekFilesEmitter(fmt, Path("/tmp/test.json"))
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.0.1",
                 src_port=50000,
                 dst_ip="10.0.0.10",
@@ -238,10 +271,10 @@ class TestFilesCanHandle:
     def test_rejects_without_file_transfer(self):
         fmt = load_format("zeek_files")
         emitter = ZeekFilesEmitter(fmt, Path("/tmp/test.json"))
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.0.0.1", src_port=50000, dst_ip="8.8.8.8", dst_port=80, protocol="tcp"
             ),
         )
@@ -258,10 +291,10 @@ class TestFilesUidCorrelation:
             output = Path(tmpdir) / "files.json"
             emitter = ZeekFilesEmitter(fmt, output)
 
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.0.1",
                     src_port=50000,
                     dst_ip="8.8.8.8",
@@ -291,10 +324,10 @@ class TestFilesUidCorrelation:
         with tempfile.TemporaryDirectory() as tmpdir:
             output = Path(tmpdir) / "files.json"
             emitter = ZeekFilesEmitter(fmt, output)
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.0.1",
                     src_port=50000,
                     dst_ip="10.0.0.10",
@@ -325,10 +358,10 @@ class TestFilesUidCorrelation:
         with tempfile.TemporaryDirectory() as tmpdir:
             output = Path(tmpdir) / "files.json"
             emitter = ZeekFilesEmitter(fmt, output)
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.0.1",
                     src_port=50000,
                     dst_ip="10.0.0.10",
@@ -362,10 +395,10 @@ class TestFilesUidCorrelation:
         with tempfile.TemporaryDirectory() as tmpdir:
             out_dir = Path(tmpdir)
             emitter = ZeekEmitter(conn_fmt, out_dir, sensor_hostnames=["core", "dmz"])
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.0.1",
                     src_port=50000,
                     dst_ip="10.0.0.10",
@@ -411,10 +444,10 @@ class TestFilesUidCorrelation:
             files_output = Path(tmpdir) / "files.json"
             http_emitter = ZeekHttpEmitter(http_fmt, http_output)
             files_emitter = ZeekFilesEmitter(files_fmt, files_output)
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.0.1",
                     src_port=50000,
                     dst_ip="10.0.0.10",
@@ -449,8 +482,8 @@ class TestFilesUidCorrelation:
         assert file_row["ts"] > http_row["ts"]
         assert file_row["ts"] - http_row["ts"] > 0.005
 
-    def test_http_file_timestamp_uses_final_monotonic_http_timestamp(self):
-        """files.log should follow http.log after same-UID timestamp repairs."""
+    def test_http_file_timestamp_follows_its_own_frozen_http_transaction(self):
+        """files.log follows its transaction without emitter-order timestamp repair."""
         files_fmt = load_format("zeek_files")
         http_fmt = load_format("zeek_http")
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -458,7 +491,7 @@ class TestFilesUidCorrelation:
             files_output = Path(tmpdir) / "files.json"
             http_emitter = ZeekHttpEmitter(http_fmt, http_output)
             files_emitter = ZeekFilesEmitter(files_fmt, files_output)
-            network = NetworkContext(
+            network = network_plan(
                 src_ip="10.0.0.1",
                 src_port=50000,
                 dst_ip="10.0.0.10",
@@ -468,7 +501,7 @@ class TestFilesUidCorrelation:
                 zeek_uid="CHttpUIDShared1",
                 duration=2.0,
             )
-            first = SecurityEvent(
+            first = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, 500000, tzinfo=UTC),
                 event_type="connection",
                 network=network,
@@ -478,7 +511,7 @@ class TestFilesUidCorrelation:
                     trans_depth=1,
                 ),
             )
-            second = SecurityEvent(
+            second = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                 event_type="connection",
                 network=network,
@@ -507,8 +540,8 @@ class TestFilesUidCorrelation:
             file_row = json.loads(files_output.read_text().splitlines()[0])
 
         assert len(http_rows) == 2
-        assert http_rows[1]["ts"] > http_rows[0]["ts"]
-        assert file_row["ts"] > http_rows[1]["ts"]
+        http_by_depth = {row["trans_depth"]: row for row in http_rows}
+        assert file_row["ts"] > http_by_depth[2]["ts"]
 
     def test_pe_timestamp_follows_parent_http_file_timestamp(self):
         """pe.log analysis should not predate the owning HTTP/files.log artifact."""
@@ -522,10 +555,10 @@ class TestFilesUidCorrelation:
             http_emitter = ZeekHttpEmitter(http_fmt, http_output)
             files_emitter = ZeekFilesEmitter(files_fmt, files_output)
             pe_emitter = ZeekPeEmitter(pe_fmt, pe_output)
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, 138017, tzinfo=UTC),
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.0.1",
                     src_port=50000,
                     dst_ip="10.0.0.10",
@@ -585,8 +618,67 @@ class TestFilesUidCorrelation:
         assert isinstance(result.pe.compile_ts, int)
         assert result.pe.compile_ts <= int(request.timestamp.timestamp()) - (30 * 24 * 60 * 60)
 
-    def test_http_file_analysis_loss_suppresses_hash_and_pe_analyzers(self):
-        """Partial HTTP file observations should not claim full-content analyzers."""
+    def test_request_pe_timestamp_uses_its_directional_file_transfer(self):
+        """PE timing follows the referenced upload when both HTTP directions have files."""
+
+        event = OccurrenceBuilder(
+            timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
+            event_type="connection",
+            network=network_plan(
+                src_ip="10.0.0.1",
+                src_port=50000,
+                dst_ip="10.0.0.10",
+                dst_port=80,
+                protocol="tcp",
+                service="http",
+                conn_state="SF",
+                zeek_uid="CBidirectionalPe1",
+                duration=2.0,
+            ),
+            http=HttpContext(
+                method="POST",
+                host="upload.example.test",
+                uri="/accept",
+                request_body_len=8192,
+                response_body_len=4096,
+                orig_fuids=("FUploadPe1234567",),
+                orig_mime_types=("application/x-msdownload",),
+                resp_fuids=("FResponse1234567",),
+                resp_mime_types=("application/octet-stream",),
+            ),
+            file_transfer=FileTransferContext(
+                fuid="FResponse1234567",
+                source="HTTP",
+                is_orig=False,
+                duration=0.02,
+                seen_bytes=4096,
+                total_bytes=4096,
+            ),
+            file_transfers=[
+                FileTransferContext(
+                    fuid="FUploadPe1234567",
+                    source="HTTP",
+                    is_orig=True,
+                    duration=0.4,
+                    seen_bytes=8192,
+                    total_bytes=8192,
+                )
+            ],
+            pe=PeContext(id="FUploadPe1234567", compile_ts=1_700_000_000),
+        )
+        upload = next(transfer for transfer in event.protocol.file_transfers if transfer.is_orig)
+
+        file_ts, file_duration = _bounded_file_transfer_observation(
+            event,
+            min_start=_related_http_analyzer_timestamp(event, upload),
+            file_transfer=upload,
+        )
+        pe_ts = _pe_analyzer_timestamp(event)
+
+        assert file_ts < pe_ts < file_ts + timedelta(seconds=file_duration)
+
+    def test_http_file_analysis_stays_complete_until_sensor_observation(self):
+        """Canonical HTTP content stays complete until the sensor plans capture loss."""
         request = HttpResponseFileTransferRequest(
             host="updates.example.test",
             uri="/agent.exe",
@@ -600,13 +692,13 @@ class TestFilesUidCorrelation:
         result = HttpResponseFileTransferActionBundle(request, _AlwaysPeRandom()).execute()
         ft = result.file_transfer
 
-        assert ft.timedout is True
-        assert ft.missing_bytes > 0
-        assert ft.seen_bytes == request.response_body_len - ft.missing_bytes
+        assert ft.timedout is False
+        assert ft.missing_bytes == 0
+        assert ft.seen_bytes == request.response_body_len
         assert ft.total_bytes == request.response_body_len
-        assert ft.analyzers == []
-        assert ft.sha1 == ""
-        assert result.pe is None
+        assert ft.analyzers == ("SHA1",)
+        assert ft.sha1
+        assert result.pe is not None
 
     def test_certificate_file_timestamp_follows_parent_ssl_record(self):
         """Certificate files should not predate the owning ssl.log row."""
@@ -623,10 +715,10 @@ class TestFilesUidCorrelation:
                 certificate_subject="CN=updates.example.test",
                 certificate_issuer="CN=Example Issuer",
             )
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.0.1",
                     src_port=50000,
                     dst_ip="10.0.0.10",
@@ -667,10 +759,10 @@ class TestFilesUidCorrelation:
                 certificate_subject="CN=short.example.test",
                 certificate_issuer="CN=Example Issuer",
             )
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=base_ts,
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.0.1",
                     src_port=50000,
                     dst_ip="10.0.0.10",
@@ -722,10 +814,10 @@ class TestFilesUidCorrelation:
                 certificate_issuer="CN=Example Root",
                 host_cert=False,
             )
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.0.1",
                     src_port=50000,
                     dst_ip="10.0.0.10",
@@ -763,10 +855,10 @@ class TestFilesUidCorrelation:
             output = Path(tmpdir) / "files.json"
             emitter = ZeekFilesEmitter(fmt, output)
             for idx, fuid in enumerate(("Fcert11111111111", "Fcert22222222222")):
-                event = SecurityEvent(
+                event = OccurrenceBuilder(
                     timestamp=datetime(2024, 1, 15, 10, 0, idx, tzinfo=UTC),
                     event_type="connection",
-                    network=NetworkContext(
+                    network=network_plan(
                         src_ip="10.0.0.1",
                         src_port=50000 + idx,
                         dst_ip="8.8.8.8",
@@ -802,10 +894,10 @@ class TestFilesUidCorrelation:
             output = Path(tmpdir) / "files.json"
             emitter = ZeekFilesEmitter(fmt, output)
             for idx, name in enumerate(("api.example.com", "cdn.example.net", "login.example.org")):
-                event = SecurityEvent(
+                event = OccurrenceBuilder(
                     timestamp=datetime(2024, 1, 15, 10, 0, idx, tzinfo=UTC),
                     event_type="connection",
-                    network=NetworkContext(
+                    network=network_plan(
                         src_ip="10.0.0.1",
                         src_port=50000 + idx,
                         dst_ip="8.8.8.8",
@@ -835,10 +927,10 @@ class TestFilesUidCorrelation:
             output = Path(tmpdir) / "files.json"
             emitter = ZeekFilesEmitter(fmt, output)
 
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.0.1",
                     src_port=50000,
                     dst_ip="10.0.0.10",
@@ -851,9 +943,9 @@ class TestFilesUidCorrelation:
                     source="SMB",
                     analyzers=["MD5", "SHA1", "SHA256"],
                     seen_bytes=4096,
-                    md5="0" * 32,
-                    sha1="1" * 40,
-                    sha256="2" * 64,
+                    md5="A" * 32,
+                    sha1="B" * 40,
+                    sha256="C" * 64,
                 ),
             )
             emitter.emit(event)
@@ -862,9 +954,9 @@ class TestFilesUidCorrelation:
             with open(output) as f:
                 data = json.loads(f.readline())
 
-            assert data["md5"] == "0" * 32
-            assert data["sha1"] == "1" * 40
-            assert data["sha256"] == "2" * 64
+            assert data["md5"] == "a" * 32
+            assert data["sha1"] == "b" * 40
+            assert data["sha256"] == "c" * 64
 
     def test_smb_filename_renders_when_present(self):
         """SMB files.log rows should include Zeek filename when the context has one."""
@@ -873,10 +965,10 @@ class TestFilesUidCorrelation:
             output = Path(tmpdir) / "files.json"
             emitter = ZeekFilesEmitter(fmt, output)
 
-            event = SecurityEvent(
+            event = OccurrenceBuilder(
                 timestamp=datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC),
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.0.0.1",
                     src_port=50000,
                     dst_ip="10.0.0.10",
@@ -898,98 +990,3 @@ class TestFilesUidCorrelation:
                 data = json.loads(f.readline())
 
             assert data["filename"] == r"\\files01\Shared\Finance\budget-review.xlsx"
-
-    def test_smb_file_analysis_loss_suppresses_hash_analyzers(self):
-        """Partial SMB file observations should not claim full-content hashes."""
-        request = SmbFileTransferMetadataRequest(
-            src_ip="10.0.0.5",
-            dst_ip="10.0.0.10",
-            transfer_bytes=4_000_000,
-            duration=2.5,
-            server="FILE-SRV-01",
-            user="alex",
-        )
-        smb_config = {
-            "min_transfer_bytes": 1,
-            "missing_bytes_probability": 1.0,
-            "timeout_probability": 1.0,
-            "mime_types": [{"mime_type": "application/zip", "weight": 1}],
-            "analyzer_sets": [{"analyzers": ["MD5", "SHA1"], "weight": 1}],
-            "filename_templates": [
-                {
-                    "mime_types": ["application/zip"],
-                    "templates": [r"\\{server}\Installers\agent.zip"],
-                    "weight": 1,
-                }
-            ],
-        }
-
-        ft = SmbFileTransferMetadataActionBundle(
-            request,
-            _AlwaysPeRandom(),
-            smb_config=smb_config,
-        ).execute()
-
-        assert ft is not None
-        assert ft.timedout is True
-        assert ft.missing_bytes > 0
-        assert ft.seen_bytes == request.transfer_bytes - ft.missing_bytes
-        assert ft.analyzers == []
-        assert ft.md5 == ""
-        assert ft.sha1 == ""
-
-
-class TestSmbFileTransferConfig:
-    """Verify SMB file-transfer realism config loading."""
-
-    def test_overlay_updates_threshold_and_extends_mime_types(self, tmp_path, monkeypatch):
-        from evidenceforge.generation.activity.smb_file_transfers import (
-            load_smb_file_transfers,
-            reset_smb_file_transfers_cache,
-        )
-
-        overlay_dir = tmp_path / ".eforge" / "config" / "activity"
-        overlay_dir.mkdir(parents=True)
-        (overlay_dir / "smb_file_transfers.yaml").write_text(
-            yaml.safe_dump(
-                {
-                    "min_transfer_bytes": 8192,
-                    "mime_types": [{"mime_type": "application/x-test", "weight": 1}],
-                },
-                sort_keys=False,
-            )
-        )
-        monkeypatch.chdir(tmp_path)
-        reset_smb_file_transfers_cache()
-
-        try:
-            data = load_smb_file_transfers()
-            assert data["min_transfer_bytes"] == 8192
-            assert any(entry["mime_type"] == "application/x-test" for entry in data["mime_types"])
-        finally:
-            reset_smb_file_transfers_cache()
-
-    def test_filename_picker_uses_overlay_templates(self):
-        """Filename templates should be data-driven and support overlays."""
-        from evidenceforge.generation.activity.smb_file_transfers import pick_smb_filename
-
-        config = {
-            "filename_templates": [
-                {
-                    "mime_types": ["application/pdf"],
-                    "templates": [r"\\{server}\Evidence\{basename}.pdf"],
-                    "weight": 1,
-                }
-            ]
-        }
-
-        filename = pick_smb_filename(
-            random.Random(42),
-            config,
-            mime_type="application/pdf",
-            server="files01.example.com",
-            user="alice",
-        )
-
-        assert filename.startswith("\\\\files01\\Evidence\\")
-        assert filename.endswith(".pdf")

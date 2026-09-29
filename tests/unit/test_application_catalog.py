@@ -11,6 +11,8 @@ from evidenceforge.generation.activity.application_catalog import (
     get_apps_for_persona,
     get_child_processes,
     get_pe_metadata,
+    is_deployment_compatible_application,
+    is_singleton_application_image,
     is_system_type_allowed,
     load_catalog,
     pick_app_and_command,
@@ -25,6 +27,43 @@ class TestCatalogLoading:
         data = load_catalog()
         assert "applications" in data
         assert len(data["applications"]) > 20
+
+    def test_remote_access_apps_share_one_deployment_cohort(self):
+        apps = get_apps_for_persona(
+            "sales",
+            "windows",
+            "user_app",
+            "workstation",
+            "meridianhcs.local",
+        )
+        remote_ids = {
+            app["id"] for app in apps if app.get("compatibility_group") == "remote_access_stack"
+        }
+
+        assert len(remote_ids) == 1
+
+    def test_remote_access_ui_is_singleton_per_session(self):
+        assert is_singleton_application_image(
+            r"C:\Program Files (x86)\Cisco\Cisco AnyConnect Secure Mobility Client\vpnui.exe",
+            "windows",
+        )
+
+    def test_long_lived_desktop_apps_are_singleton_per_session(self):
+        images = (
+            r"C:\Users\sophia.martinez\AppData\Local\slack\Slack.exe",
+            r"C:\Users\sophia.martinez\AppData\Roaming\Zoom\bin\Zoom.exe",
+            r"C:\Program Files\Google\Drive File Stream\97.0.1.0\GoogleDriveFS.exe",
+            r"C:\Users\sophia.martinez\AppData\Local\Microsoft\Teams\current\Teams.exe",
+            r"C:\Users\sophia.martinez\AppData\Local\Microsoft\OneDrive\OneDrive.exe",
+        )
+
+        assert all(is_singleton_application_image(image, "windows") for image in images)
+
+    def test_incompatible_remote_access_app_is_rejected_for_deployment(self):
+        assert is_deployment_compatible_application("vpnui.exe", "windows", "meridianhcs.local")
+        assert not is_deployment_compatible_application(
+            "ZSATray.exe", "windows", "meridianhcs.local"
+        )
 
     def test_all_entries_have_fully_qualified_paths(self):
         """P0-1: No bare filenames — all image paths must be fully qualified."""
@@ -148,11 +187,12 @@ class TestPersonaFiltering:
         app_ids = {a["id"] for a in apps}
         assert "kubectl" in app_ids
 
-    def test_kubectl_and_internal_curl_are_workstation_scoped_on_linux(self):
+    def test_kubectl_is_workstation_scoped_and_internal_curl_is_server_capable(self):
         assert is_system_type_allowed("kubectl", "linux", "workstation")
         assert not is_system_type_allowed("kubectl", "linux", "server")
         assert is_system_type_allowed("curl", "linux", "workstation")
-        assert not is_system_type_allowed("curl", "linux", "server")
+        assert is_system_type_allowed("curl", "linux", "server")
+        assert not is_system_type_allowed("curl", "linux", "domain_controller")
 
     def test_executive_gets_office_apps(self):
         apps = get_apps_for_persona("executive", "windows", "user_app")
@@ -295,6 +335,47 @@ class TestPickAppAndCommand:
         result = pick_app_and_command(rng, "default", "windows", "nonexistent_category")
         assert result is None
 
+    def test_exact_deployment_ids_bound_selection_without_persona_catalog_scan(self, monkeypatch):
+        """Compiled assignment IDs are the only production application candidates."""
+        from evidenceforge.generation.activity import application_catalog
+
+        monkeypatch.setattr(
+            application_catalog,
+            "get_apps_for_persona",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("legacy persona catalog scan used")
+            ),
+        )
+
+        seen = {
+            pick_app_and_command(
+                random.Random(seed),
+                "developer",
+                "windows",
+                "user_app",
+                username="alice",
+                system_type="workstation",
+                application_ids=("postman",),
+            )[0]
+            for seed in range(10)
+        }
+
+        assert len(seen) == 1
+        assert next(iter(seen)).endswith(r"\Postman.exe")
+
+    def test_exact_deployment_ids_fail_closed_for_undeployed_application(self):
+        """An unknown or category-ineligible deployment ID cannot launch an app."""
+        assert (
+            pick_app_and_command(
+                random.Random(42),
+                "developer",
+                "windows",
+                "user_app",
+                application_ids=("not-deployed",),
+            )
+            is None
+        )
+
     def test_selection_weight_biases_catalog_choice(self, monkeypatch):
         """Application entries with lower selection_weight should be rarer."""
         from evidenceforge.generation.activity import application_catalog
@@ -373,3 +454,4 @@ class TestPickAppAndCommand:
         counts = Counter(seen)
         _exe, count = counts.most_common(1)[0]
         assert count / len(seen) >= 0.75
+        assert _USER_BROWSER_AFFINITY == {}

@@ -22,7 +22,7 @@
 
 """Emitter for macOS Endpoint Security (eslogger) NDJSON telemetry.
 
-``ESLoggerEmitter`` renders the canonical ``SecurityEvent`` model into
+``ESLoggerEmitter`` renders the canonical ``CanonicalOccurrence`` model into
 ``eslogger``-style Endpoint Security (ESF) NDJSON, one ``eslogger.ndjson`` file
 per macOS host (per-FQDN directory routing, like eCAR).  It is a pure renderer:
 process identity, code-signing identity, audit-token session identity, and file
@@ -50,7 +50,7 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote
 
-from evidenceforge.events.base import SecurityEvent
+from evidenceforge.events.base import CanonicalOccurrence
 from evidenceforge.events.contexts import HostContext
 from evidenceforge.generation.activity.macos_signing import get_signing_identity
 from evidenceforge.generation.emitters.host_base import HostMultiplexEmitter
@@ -163,6 +163,24 @@ _LW_SESSION_EVENT_NAMES: dict[str, str] = {
 _SESSION_EVENT_TYPES = {"ssh_session", "logoff", "workstation_locked", "workstation_unlocked"}
 
 
+def _nest_dotted_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild a nested ES record from dotted field names (``a.b.c`` -> ``{a: {b: {c}}}``)."""
+    record: dict[str, Any] = {}
+    for name, value in fields.items():
+        if name.startswith("_"):
+            continue
+        node = record
+        *parents, leaf = name.split(".")
+        for part in parents:
+            child = node.get(part)
+            if not isinstance(child, dict):
+                child = {}
+                node[part] = child
+            node = child
+        node[leaf] = value
+    return record
+
+
 class ESLoggerEmitter(HostMultiplexEmitter):
     """Render canonical events to macOS Endpoint Security (eslogger) NDJSON.
 
@@ -209,7 +227,7 @@ class ESLoggerEmitter(HostMultiplexEmitter):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _target_host(event: SecurityEvent) -> HostContext | None:
+    def _target_host(event: CanonicalOccurrence) -> HostContext | None:
         """Return the host whose eslogger log this event belongs to.
 
         Session/auth events (SSH) are logged on the destination macOS host;
@@ -219,7 +237,7 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             return event.dst_host
         return event.src_host
 
-    def can_handle(self, event: SecurityEvent) -> bool:
+    def can_handle(self, event: CanonicalOccurrence) -> bool:
         """Handle only supported types on a macOS target host."""
         if event.event_type not in self._supported_types:
             return False
@@ -244,8 +262,8 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             return (host.hostname, auth.session_id) in self._openssh_login_sessions
         return True
 
-    def emit(self, event: SecurityEvent) -> None:
-        """Dispatch a SecurityEvent to the matching ES renderer."""
+    def emit(self, event: CanonicalOccurrence) -> None:
+        """Dispatch a CanonicalOccurrence to the matching ES renderer."""
         et = event.event_type
         if et in ("process_create", "system_process_create"):
             self._render_process_create(event)
@@ -280,8 +298,14 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         Called once per record in the single writer/consumer thread, so the
         counter increments are ordering-stable and deterministic.
         """
-        record = event_data["_record"]
-        host_fqdn = event_data.get("_host_fqdn", "")
+        if "_record" in event_data:
+            record = event_data["_record"]
+            host_fqdn = event_data.get("_host_fqdn", "")
+        else:
+            # Raw/native escape hatch: a flat dotted-field record (the parser's
+            # view) is nested back into the ES message shape.
+            record = _nest_dotted_fields(event_data)
+            host_fqdn = str(event_data.get("_host_fqdn", ""))
         self._seq_by_host[host_fqdn] = self._seq_by_host.get(host_fqdn, 0) + 1
         record["seq_num"] = self._seq_by_host[host_fqdn]
         self._global_seq += 1
@@ -318,7 +342,7 @@ class ESLoggerEmitter(HostMultiplexEmitter):
     # Per-event renderers
     # ------------------------------------------------------------------
 
-    def _render_process_create(self, event: SecurityEvent) -> None:
+    def _render_process_create(self, event: CanonicalOccurrence) -> None:
         """Render an ES ``fork`` then ``exec`` pair for one process launch.
 
         ``fork``: the subject is the parent; ``event.fork.child`` is the new
@@ -390,7 +414,7 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             ),
         )
 
-    def _render_process_terminate(self, event: SecurityEvent) -> None:
+    def _render_process_terminate(self, event: CanonicalOccurrence) -> None:
         """Render an ES ``exit`` event completing a process lifecycle."""
         host = event.src_host
         proc = event.process
@@ -417,7 +441,7 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             ),
         )
 
-    def _render_file_event(self, event: SecurityEvent) -> None:
+    def _render_file_event(self, event: CanonicalOccurrence) -> None:
         """Render an ES file event (create/open/write/rename/unlink)."""
         host = event.src_host
         fc = event.file
@@ -466,7 +490,7 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             ),
         )
 
-    def _render_openssh_login(self, event: SecurityEvent) -> None:
+    def _render_openssh_login(self, event: CanonicalOccurrence) -> None:
         """Render an ES ``openssh_login`` from an SSH session on a macOS target."""
         host = event.dst_host
         auth = event.auth
@@ -500,7 +524,7 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             ),
         )
 
-    def _render_openssh_logout(self, event: SecurityEvent) -> None:
+    def _render_openssh_logout(self, event: CanonicalOccurrence) -> None:
         """Render an ES ``openssh_logout`` for an SSH session close on macOS."""
         host = event.dst_host
         auth = event.auth
@@ -524,7 +548,7 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             ),
         )
 
-    def _render_lw_session(self, event: SecurityEvent) -> None:
+    def _render_lw_session(self, event: CanonicalOccurrence) -> None:
         """Render an ES ``lw_session_lock``/``lw_session_unlock`` for a macOS console.
 
         The generic ``workstation_locked``/``workstation_unlocked`` canonical
@@ -554,7 +578,7 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             ),
         )
 
-    def _render_privilege_elevation(self, event: SecurityEvent) -> None:
+    def _render_privilege_elevation(self, event: CanonicalOccurrence) -> None:
         """Render an ES ``sudo``/``su`` for a macOS privilege-elevation event.
 
         macOS ES (14+) reports a distinct NOTIFY_SUDO / NOTIFY_SU signal for a
@@ -622,7 +646,7 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             ),
         )
 
-    def _render_btm_launch_item_add(self, event: SecurityEvent) -> None:
+    def _render_btm_launch_item_add(self, event: CanonicalOccurrence) -> None:
         """Render an ES ``btm_launch_item_add`` for a LaunchAgents/Daemons plist.
 
         backgroundtaskmanagementd discovers the legacy plist and is the message
@@ -762,7 +786,7 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         )
 
     def _process_object_for(
-        self, host: HostContext, event: SecurityEvent, pid_hint: int
+        self, host: HostContext, event: CanonicalOccurrence, pid_hint: int
     ) -> dict[str, Any]:
         """Resolve the acting process object for file/BTM events.
 

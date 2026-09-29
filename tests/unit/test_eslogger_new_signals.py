@@ -25,19 +25,22 @@
 Each test drives the canonical producer (SSH bundle close, workstation
 lock/unlock bundles, or the sudo/su privilege-elevation producer/hook) through a
 real ``ActivityGenerator`` with a capturing dispatcher, then feeds the resulting
-canonical ``SecurityEvent``s through a real ``ESLoggerEmitter`` and asserts the
+canonical ``OccurrenceBuilder``s through a real ``ESLoggerEmitter`` and asserts the
 rendered ES event names/codes — proving the events actually render, not merely
-that a SecurityEvent was constructed.
+that a OccurrenceBuilder was constructed.
 """
 
 import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
-from evidenceforge.events.base import SecurityEvent
+from evidenceforge.events.base import OccurrenceBuilder
 from evidenceforge.events.contexts import ProcessContext
 from evidenceforge.events.dispatcher import EventDispatcher
 from evidenceforge.formats.loader import load_format
+from evidenceforge.generation.actions.macos_privilege import (
+    maybe_dispatch_process_privilege_elevation,
+)
 from evidenceforge.generation.activity import ActivityGenerator
 from evidenceforge.generation.emitters.eslogger import ESLoggerEmitter
 from evidenceforge.generation.state_manager import StateManager
@@ -51,7 +54,7 @@ WIN = System(hostname="WS-01", ip="10.0.0.10", os="Windows 11", type="workstatio
 ALICE = User(username="alice", full_name="Alice", email="alice@corp.local", enabled=True)
 
 
-def _make_gen() -> tuple[ActivityGenerator, list[SecurityEvent], StateManager]:
+def _make_gen() -> tuple[ActivityGenerator, list[OccurrenceBuilder], StateManager]:
     """Build an ActivityGenerator whose dispatcher captures every dispatched event."""
     sm = StateManager()
     sm.set_current_time(TS)
@@ -61,14 +64,14 @@ def _make_gen() -> tuple[ActivityGenerator, list[SecurityEvent], StateManager]:
         m.can_handle.return_value = False
         emitters[name] = m
     dispatcher = EventDispatcher(sm, emitters)
-    captured: list[SecurityEvent] = []
-    original = dispatcher.dispatch
+    captured: list[OccurrenceBuilder] = []
+    original = dispatcher.prepare_builder
 
-    def capturing(event: SecurityEvent) -> None:
+    def capturing(event: OccurrenceBuilder, *args: object, **kwargs: object) -> object:
         captured.append(event)
-        original(event)
+        return original(event, *args, **kwargs)
 
-    dispatcher.dispatch = capturing
+    dispatcher.prepare_builder = capturing
     gen = ActivityGenerator(sm, emitters, dispatcher=dispatcher)
     return gen, captured, sm
 
@@ -80,7 +83,7 @@ def _eslogger(tmp_path, sm: StateManager) -> ESLoggerEmitter:
     return e
 
 
-def _render(emitter: ESLoggerEmitter, event: SecurityEvent) -> list[dict]:
+def _render(emitter: ESLoggerEmitter, event: OccurrenceBuilder) -> list[dict]:
     """Render a single event through the emitter, returning the NDJSON records."""
     captured: list[dict] = []
     original = emitter.emit_event
@@ -163,8 +166,8 @@ def test_macos_logoff_renders_openssh_logout_only_for_a_rendered_login(tmp_path)
         system_type="workstation",
     )
 
-    def _logoff(session_id: int, logon_type: int) -> SecurityEvent:
-        return SecurityEvent(
+    def _logoff(session_id: int, logon_type: int) -> OccurrenceBuilder:
+        return OccurrenceBuilder(
             timestamp=TS,
             event_type="logoff",
             dst_host=host,
@@ -181,7 +184,7 @@ def test_macos_logoff_renders_openssh_logout_only_for_a_rendered_login(tmp_path)
 
     # Render an SSH login for session 42, then its logout is handled; a
     # different session's logout is still dropped.
-    login = SecurityEvent(
+    login = OccurrenceBuilder(
         timestamp=TS,
         event_type="ssh_session",
         dst_host=host,
@@ -291,22 +294,32 @@ def test_privilege_elevation_renders_as_su(tmp_path):
     assert rows[0]["event"]["su"]["from_username"] == "alice"
 
 
+def _privilege_hook(gen: ActivityGenerator, system: System, process: ProcessContext) -> None:
+    """Run the process-execution sudo/su hook exactly as the service does."""
+    maybe_dispatch_process_privilege_elevation(
+        gen.dispatcher,
+        host=gen._build_host_context(system),
+        time=TS,
+        process=process,
+    )
+
+
 def test_macos_sudo_exec_triggers_privilege_elevation_hook():
     """A macOS process create for sudo/su fires the privilege_elevation producer."""
     gen, events, _sm = _make_gen()
-    gen._maybe_emit_macos_privilege_elevation(MAC, TS, _proc("/usr/bin/sudo", "sudo -l"))
+    _privilege_hook(gen, MAC, _proc("/usr/bin/sudo", "sudo -l"))
     assert any(e.event_type == "privilege_elevation" for e in events)
 
 
 def test_non_sudo_macos_exec_does_not_trigger_hook():
     """Ordinary macOS process creates do not emit a privilege_elevation event."""
     gen, events, _sm = _make_gen()
-    gen._maybe_emit_macos_privilege_elevation(MAC, TS, _proc("/usr/bin/curl", "curl https://x"))
+    _privilege_hook(gen, MAC, _proc("/usr/bin/curl", "curl https://x"))
     assert not any(e.event_type == "privilege_elevation" for e in events)
 
 
 def test_windows_sudo_basename_does_not_trigger_hook():
     """The hook is macOS-only even when a non-macOS host runs a sudo-named binary."""
     gen, events, _sm = _make_gen()
-    gen._maybe_emit_macos_privilege_elevation(WIN, TS, _proc("/usr/bin/sudo", "sudo x"))
+    _privilege_hook(gen, WIN, _proc("/usr/bin/sudo", "sudo x"))
     assert not any(e.event_type == "privilege_elevation" for e in events)

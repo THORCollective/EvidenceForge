@@ -215,6 +215,31 @@ class TestLinuxPidAllocation:
         assert second_pid > first_pid
         assert abs(pid_delta - elapsed_seconds) > 1.0
 
+    def test_linux_pid_progression_has_host_workload_texture(self, sm):
+        """Minute-scale PID progression should not expose one constant clock slope."""
+        boot_time = datetime(2024, 3, 18, 8, 0, 0)
+        sm.register_boot_time("TEST-01", boot_time)
+        sm._initialize_pid_allocator("TEST-01", "linux")
+
+        offsets = [
+            sm._linux_pid_hidden_churn_offset("TEST-01", minute * 60) for minute in range(7 * 60)
+        ]
+        minute_deltas = [
+            later - earlier for earlier, later in zip(offsets[:-1], offsets[1:], strict=True)
+        ]
+
+        assert len(set(minute_deltas)) > 40
+        assert statistics.stdev(minute_deltas) > 12
+        assert sm._linux_pid_weekly_churn_prefixes["TEST-01"]
+
+    def test_linux_pid_progression_varies_materially_across_hosts(self, sm):
+        """Unrelated hosts should not expose one fleet-wide PID/time slope."""
+        hosts = [f"LINUX-{ordinal:02d}" for ordinal in range(16)]
+        six_hour_churn = [sm._linux_pid_hidden_churn_offset(host, 6 * 3600) for host in hosts]
+
+        assert len(set(six_hour_churn)) == len(hosts)
+        assert max(six_hour_churn) > min(six_hour_churn) * 1.35
+
 
 class TestPidWraparound:
     """PID wraparound should not reuse PIDs of still-running processes."""

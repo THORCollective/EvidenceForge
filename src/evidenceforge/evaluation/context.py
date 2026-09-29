@@ -5,9 +5,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
+from evidenceforge.events.ground_truth import GroundTruthDocument
 from evidenceforge.events.observation_manifest import ObservationManifest
+
+if TYPE_CHECKING:
+    from evidenceforge.composition.models import EffectiveConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +20,7 @@ class EvaluationContext:
     """Additional dataset metadata available to scorers."""
 
     observation_manifest: ObservationManifest | None = None
+    ground_truth: GroundTruthDocument | None = None
     # storyline_id -> {"values": [rendered on-disk credentials], "time": datetime},
     # from GROUND_TRUTH.json. Lets the causality pillar match spillage events
     # without re-running synthesis, anchored to the actual emitted time.
@@ -28,3 +34,7 @@ class EvaluationContext:
     # causality pillar match email artifacts without leaking storyline labels into
     # ARTIFACTS_MANIFEST.json.
     email_ground_truth: dict[str, dict] | None = None
+    effective_config: EffectiveConfig | None = None
+    # Parseability owns this run-local exclusion set. Records remain in report
+    # counts and exact acceptance gates, but cannot enter typed cross-source indexes.
+    malformed_record_ids: set[int] = field(default_factory=set, compare=False)

@@ -30,10 +30,9 @@ rendering the same SecurityEvents twice produces byte-identical NDJSON.
 import json
 from datetime import UTC, datetime
 
-from evidenceforge.events.base import SecurityEvent
+from evidenceforge.events.base import OccurrenceBuilder
 from evidenceforge.events.contexts import (
     AuthContext,
-    EdrContext,
     FileContext,
     HostContext,
     ProcessContext,
@@ -83,9 +82,9 @@ def _sample_events():
         start_time=TS,
     )
     return [
-        SecurityEvent(timestamp=TS, event_type="process_create", src_host=mac, process=proc),
-        SecurityEvent(timestamp=TS, event_type="process_terminate", src_host=mac, process=proc),
-        SecurityEvent(
+        OccurrenceBuilder(timestamp=TS, event_type="process_create", src_host=mac, process=proc),
+        OccurrenceBuilder(timestamp=TS, event_type="process_terminate", src_host=mac, process=proc),
+        OccurrenceBuilder(
             timestamp=TS,
             event_type="file_open",
             src_host=mac,
@@ -93,7 +92,7 @@ def _sample_events():
             file=FileContext("/Users/alice/Library/Keychains/login.keychain-db", "open", 1500),
             auth=AuthContext(username="alice"),
         ),
-        SecurityEvent(
+        OccurrenceBuilder(
             timestamp=TS,
             event_type="file_create",
             src_host=mac,
@@ -101,22 +100,21 @@ def _sample_events():
             file=FileContext("/Users/alice/Library/LaunchAgents/x.plist", "create", 1500),
             auth=AuthContext(username="alice"),
         ),
-        SecurityEvent(
+        OccurrenceBuilder(
             timestamp=TS,
             event_type="ssh_session",
             src_host=win,
             dst_host=mac,
             auth=AuthContext(username="alice", source_ip="10.0.0.10", session_id=132500),
-            edr=EdrContext(object_id="sess-1"),
         ),
-        SecurityEvent(
+        OccurrenceBuilder(
             timestamp=TS,
             event_type="logoff",
             src_host=win,
             dst_host=mac,
             auth=AuthContext(username="alice", source_ip="10.0.0.10", session_id=132500),
         ),
-        SecurityEvent(
+        OccurrenceBuilder(
             timestamp=TS,
             event_type="btm_launch_item_add",
             src_host=mac,
@@ -124,19 +122,19 @@ def _sample_events():
             file=FileContext("/Users/alice/Library/LaunchAgents/x.plist", "create", 1500),
             auth=AuthContext(username="alice"),
         ),
-        SecurityEvent(
+        OccurrenceBuilder(
             timestamp=TS,
             event_type="workstation_locked",
             dst_host=mac,
             auth=AuthContext(username="alice", session_id=132501),
         ),
-        SecurityEvent(
+        OccurrenceBuilder(
             timestamp=TS,
             event_type="workstation_unlocked",
             dst_host=mac,
             auth=AuthContext(username="alice", session_id=132501),
         ),
-        SecurityEvent(
+        OccurrenceBuilder(
             timestamp=TS,
             event_type="privilege_elevation",
             src_host=mac,
@@ -150,7 +148,7 @@ def _sample_events():
             ),
             auth=AuthContext(username="root", subject_username="alice", elevated=True),
         ),
-        SecurityEvent(
+        OccurrenceBuilder(
             timestamp=TS,
             event_type="privilege_elevation",
             src_host=mac,

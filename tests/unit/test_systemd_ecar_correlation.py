@@ -169,7 +169,7 @@ class TestSystemdProcessLifecycle:
             for c in mock_emitters["ecar"].emit.call_args_list
             if c[0][0].event_type == "system_process_create"
         ][-1]
-        create_obj_id = create_event.edr.object_id
+        create_obj_id = create_event.identity_plan.object_id
 
         # Finished
         activity_gen.generate_system_process_termination(
@@ -187,7 +187,7 @@ class TestSystemdProcessLifecycle:
             for c in mock_emitters["ecar"].emit.call_args_list
             if c[0][0].event_type == "process_terminate"
         ][-1]
-        assert terminate_event.edr.object_id == create_obj_id
+        assert terminate_event.identity_plan.object_id == create_obj_id
         assert create_obj_id != ""
 
     def test_syslog_message_override_does_not_affect_cron(
@@ -288,7 +288,7 @@ def test_syslog_sort_orders_same_second_systemd_start_before_finish():
 
 
 def test_syslog_sudo_lifecycle_normalizer_orders_same_pid_pam_session():
-    """Sudo COMMAND rows should stay between same-PID PAM open and close rows."""
+    """Sudo COMMAND rows should precede the same-PID PAM open and close rows."""
     lines = [
         "<85>1 2024-03-18T12:00:00.100000Z WEB-EXT-01 sudo 701258 - - "
         "deploy : TTY=pts/1 ; PWD=/srv/app ; USER=root ; COMMAND=/usr/bin/id",
@@ -300,7 +300,7 @@ def test_syslog_sudo_lifecycle_normalizer_orders_same_pid_pam_session():
 
     normalized = SyslogEmitter._normalize_sudo_session_lifecycles_for_lines(lines)
 
-    assert "session opened" in normalized[0]
-    assert "COMMAND=/usr/bin/id" in normalized[1]
+    assert "COMMAND=/usr/bin/id" in normalized[0]
+    assert "session opened" in normalized[1]
     assert "session closed" in normalized[2]
-    assert "2024-03-18T12:00:00.099000Z" in normalized[0]
+    assert "2024-03-18T12:00:00.140000Z" in normalized[1]

@@ -23,13 +23,16 @@
 """Unit tests for Phase 5.3: Protocol & Network Diversity."""
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock
 
 import pytest
 
 from evidenceforge.formats.loader import load_format
 from evidenceforge.generation.actions import DnsLookupActionBundle, DnsLookupRequest
+from evidenceforge.generation.actions import (
+    network_transaction_planner as network_planner_module,
+)
 from evidenceforge.generation.activity import (
     EXTERNAL_IPS,
     REVERSE_DNS,
@@ -40,6 +43,8 @@ from evidenceforge.generation.activity import (
 )
 from evidenceforge.generation.state_manager import StateManager
 from evidenceforge.models import System
+
+pytestmark = pytest.mark.slow
 
 
 @pytest.fixture
@@ -177,7 +182,7 @@ class TestDnsLookupEmission:
             dst_ip="172.217.14.206",
             time=timestamp,
         )
-        # DNS now goes through SecurityEvent pipeline via emit() (DnsContext fan-out)
+        # DNS now goes through OccurrenceBuilder pipeline via emit() (DnsContext fan-out)
         assert mock_emitters["zeek_dns"].emit.called
         dns_se = mock_emitters["zeek_dns"].emit.call_args_list[0][0][0]
         dns_ctx = dns_se.dns
@@ -238,12 +243,12 @@ class TestDnsLookupEmission:
             dst_ip="172.217.14.206",
             time=timestamp,
         )
-        # Both conn and dns now go through emit() on the SAME SecurityEvent
-        # Get the dns.log SecurityEvent
+        # Both conn and dns now go through emit() on the SAME OccurrenceBuilder
+        # Get the dns.log OccurrenceBuilder
         dns_se = mock_emitters["zeek_dns"].emit.call_args_list[0][0][0]
         dns_uid = dns_se.network.zeek_uid
 
-        # Get the conn.log SecurityEvent
+        # Get the conn.log OccurrenceBuilder
         conn_se = mock_emitters["zeek_conn"].emit.call_args_list[0][0][0]
         conn_uid = conn_se.network.zeek_uid
 
@@ -253,6 +258,43 @@ class TestDnsLookupEmission:
             f"dns={dns_uid}, conn={conn_uid}"
         )
         assert dns_uid.startswith("C"), "Zeek conn UIDs use 'C' prefix"
+
+    def test_dns_lookup_preserves_live_query_process(
+        self,
+        activity_gen,
+        win_system,
+        timestamp,
+        state_manager,
+        mock_emitters,
+    ):
+        """The DNS occurrence should retain its live initiating application."""
+        state_manager.set_current_time(timestamp)
+        pid = state_manager.create_process(
+            system=win_system.hostname,
+            parent_pid=4,
+            image=r"C:\Program Files\Mozilla Firefox\firefox.exe",
+            command_line=r'"C:\Program Files\Mozilla Firefox\firefox.exe"',
+            username="alice",
+            integrity_level="Medium",
+            logon_id="0x1a2b3c",
+        )
+
+        activity_gen._emit_dns_lookup(
+            src_ip=win_system.ip,
+            dst_ip="172.217.14.206",
+            time=timestamp + timedelta(seconds=10),
+            hostname="www.google.com",
+            source_system=win_system,
+            source_pid=pid,
+            source_process_image=r"C:\Program Files\Mozilla Firefox\firefox.exe",
+        )
+
+        dns_event = mock_emitters["zeek_dns"].emit.call_args_list[0][0][0]
+        assert dns_event.dns is not None
+        assert dns_event.dns.query_process is not None
+        assert dns_event.dns.query_process.pid == pid
+        assert dns_event.dns.query_process.image.endswith("firefox.exe")
+        assert dns_event.dns.query_process.username == "alice"
 
 
 class TestDnsQueryTypeSemantics:
@@ -330,6 +372,7 @@ class TestDnsQueryTypeSemantics:
 
         monkeypatch.setattr(rng, "random", _fixed_random)
         monkeypatch.setattr(generator_module, "_get_rng", lambda: rng)
+        monkeypatch.setattr(network_planner_module, "_get_rng", lambda: rng)
 
         activity_gen._emit_dns_lookup(
             src_ip="10.0.10.1",

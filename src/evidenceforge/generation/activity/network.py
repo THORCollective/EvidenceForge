@@ -29,6 +29,7 @@ All domain↔IP data is loaded from dns_registry.yaml via dns_registry.py.
 import ipaddress
 import random
 
+from evidenceforge.config.provider import _register_legacy_network_module
 from evidenceforge.generation.activity.dns_registry import (
     generate_long_tail_domain,
     get_cdn_ranges,
@@ -56,21 +57,6 @@ def _is_private_ip(ip: str) -> bool:
 
 # Backward-compatible: IP → domain (used by many modules)
 REVERSE_DNS: dict[str, str] = get_reverse_dns()
-# Registry-only snapshot: generation registers each scenario's host IP → FQDN
-# mappings into REVERSE_DNS, so it must be reset between generations.
-_REGISTRY_REVERSE_DNS: dict[str, str] = dict(REVERSE_DNS)
-
-
-def reset_reverse_dns() -> None:
-    """Restore REVERSE_DNS to the registry-only mappings, in place.
-
-    Called at the start of each generation so host mappings registered by an
-    earlier scenario in the same process cannot leak into the next one. The
-    dict is mutated in place because other modules alias it by import.
-    """
-    REVERSE_DNS.clear()
-    REVERSE_DNS.update(_REGISTRY_REVERSE_DNS)
-
 
 # Backward-compatible: domain → first IP
 FORWARD_DNS: dict[str, str] = {d: ips[0] for d, ips in get_forward_dns().items()}
@@ -92,9 +78,12 @@ for _act_type, _tag in _TAG_TO_ACTIVITY.items():
         _ips.extend(_e["ips"])
     EXTERNAL_IPS[_act_type] = list(dict.fromkeys(_ips))  # Deduplicate, preserve order
 
-# CDN ranges and IPv6 map from registry
-_CDN_RANGES = [tuple(r) for r in get_cdn_ranges()]
+# CDN ranges and IPv6 map from registry. Generation reads CDN ranges from the
+# active provider dynamically; this list remains for public inspection compatibility.
+_CDN_RANGES = [tuple(value) for value in get_cdn_ranges()]
 _IPV6_MAP: dict[str, str] = get_ipv6_map()
+
+_register_legacy_network_module(__name__, globals())
 
 # AD SRV record templates for domain service discovery
 _AD_SRV_QUERIES = [
@@ -161,7 +150,8 @@ def _ipv4_to_fake_ipv6(ipv4: str) -> str:
 
 def _generate_random_external_ip(rng) -> str:
     """Generate a random plausible external IP from common cloud/CDN ranges."""
-    prefix = rng.choice(_CDN_RANGES)
+    cdn_ranges = [tuple(value) for value in get_cdn_ranges()]
+    prefix = rng.choice(cdn_ranges)
     return f"{prefix[0]}.{prefix[1]}.{rng.randint(0, 255)}.{rng.randint(1, 254)}"
 
 
@@ -365,7 +355,12 @@ def _generate_rdns_name(rng, ip: str, forward_hostname: str | None = None) -> st
 _HTTP_URI_STATUS_CACHE: dict[tuple[str, str], tuple[int, str]] = {}
 
 
-def _get_http_status(dst_ip: str, uri: str) -> tuple[int, str]:
+def _get_http_status(
+    dst_ip: str,
+    uri: str,
+    *,
+    publish_cache: bool = True,
+) -> tuple[int, str]:
     """Get a deterministic HTTP status for a (dst_ip, uri) pair.
 
     Same URI on same server always returns same status (baseline consistency).
@@ -389,7 +384,8 @@ def _get_http_status(dst_ip: str, uri: str) -> tuple[int, str]:
         result = (304, "Not Modified")
     else:
         result = (200, "OK")
-    _HTTP_URI_STATUS_CACHE[key] = result
+    if publish_cache:
+        _HTTP_URI_STATUS_CACHE[key] = result
     return result
 
 
@@ -398,7 +394,7 @@ def _is_invalid_network_connection(src_ip: str, dst_ip: str) -> tuple[bool, str]
 
     Checks for addresses that should never appear in generated traffic
     (localhost, link-local, multicast). Same-host connections (src==dst) are
-    valid for host-based logs and handled separately via SecurityEvent.local_only.
+    valid for host-based logs and handled separately via OccurrenceBuilder.local_only.
 
     Args:
         src_ip: Source IP address

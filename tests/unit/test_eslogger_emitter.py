@@ -32,10 +32,9 @@ from datetime import UTC, datetime
 
 import pytest
 
-from evidenceforge.events.base import SecurityEvent
+from evidenceforge.events.base import OccurrenceBuilder
 from evidenceforge.events.contexts import (
     AuthContext,
-    EdrContext,
     FileContext,
     HostContext,
     ProcessContext,
@@ -100,7 +99,7 @@ def _rows(emitter, event):
 
 class TestCanHandle:
     def test_macos_process_create_handled(self, emitter, mac_host, ts):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="process_create",
             src_host=mac_host,
@@ -109,7 +108,7 @@ class TestCanHandle:
         assert emitter.can_handle(event) is True
 
     def test_windows_process_create_rejected(self, emitter, win_host, ts):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="process_create",
             src_host=win_host,
@@ -122,7 +121,7 @@ class TestCanHandle:
 
     def test_ssh_session_gated_on_dst_host(self, emitter, mac_host, win_host, ts):
         # macOS destination -> handled (session events log on dst_host)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="ssh_session",
             src_host=win_host,
@@ -142,7 +141,7 @@ class TestProcessLifecycle:
             username="alice",
             start_time=ts,
         )
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts, event_type="process_create", src_host=mac_host, process=proc
         )
         rows = _rows(emitter, event)
@@ -171,7 +170,7 @@ class TestProcessLifecycle:
             start_time=ts,
             parent_image="/bin/zsh",
         )
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts, event_type="process_create", src_host=mac_host, process=proc
         )
         fork_row, exec_row = _rows(emitter, event)
@@ -183,7 +182,7 @@ class TestProcessLifecycle:
     def test_process_object_has_no_top_level_pid(self, emitter, mac_host, ts):
         """es_process_t carries the PID only inside its audit token."""
         proc = ProcessContext(1500, 1, "/usr/bin/osascript", "osascript", "alice", start_time=ts)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts, event_type="process_create", src_host=mac_host, process=proc
         )
         for row in _rows(emitter, event):
@@ -199,7 +198,7 @@ class TestProcessLifecycle:
 
     def test_process_terminate_emits_exit(self, emitter, mac_host, ts):
         proc = ProcessContext(1500, 1, "/usr/bin/osascript", "osascript", "alice", start_time=ts)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts, event_type="process_terminate", src_host=mac_host, process=proc
         )
         rows = _rows(emitter, event)
@@ -212,24 +211,24 @@ class TestProcessLifecycle:
         # create_process assigns pidversion; the emitter must read it, not derive.
         sm = emitter._state_manager
         sm.set_current_time(ts)
-        from evidenceforge.models.state import RunningProcess
-
-        sm.state.running_processes[("MAC-01", 1)] = RunningProcess(
+        sm.register_process(
+            system="MAC-01",
             pid=1,
             parent_pid=0,
             image="/sbin/launchd",
             command_line="/sbin/launchd",
             username="root",
-            system="MAC-01",
-            start_time=ts,
             integrity_level="System",
+            os_category="macos",
+            start_time=ts,
         )
         pid = sm.create_process(
             "MAC-01", 1, "/usr/bin/osascript", "osascript", "alice", "Medium", os_category="macos"
         )
         expected = sm.get_pidversion("MAC-01", pid)
+        assert expected > 0
         proc = ProcessContext(pid, 1, "/usr/bin/osascript", "osascript", "alice", start_time=ts)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts, event_type="process_create", src_host=mac_host, process=proc
         )
         fork_row, exec_row = _rows(emitter, event)
@@ -242,7 +241,7 @@ class TestProcessLifecycle:
 class TestCodeSigning:
     def test_platform_binary_signed(self, emitter, mac_host, ts):
         proc = ProcessContext(1500, 1, "/usr/bin/osascript", "osascript", "alice", start_time=ts)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts, event_type="process_create", src_host=mac_host, process=proc
         )
         target = _rows(emitter, event)[1]["event"]["exec"]["target"]
@@ -257,7 +256,7 @@ class TestCodeSigning:
         # AMOS trojanized-cleaner dropper resolves to an ad-hoc identity.
         image = "/Applications/CleanMyMacX Helper.app/Contents/MacOS/CleanMyMacX Helper"
         proc = ProcessContext(1600, 1, image, "CleanMyMacX Helper", "alice", start_time=ts)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts, event_type="process_create", src_host=mac_host, process=proc
         )
         exec_event = _rows(emitter, event)[1]["event"]["exec"]
@@ -283,7 +282,7 @@ class TestFileEvents:
     def test_file_event_names(self, emitter, mac_host, ts, event_type, es_name, code):
         proc = ProcessContext(1700, 1, "/usr/bin/osascript", "osascript", "alice", start_time=ts)
         path = "/Users/alice/Library/Keychains/login.keychain-db"
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type=event_type,
             src_host=mac_host,
@@ -301,7 +300,7 @@ class TestFileEvents:
 
     def test_create_reports_existing_file_destination(self, emitter, mac_host, ts):
         path = "/Users/alice/Library/LaunchAgents/com.example.plist"
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="file_create",
             src_host=mac_host,
@@ -316,7 +315,7 @@ class TestFileEvents:
         path = "/Users/alice/Library/Keychains/login.keychain-db"
         opened = _rows(
             emitter,
-            SecurityEvent(
+            OccurrenceBuilder(
                 timestamp=ts,
                 event_type="file_open",
                 src_host=mac_host,
@@ -326,7 +325,7 @@ class TestFileEvents:
         )[0]["event"]["open"]
         unlinked = _rows(
             emitter,
-            SecurityEvent(
+            OccurrenceBuilder(
                 timestamp=ts,
                 event_type="file_unlink",
                 src_host=mac_host,
@@ -340,7 +339,7 @@ class TestFileEvents:
 
 class TestSshSessions:
     def test_openssh_login(self, emitter, mac_host, win_host, ts):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="ssh_session",
             src_host=win_host,
@@ -348,7 +347,6 @@ class TestSshSessions:
             auth=AuthContext(
                 username="alice", source_ip="10.0.0.10", source_port=54321, session_id=132500
             ),
-            edr=EdrContext(object_id="sess-1"),
         )
         rows = _rows(emitter, event)
         assert len(rows) == 1
@@ -366,7 +364,7 @@ class TestSshSessions:
         assert row["process"]["session_id"] == 132500
 
     def test_openssh_logout(self, emitter, mac_host, win_host, ts):
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="logoff",
             src_host=win_host,
@@ -385,7 +383,7 @@ class TestBtm:
     def test_btm_launch_item_add_agent(self, emitter, mac_host, ts):
         plist = "/Users/alice/Library/LaunchAgents/com.evil.persist.plist"
         proc = ProcessContext(1800, 1, "/bin/cp", "cp", "alice", start_time=ts)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="btm_launch_item_add",
             src_host=mac_host,
@@ -408,7 +406,7 @@ class TestBtm:
 
     def test_btm_launch_item_add_daemon(self, emitter, mac_host, ts):
         plist = "/Library/LaunchDaemons/com.evil.persist.plist"
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="btm_launch_item_add",
             src_host=mac_host,
@@ -423,7 +421,7 @@ class TestBtm:
 
     def test_btm_item_url_percent_encodes_spaces(self, emitter, mac_host, ts):
         plist = "/Users/alice/Library/LaunchAgents/com.example agent.plist"
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="btm_launch_item_add",
             src_host=mac_host,
@@ -462,7 +460,7 @@ class TestEventTypeCodes:
 class TestEnvelope:
     def test_envelope_fields_present(self, emitter, mac_host, ts):
         proc = ProcessContext(1500, 1, "/usr/bin/osascript", "osascript", "alice", start_time=ts)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts, event_type="process_create", src_host=mac_host, process=proc
         )
         row = _rows(emitter, event)[0]
@@ -505,7 +503,7 @@ class TestEnvelope:
 
     def test_seq_numbers_increment(self, emitter, mac_host, ts):
         proc = ProcessContext(1500, 1, "/usr/bin/osascript", "osascript", "alice", start_time=ts)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts, event_type="process_create", src_host=mac_host, process=proc
         )
         rows = _rows(emitter, event)
@@ -514,7 +512,7 @@ class TestEnvelope:
 
     def test_mach_time_reflects_boot(self, emitter, mac_host, ts):
         proc = ProcessContext(1500, 1, "/usr/bin/osascript", "osascript", "alice", start_time=ts)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts, event_type="process_create", src_host=mac_host, process=proc
         )
         row = _rows(emitter, event)[0]

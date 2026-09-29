@@ -24,8 +24,9 @@
 
 from typing import Any
 
-from evidenceforge.events.base import SecurityEvent
+from evidenceforge.events.base import CanonicalOccurrence
 from evidenceforge.generation.emitters.zeek_base import SensorMultiplexEmitter
+from evidenceforge.generation.network_observation import network_source_timing_key
 
 
 class ZeekWeirdEmitter(SensorMultiplexEmitter):
@@ -38,7 +39,7 @@ class ZeekWeirdEmitter(SensorMultiplexEmitter):
     _flat_filename = "zeek_weird.json"
     _supported_types: set[str] = {"connection"}
 
-    def can_handle(self, event: SecurityEvent) -> bool:
+    def can_handle(self, event: CanonicalOccurrence) -> bool:
         """Only handle connection events that carry WeirdContext."""
         return (
             event.event_type == "connection"
@@ -46,8 +47,8 @@ class ZeekWeirdEmitter(SensorMultiplexEmitter):
             and not (event.network is not None and event.network.application_layer_only)
         )
 
-    def emit(self, event: SecurityEvent) -> None:
-        """Render weird.log entry from WeirdContext + NetworkContext."""
+    def emit(self, event: CanonicalOccurrence) -> None:
+        """Render weird.log entry from WeirdContext + NetworkTransactionPlan."""
         net = event.network
         weird = event.weird
         event_data = {
@@ -61,10 +62,9 @@ class ZeekWeirdEmitter(SensorMultiplexEmitter):
             "notice": weird.notice,
             "peer": weird.peer,
             "source": weird.source,
-            "_sensor_hostnames": event._sensor_hostnames_by_format.get(self.format_def.name, []),
+            "_source_timing_key": network_source_timing_key("zeek_weird"),
+            **self._sensor_metadata(event, self.format_def.name),
         }
-        if event._nat_swaps_by_sensor:
-            event_data["_nat_swaps_by_sensor"] = event._nat_swaps_by_sensor
         self.emit_event(event_data)
 
     def _render_event(self, event_data: dict[str, Any]) -> str:

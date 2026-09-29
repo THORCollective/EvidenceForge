@@ -44,11 +44,14 @@ from typing import Any
 import pytest
 
 from evidenceforge.evaluation.parsers import ParsedRecord
+from evidenceforge.evaluation.parsers.eslogger import ESLoggerParser
 from evidenceforge.evaluation.pillars.causality import CausalityScorer
+from evidenceforge.evaluation.pillars.parseability import _get_variant, _normalize_for_validation
 from evidenceforge.evaluation.pillars.plausibility import PlausibilityScorer
-from evidenceforge.events.base import SecurityEvent
+from evidenceforge.events.base import OccurrenceBuilder
 from evidenceforge.events.contexts import AuthContext, FileContext, HostContext, ProcessContext
 from evidenceforge.formats.loader import load_format
+from evidenceforge.formats.rules import evaluate_rule
 from evidenceforge.generation.emitters.eslogger import ESLoggerEmitter
 from evidenceforge.generation.state_manager import StateManager
 
@@ -119,9 +122,26 @@ def _rows(emitter, event) -> list[dict[str, Any]]:
 
 
 def _record(row: dict[str, Any], ts: datetime | None = None) -> ParsedRecord:
+    """Parse one rendered row with the production parser (incl. derived fields)."""
+    parsed = ESLoggerParser()._parse_line(json.dumps(row), 1)
     return ParsedRecord(
-        source_format="eslogger", raw=json.dumps(row), fields=_flatten(row), timestamp=ts
+        source_format="eslogger",
+        raw=parsed.raw,
+        fields=parsed.fields,
+        timestamp=ts if ts is not None else parsed.timestamp,
     )
+
+
+def _failed_rule_ids(record: ParsedRecord) -> list[str]:
+    """Return eslogger record-rule ids that fail for one parsed record."""
+    definition = load_format("eslogger")
+    normalized = _normalize_for_validation("eslogger", record.fields, record.timestamp)
+    variant = _get_variant("eslogger", record)
+    return [
+        rule.id
+        for rule in definition.validators or []
+        if evaluate_rule(rule, normalized, "eslogger", variant, set()).outcome == "fail"
+    ]
 
 
 def _make_scenario():
@@ -174,7 +194,7 @@ class TestCoOccurrenceRealEmitterOutput:
             username="alice",
             start_time=T0,
         )
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=T0, event_type="process_create", src_host=mac_host, process=proc
         )
         records = [_record(row) for row in _rows(emitter, event)]
@@ -184,7 +204,7 @@ class TestCoOccurrenceRealEmitterOutput:
 
     def test_process_terminate_exit_row_passes(self, emitter, mac_host):
         proc = ProcessContext(1500, 1, "/usr/bin/osascript", "osascript", "alice", start_time=T0)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=T0, event_type="process_terminate", src_host=mac_host, process=proc
         )
         records = [_record(row) for row in _rows(emitter, event)]
@@ -197,7 +217,7 @@ class TestCoOccurrenceRealEmitterOutput:
     )
     def test_file_events_pass(self, emitter, mac_host, event_type):
         proc = ProcessContext(1700, 1, "/usr/bin/osascript", "osascript", "alice", start_time=T0)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=T0,
             event_type=event_type,
             src_host=mac_host,
@@ -217,7 +237,7 @@ class TestCoOccurrenceRealEmitterOutput:
     def test_btm_launch_item_add_passes(self, emitter, mac_host):
         plist = "/Users/alice/Library/LaunchAgents/com.evil.persist.plist"
         proc = ProcessContext(1800, 1, "/bin/cp", "cp", "alice", start_time=T0)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=T0,
             event_type="btm_launch_item_add",
             src_host=mac_host,
@@ -231,7 +251,7 @@ class TestCoOccurrenceRealEmitterOutput:
         assert result.score == 100.0, result.sample_failures
 
     def test_ssh_login_and_logout_pass(self, emitter, mac_host, win_host):
-        login_event = SecurityEvent(
+        login_event = OccurrenceBuilder(
             timestamp=T0,
             event_type="ssh_session",
             src_host=win_host,
@@ -240,7 +260,7 @@ class TestCoOccurrenceRealEmitterOutput:
                 username="alice", source_ip="10.0.0.10", source_port=54321, session_id=132500
             ),
         )
-        logout_event = SecurityEvent(
+        logout_event = OccurrenceBuilder(
             timestamp=T0 + timedelta(minutes=10),
             event_type="logoff",
             src_host=win_host,
@@ -254,14 +274,14 @@ class TestCoOccurrenceRealEmitterOutput:
         assert result.score == 100.0, result.sample_failures
 
     def test_lock_and_unlock_pass(self, emitter, mac_host):
-        lock_event = SecurityEvent(
+        lock_event = OccurrenceBuilder(
             timestamp=T0,
             event_type="workstation_locked",
             src_host=mac_host,
             dst_host=mac_host,
             auth=AuthContext(username="alice", session_id=132500),
         )
-        unlock_event = SecurityEvent(
+        unlock_event = OccurrenceBuilder(
             timestamp=T0 + timedelta(minutes=5),
             event_type="workstation_unlocked",
             src_host=mac_host,
@@ -277,7 +297,7 @@ class TestCoOccurrenceRealEmitterOutput:
     @pytest.mark.parametrize("image", ["/usr/bin/sudo", "/usr/bin/su"])
     def test_privilege_elevation_passes(self, emitter, mac_host, image):
         proc = ProcessContext(1900, 1, image, f"{image} -l", "alice", start_time=T0)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=T0,
             event_type="privilege_elevation",
             src_host=mac_host,
@@ -295,7 +315,7 @@ class TestCoOccurrenceDetectsViolations:
 
     def test_missing_argv_fails_exec_rule(self, emitter, mac_host):
         proc = ProcessContext(1500, 1, "/usr/bin/osascript", "osascript", "alice", start_time=T0)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=T0, event_type="process_create", src_host=mac_host, process=proc
         )
         rows = _rows(emitter, event)
@@ -308,19 +328,18 @@ class TestCoOccurrenceDetectsViolations:
 
     def test_missing_envelope_field_fails(self, emitter, mac_host):
         proc = ProcessContext(1500, 1, "/usr/bin/osascript", "osascript", "alice", start_time=T0)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=T0, event_type="process_terminate", src_host=mac_host, process=proc
         )
         row = _rows(emitter, event)[0]
         del row["mach_time"]
-        records = [_record(row)]
-        scorer = PlausibilityScorer()
-        result = scorer._score_co_occurrence({"eslogger": records})
-        assert result.score < 100.0
+        # A missing required field is a schema failure owned by parseability;
+        # co-occurrence scoring skips it, so check the record rule directly.
+        assert _failed_rule_ids(_record(row))
 
     def test_missing_btm_path_fails(self, emitter, mac_host):
         plist = "/Users/alice/Library/LaunchAgents/com.evil.persist.plist"
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=T0,
             event_type="btm_launch_item_add",
             src_host=mac_host,
@@ -329,10 +348,9 @@ class TestCoOccurrenceDetectsViolations:
         )
         row = _rows(emitter, event)[0]
         del row["event"]["btm_launch_item_add"]["item"]["item_url"]
-        records = [_record(row)]
-        scorer = PlausibilityScorer()
-        result = scorer._score_co_occurrence({"eslogger": records})
-        assert result.score < 100.0
+        # A missing required field is a schema failure owned by parseability;
+        # co-occurrence scoring skips it, so check the record rule directly.
+        assert _failed_rule_ids(_record(row))
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +368,7 @@ class TestExecBeforeExit:
             username="alice",
             start_time=T0,
         )
-        create_event = SecurityEvent(
+        create_event = OccurrenceBuilder(
             timestamp=T0, event_type="process_create", src_host=mac_host, process=create_proc
         )
         exec_row = next(r for r in _rows(emitter, create_event) if r["event_type"] == 9)
@@ -358,7 +376,7 @@ class TestExecBeforeExit:
         term_proc = ProcessContext(
             1500, 1, "/usr/bin/osascript", "osascript", "alice", start_time=T0
         )
-        term_event = SecurityEvent(
+        term_event = OccurrenceBuilder(
             timestamp=T0 + timedelta(minutes=2),
             event_type="process_terminate",
             src_host=mac_host,
@@ -385,7 +403,7 @@ class TestExecBeforeExit:
             username="alice",
             start_time=T0,
         )
-        create_event = SecurityEvent(
+        create_event = OccurrenceBuilder(
             timestamp=T0, event_type="process_create", src_host=mac_host, process=create_proc
         )
         exec_row = next(r for r in _rows(emitter, create_event) if r["event_type"] == 9)
@@ -393,7 +411,7 @@ class TestExecBeforeExit:
         term_proc = ProcessContext(
             1500, 1, "/usr/bin/osascript", "osascript", "alice", start_time=T0
         )
-        term_event = SecurityEvent(
+        term_event = OccurrenceBuilder(
             timestamp=T0 + timedelta(minutes=2),
             event_type="process_terminate",
             src_host=mac_host,
@@ -417,7 +435,7 @@ class TestPlistCreateBeforeBtm:
     def test_plist_create_before_btm_is_correct(self, emitter, mac_host):
         plist = "/Users/alice/Library/LaunchAgents/com.evil.persist.plist"
         proc = ProcessContext(1800, 1, "/bin/cp", "cp", "alice", start_time=T0)
-        create_event = SecurityEvent(
+        create_event = OccurrenceBuilder(
             timestamp=T0,
             event_type="file_create",
             src_host=mac_host,
@@ -427,7 +445,7 @@ class TestPlistCreateBeforeBtm:
         )
         create_row = _rows(emitter, create_event)[0]
 
-        btm_event = SecurityEvent(
+        btm_event = OccurrenceBuilder(
             timestamp=T0 + timedelta(seconds=2),
             event_type="btm_launch_item_add",
             src_host=mac_host,
@@ -459,7 +477,7 @@ class TestPlistCreateBeforeBtm:
         """
         plist = "/Users/alice/Library/LaunchAgents/com.evil.persist.plist"
         proc = ProcessContext(1800, 1, "/bin/cp", "cp", "alice", start_time=T0)
-        create_event = SecurityEvent(
+        create_event = OccurrenceBuilder(
             timestamp=T0,
             event_type="file_create",
             src_host=mac_host,
@@ -469,7 +487,7 @@ class TestPlistCreateBeforeBtm:
         )
         create_row = _rows(emitter, create_event)[0]
 
-        btm_event = SecurityEvent(
+        btm_event = OccurrenceBuilder(
             timestamp=T0 + timedelta(seconds=2),
             event_type="btm_launch_item_add",
             src_host=mac_host,
@@ -488,6 +506,7 @@ class TestPlistCreateBeforeBtm:
         }
         scorer = CausalityScorer()
         result = scorer._score_causal_ordering(records, _make_scenario())
-        # No pair is countable (skipped by allow_missing_prior), so this pair
-        # contributes nothing and the default "no applicable pairs" score holds.
-        assert result.score == 100.0
+        # No pair is countable (skipped by allow_missing_prior), so the inverted
+        # pair is never penalized and causal ordering reports nothing to score.
+        assert result.skipped
+        assert result.score is None

@@ -11,6 +11,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from evidenceforge.formats.rules import Finding
+
 
 class SubScore(BaseModel):
     """A sub-score within a quality pillar."""
@@ -24,6 +26,9 @@ class SubScore(BaseModel):
     adjusted: bool = False
     """True when the score excludes expected observation-profile gaps."""
     details: str = ""
+    sample_findings: list[Finding] = Field(default_factory=list)
+    unavailable_check_count: int = 0
+    sample_unavailable_findings: list[Finding] = Field(default_factory=list)
     sample_failures: list[str] = Field(default_factory=list)
     failure_summary: dict[str, dict[str, int]] = Field(default_factory=dict)
     """Aggregated failure counts by format and category.
@@ -43,6 +48,7 @@ class AcceptanceCriterion(BaseModel):
     aspirational: float | None = None
     actual: float | None = None
     passed: bool | None = None
+    applicable: bool | None = None
     meets_aspirational: bool | None = None
     level: Literal["hard", "target"]
 
@@ -63,6 +69,22 @@ class PillarScore(BaseModel):
 DimensionScore = PillarScore
 
 
+class EvaluationCategoryScore(BaseModel):
+    """Compatibility-independent score for one evaluation acceptance concern."""
+
+    key: Literal[
+        "source_schema",
+        "canonical_invariants",
+        "scenario_completeness",
+        "distribution_realism",
+        "expert_comparison",
+    ]
+    name: str
+    score: float | None = Field(None, ge=0.0, le=100.0)
+    sub_score_keys: list[str] = Field(default_factory=list)
+    details: str = ""
+
+
 class LLMSpotCheck(BaseModel):
     """Result of an optional LLM spot-check."""
 
@@ -81,6 +103,7 @@ class QualityReport(BaseModel):
     source_counts: dict[str, int] = Field(default_factory=dict)
     overall_score: float | None = Field(None, ge=0.0, le=100.0)
     pillars: list[PillarScore] = Field(default_factory=list)
+    categories: list[EvaluationCategoryScore] = Field(default_factory=list)
     acceptance_passed: bool | None = None
     acceptance_criteria: list[AcceptanceCriterion] = Field(default_factory=list)
     aspirational_met: int | None = None

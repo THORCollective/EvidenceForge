@@ -25,8 +25,12 @@
 from datetime import timedelta
 from typing import Any
 
-from evidenceforge.events.base import SecurityEvent
-from evidenceforge.generation.emitters.zeek_base import SensorMultiplexEmitter
+from evidenceforge.events.base import CanonicalOccurrence
+from evidenceforge.generation.emitters.zeek_base import (
+    SensorMultiplexEmitter,
+    planned_zeek_connection_interval,
+)
+from evidenceforge.generation.network_observation import network_source_timing_key
 from evidenceforge.generation.source_timing import SourceTimingPlanner
 
 _SOURCE_TIMING = SourceTimingPlanner()
@@ -38,7 +42,7 @@ class ZeekDnsEmitter(SensorMultiplexEmitter):
     Generates Zeek DNS query/response logs. Each record represents a DNS
     transaction with query name, type, response code, and answers.
 
-    Handles SecurityEvents with DnsContext (fan-out from connection events)
+    Handles canonical occurrences with DnsContext (fan-out from connection events)
     and also retains emit_raw() for backward compatibility.
     """
 
@@ -46,7 +50,7 @@ class ZeekDnsEmitter(SensorMultiplexEmitter):
     _flat_filename = "zeek_dns.json"
     _supported_types: set[str] = {"connection"}
 
-    def can_handle(self, event: SecurityEvent) -> bool:
+    def can_handle(self, event: CanonicalOccurrence) -> bool:
         """Handle connection events that carry a DnsContext."""
         return (
             event.event_type in self._supported_types
@@ -54,43 +58,67 @@ class ZeekDnsEmitter(SensorMultiplexEmitter):
             and event.dns is not None
         )
 
-    def emit(self, event: SecurityEvent) -> None:
-        """Render DnsContext + NetworkContext to Zeek dns.log NDJSON."""
+    def emit(self, event: CanonicalOccurrence) -> None:
+        """Render DnsContext + NetworkTransactionPlan to Zeek dns.log NDJSON."""
         net = event.network
         dns = event.dns
-        conn_ts = _SOURCE_TIMING.source_time(
-            event,
-            "source.zeek_conn_start",
-            seed_parts=(
-                net.zeek_uid,
-                net.src_ip,
-                net.src_port,
-                net.dst_ip,
-                net.dst_port,
-                event.timestamp,
-            ),
-            not_before=event.timestamp,
+        planned_interval = planned_zeek_connection_interval(event)
+        if planned_interval is not None:
+            conn_ts, planned_close = planned_interval
+        else:
+            planned_close = None
+            conn_ts = _SOURCE_TIMING.source_time(
+                event,
+                "source.zeek_conn_start",
+                seed_parts=(
+                    net.zeek_uid,
+                    net.src_ip,
+                    net.src_port,
+                    net.dst_ip,
+                    net.dst_port,
+                    event.timestamp,
+                ),
+                not_before=event.timestamp,
+            )
+        conn_lifetime = (
+            (planned_close - conn_ts).total_seconds()
+            if planned_close is not None
+            else net.duration
+            if net.duration is not None
+            else dns.rtt
         )
-        conn_lifetime = net.duration if net.duration is not None else dns.rtt
+        timing_key = network_source_timing_key("zeek_dns")
+        single_exchange_udp = (
+            net.protocol == "udp"
+            and net.history == "Dd"
+            and net.orig_pkts == 1
+            and net.resp_pkts == 1
+            and dns.rtt is not None
+            and conn_lifetime is not None
+        )
         within = None
         if conn_lifetime is not None and conn_lifetime > 0:
             rtt = dns.rtt or 0.0
             latest_offset = max(0.0, conn_lifetime - rtt - 0.000001)
             latest = conn_ts + timedelta(seconds=latest_offset)
             within = (conn_ts, latest)
-        event_ts = _SOURCE_TIMING.source_time(
-            event,
-            "source.zeek_dns_query",
-            seed_parts=(
-                net.zeek_uid,
-                net.src_ip,
-                net.src_port,
-                net.dst_ip,
-                net.dst_port,
-                event.timestamp,
-            ),
-            not_before=conn_ts,
-            within=within,
+        event_ts = (
+            conn_ts
+            if single_exchange_udp and planned_interval is None
+            else _SOURCE_TIMING.source_time(
+                event,
+                "source.zeek_dns_query",
+                seed_parts=(
+                    net.zeek_uid,
+                    net.src_ip,
+                    net.src_port,
+                    net.dst_ip,
+                    net.dst_port,
+                    event.timestamp,
+                ),
+                not_before=conn_ts,
+                within=within,
+            )
         )
         event_data: dict[str, Any] = {
             "ts": event_ts,
@@ -118,20 +146,20 @@ class ZeekDnsEmitter(SensorMultiplexEmitter):
             "opcode_name": dns.opcode_name,
         }
         if dns.rtt is not None:
-            event_data["rtt"] = dns.rtt
+            event_data["rtt"] = conn_lifetime if single_exchange_udp else dns.rtt
         if dns.answers:
             event_data["answers"] = dns.answers
         if dns.TTLs:
             event_data["TTLs"] = dns.TTLs
-        event_data["_allow_sensor_observation_variance"] = True
-
-        # Sensor hostname routing (set by dispatcher for network visibility)
-        event_data["_sensor_hostnames"] = event._sensor_hostnames_by_format.get(
-            self.format_def.name if self.format_def else "zeek_dns", []
+        event_data.update(
+            self._sensor_metadata(
+                event,
+                self.format_def.name if self.format_def else "zeek_dns",
+            )
         )
-
-        if event._nat_swaps_by_sensor:
-            event_data["_nat_swaps_by_sensor"] = event._nat_swaps_by_sensor
+        event_data["_source_timing_key"] = timing_key
+        event_data["_source_duration_key"] = timing_key
+        event_data["_source_duration_field"] = "rtt"
         self.emit_event(event_data)
 
     def _render_event(self, event_data: dict[str, Any]) -> str:

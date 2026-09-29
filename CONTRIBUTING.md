@@ -52,16 +52,23 @@ lint/format checks:
 
 ```bash
 uv sync --all-extras
-uv run pytest --no-cov
+uv run pytest
 uv run ruff check .
 uv run ruff format --check .
 ```
 
-Run the slow comprehensive workload suite without coverage when your change
-touches generation behavior or before a release PR:
+Run the extended release gate without coverage when your change touches
+generation behavior or before a release PR:
 
 ```bash
-uv run pytest --include-slow -m slow --no-cov --durations=20
+uv run pytest -m slow --no-cov --durations=20
+```
+
+Million-entry, multi-week, exhaustive-matrix, and full-demo diagnostics are
+not release gates. Run only the soak tests relevant to the changed owner:
+
+```bash
+uv run pytest -m soak --no-cov --durations=20
 ```
 
 Run optional third-party parser validation when touching emitted log formats
@@ -137,8 +144,8 @@ cd EvidenceForge
 # Install dependencies and development tools (requires uv: https://docs.astral.sh/uv/)
 uv sync --all-extras
 
-# Run the test suite without coverage instrumentation (skips slow by default)
-uv run pytest --no-cov
+# Run the routine test tier (coverage is opt-in)
+uv run pytest
 
 # Lint and format
 uv run ruff check .
@@ -147,22 +154,27 @@ uv run ruff format --check .
 
 ### Test Markers
 
-- `@pytest.mark.slow`: large dataset and workload tests, skipped by default and normally
-  run without coverage instrumentation
+- `@pytest.mark.slow`: extended release-gate tests, excluded by default and run with
+  `uv run pytest -m slow --no-cov`. This lane holds distinct expensive fault matrices,
+  fresh-process determinism checks, and representative end-to-end generation.
+- `@pytest.mark.soak`: exceptional million-entry, multi-week, exhaustive-matrix, or full-demo
+  diagnostics,
+  excluded by routine and release gates. Run only when relevant with
+  `uv run pytest -m soak --no-cov`. Slow and soak are mutually exclusive tiers.
 - `@pytest.mark.external_parser`: third-party parser container tests, skipped by default
   and normally run only in an explicitly opted-in local or CI lane
 
 ```bash
 # Normal fast run
-uv run pytest --no-cov
+uv run pytest
 
 # Slow comprehensive run
-uv run pytest --include-slow -m slow --no-cov --durations=20
+uv run pytest -m slow --no-cov --durations=20
 
 # External parser run
 uv run pytest --include-external-parsers -m external_parser --no-cov
 
-# Release coverage gate; do not combine with --include-slow
+# Release coverage gate; do not combine with -m slow or -m soak
 uv run pytest --cov=evidenceforge --cov-report=term-missing --cov-report=xml --cov-fail-under=70
 ```
 
@@ -214,3 +226,20 @@ you can do:
 - Improve documentation or add tutorials.
 
 Thanks again for your interest in contributing to EvidenceForge!
+
+### Native Windows CI
+
+Routine CI runs Python 3.12 on Ubuntu and native Windows, with `uv run pytest --no-cov`.
+The routine suite includes a short real generation, checkpoint, cooperative suspension,
+verification, and fresh-process resume comparison against uninterrupted output. The same test
+runs during normal local macOS testing. Broad checkpoint fault/interruption tests remain in the
+Linux slow release gate for PRs into main.
+
+Native Windows uses an isolated local NTFS backend for protected output journals and checkpoints;
+macOS and Linux retain their POSIX implementations. The routine timeout is 45 minutes on Windows
+and 25 minutes on Linux. Small native API contracts run in the routine suite. A separate required
+Windows checkpoint durability job runs focused slow simulated power-loss recovery tests with a
+20-minute timeout. These tests validate the documented storage assumptions, not physical power-loss
+certification. See the
+[native Windows design](docs/design/native-windows-filesystem.md) for platform limits. Do not
+blanket-skip portable failures or disable publication protections to make the job green.

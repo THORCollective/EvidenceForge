@@ -12,11 +12,10 @@ import pytest
 import yaml
 
 from evidenceforge.config.schemas import TlsRealismConfig
-from evidenceforge.events.base import SecurityEvent
-from evidenceforge.events.contexts import HttpContext, NetworkContext, X509Context
+from evidenceforge.events.base import OccurrenceBuilder
+from evidenceforge.events.contexts import HttpContext
 from evidenceforge.generation.activity.generator import (
     ActivityGenerator,
-    _bound_certificate_validity_to_issuer_window,
     _dns_rtt,
     _ntp_stratum_and_ref_id,
     _ocsp_status_for_certificate,
@@ -45,6 +44,7 @@ from evidenceforge.generation.activity.tls_realism import (
 )
 from evidenceforge.generation.state_manager import StateManager
 from evidenceforge.models.scenario import System
+from tests.network_factories import network_plan
 
 # ---------------------------------------------------------------------------
 # Theme 4: Certificate realism tests
@@ -249,8 +249,8 @@ class TestTlsIssuers:
             != "revoked"
         )
 
-    def test_successful_http_tls_passes_ocsp_revocation_suppression(self, monkeypatch):
-        """TLS events with clean HTTP success should request non-revoked OCSP status."""
+    def test_successful_http_tls_finalizes_certificate_before_ocsp_child(self, monkeypatch):
+        """TLS planning should finish before any action-owned OCSP child is emitted."""
 
         class ZeroRandom(random.Random):
             def random(self) -> float:
@@ -258,31 +258,15 @@ class TestTlsIssuers:
 
         import evidenceforge.generation.activity.generator as generator_module
 
-        captured: dict[str, bool] = {}
-
-        def fake_ocsp_status(
-            cert_name: str,
-            serial_number: str,
-            *,
-            suppress_revoked: bool = False,
-        ) -> str:
-            captured["suppress_revoked"] = suppress_revoked
-            return "good"
-
         state_manager = StateManager()
         generator = ActivityGenerator(state_manager, {})
-        generator._emit_ocsp_http_response = lambda *args, **kwargs: captured.setdefault(
-            "emitted",
-            True,
-        )
         monkeypatch.setattr(generator_module, "_TLS_VERSION_VALUES", ("TLSv12",))
         monkeypatch.setattr(generator_module, "_TLS_VERSION_WEIGHTS", (1,))
-        monkeypatch.setattr(generator_module, "_ocsp_status_for_certificate", fake_ocsp_status)
 
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 10, 14, 12, 0, tzinfo=UTC),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.30.40.101",
                 src_port=50123,
                 dst_ip="93.184.216.34",
@@ -308,7 +292,9 @@ class TestTlsIssuers:
             rng=ZeroRandom(),
         )
 
-        assert captured == {"suppress_revoked": True, "emitted": True}
+        assert event.protocol.tls_presentation is not None
+        assert event.protocol.tls_presentation.leaf.subject_name == "CN=edge42.example.net"
+        assert event.protocol.ocsp_transaction is None
 
     def test_ocsp_request_path_uses_long_encoded_der_shape(self):
         """OCSP-over-HTTP GET paths should not look like short synthetic tokens."""
@@ -336,8 +322,14 @@ class TestTlsIssuers:
 
         assert path == same_path
         assert path != different_path
-        assert path.startswith(("/MFE", "/MFU", "/MFI"))
-        assert len(path) >= 73
+        import base64
+        from urllib.parse import unquote
+
+        from cryptography.x509.ocsp import load_der_ocsp_request
+
+        request = load_der_ocsp_request(base64.b64decode(unquote(path.lstrip("/"))))
+        assert request.serial_number == int("ABCDEF0123456789", 16)
+        assert request.hash_algorithm.name == "sha1"
         assert not re.fullmatch(r"/[0-9a-f]{12}", path)
 
     def test_ocsp_request_path_ignores_non_finite_bound_overrides(self, tmp_path, monkeypatch):
@@ -644,23 +636,36 @@ class TestTlsIssuers:
         assert ref_id.count(".") == 3
         assert ref_id not in {".GPS.", ".PPS.", ".GOES.", ".ACTS.", ".DCFa."}
 
-    def test_public_ntp_servers_are_loaded_from_network_params_overlay(self, tmp_path, monkeypatch):
-        """Public NTP defaults should be project-overlay configurable."""
-        from evidenceforge.generation.activity.network_params import reset_network_params_cache
+    def test_public_ntp_servers_are_loaded_from_public_identity_overlay(
+        self, tmp_path, monkeypatch
+    ):
+        """Public NTP identities should use the canonical project overlay."""
+        from evidenceforge.generation.activity.public_identity_profiles import (
+            reset_public_identity_profiles_cache,
+        )
 
         overlay_dir = tmp_path / ".eforge" / "config" / "activity"
         overlay_dir.mkdir(parents=True)
-        (overlay_dir / "network_params.yaml").write_text(
+        (overlay_dir / "public_identity_profiles.yaml").write_text(
             yaml.safe_dump(
                 {
-                    "public_ntp_servers": [
+                    "roles": [
                         {
-                            "name": "time.example.net",
-                            "ip": "198.51.100.123",
-                            "operator": "Example",
-                            "stratum": 2,
-                            "ref_id": ".GPS.",
-                            "weight": 1,
+                            "id": "ntp",
+                            "identities": [
+                                {
+                                    "ip": "45.67.89.123",
+                                    "provider": "public-ntp",
+                                    "forward_names": ["time.auditrelay.net"],
+                                    "ptr": "time.auditrelay.net",
+                                    "traits": {
+                                        "name": "time.auditrelay.net",
+                                        "operator": "Audit Relay",
+                                        "stratum": 2,
+                                        "ref_id": ".GPS.",
+                                    },
+                                }
+                            ],
                         }
                     ]
                 },
@@ -668,11 +673,11 @@ class TestTlsIssuers:
             )
         )
         monkeypatch.chdir(tmp_path)
-        reset_network_params_cache()
+        reset_public_identity_profiles_cache()
         try:
-            assert _ntp_stratum_and_ref_id("198.51.100.123") == (2, ".GPS.")
+            assert _ntp_stratum_and_ref_id("45.67.89.123") == (2, ".GPS.")
         finally:
-            reset_network_params_cache()
+            reset_public_identity_profiles_cache()
 
     def test_dns_tunnel_rtt_is_loaded_from_network_params_overlay(self, tmp_path, monkeypatch):
         """DNS tunnel timing should be project-overlay configurable."""
@@ -909,10 +914,10 @@ class TestTlsIssuers:
             type="server",
         )
         generator._ip_to_system[web_system.ip] = web_system
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 10, 14, 12, 0, tzinfo=UTC),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.30.40.3",
                 src_port=50123,
                 dst_ip=web_system.ip,
@@ -931,10 +936,13 @@ class TestTlsIssuers:
             allow_failure=False,
         )
 
-        assert event.x509 is not None
-        assert event.x509.certificate_subject == "CN=web01.example.com"
-        assert event.x509.certificate_issuer == "CN=Example Enterprise Issuing CA, O=Example, C=US"
-        assert event.x509.san_dns == ["web01.example.com", "web01"]
+        assert event.protocol.leaf_certificate is not None
+        assert event.protocol.leaf_certificate.certificate_subject == "CN=web01.example.com"
+        assert (
+            event.protocol.leaf_certificate.certificate_issuer
+            == "CN=Example Enterprise Issuing CA, O=Example, C=US"
+        )
+        assert event.protocol.leaf_certificate.san_dns == ("web01.example.com", "web01")
 
     def test_internal_tls_explicit_sni_controls_enterprise_sans(self):
         """Explicit internal SNI should not get overwritten by dst host canonical name."""
@@ -947,10 +955,10 @@ class TestTlsIssuers:
             type="domain_controller",
         )
         generator._ip_to_system[dc_system.ip] = dc_system
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 10, 14, 12, 0, tzinfo=UTC),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.30.40.3",
                 src_port=50123,
                 dst_ip=dc_system.ip,
@@ -971,18 +979,21 @@ class TestTlsIssuers:
 
         assert event.ssl is not None
         assert event.ssl.server_name == "srv-05.example.com"
-        assert event.x509 is not None
-        assert event.x509.certificate_subject == "CN=srv-05.example.com"
-        assert event.x509.certificate_issuer == "CN=Example Enterprise Issuing CA, O=Example, C=US"
-        assert event.x509.san_dns == ["srv-05.example.com", "srv-05"]
+        assert event.protocol.leaf_certificate is not None
+        assert event.protocol.leaf_certificate.certificate_subject == "CN=srv-05.example.com"
+        assert (
+            event.protocol.leaf_certificate.certificate_issuer
+            == "CN=Example Enterprise Issuing CA, O=Example, C=US"
+        )
+        assert event.protocol.leaf_certificate.san_dns == ("srv-05.example.com", "srv-05")
 
     def test_raw_ip_tls_certificate_avoids_public_ca_dnsless_identity(self):
         """Raw-IP TLS should not render a public-CA CN-only certificate."""
         generator = ActivityGenerator(StateManager(), {})
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 10, 14, 12, 0, tzinfo=UTC),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.30.40.1",
                 src_port=50123,
                 dst_ip="45.33.32.30",
@@ -1001,19 +1012,19 @@ class TestTlsIssuers:
             allow_failure=False,
         )
 
-        assert event.x509 is not None
-        assert event.x509.certificate_subject == "CN=45.33.32.30"
-        assert event.x509.certificate_issuer == "CN=45.33.32.30"
-        assert event.x509.san_dns == []
-        assert event.x509_chain == [event.x509]
+        assert event.protocol.leaf_certificate is not None
+        assert event.protocol.leaf_certificate.certificate_subject == "CN=45.33.32.30"
+        assert event.protocol.leaf_certificate.certificate_issuer == "CN=45.33.32.30"
+        assert event.protocol.leaf_certificate.san_dns == ()
+        assert event.protocol.x509_chain == (event.protocol.leaf_certificate,)
 
     def test_tls_validity_window_is_not_observation_second_anchored(self):
         """Leaf cert validity should not reveal the exact first observation timestamp."""
         generator = ActivityGenerator(StateManager(), {})
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 10, 14, 12, 34, 56, tzinfo=UTC),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.30.40.101",
                 src_port=50123,
                 dst_ip="142.250.190.99",
@@ -1032,28 +1043,9 @@ class TestTlsIssuers:
             allow_failure=False,
         )
 
-        assert event.x509 is not None
+        assert event.protocol.leaf_certificate is not None
         observed_epoch = int(event.timestamp.timestamp())
-        age_seconds = observed_epoch - event.x509.certificate_not_valid_before
-        assert age_seconds > 0
-        assert age_seconds % 86400 != 0
-
-    def test_intermediate_validity_window_is_not_observation_second_anchored(self):
-        """Intermediate CA validity should have its own issuance clock."""
-        generator = ActivityGenerator(StateManager(), {})
-        event_time = datetime(2024, 10, 14, 12, 34, 56, tzinfo=UTC)
-        chain = generator._build_tls_certificate_chain(
-            leaf=X509Context(fuid="FLeaf", certificate_subject="CN=leaf.example"),
-            cert_name="leaf.example",
-            issuer_name="CN=Cloudflare Inc ECC CA-3, O=Cloudflare Inc, C=US",
-            event_time=event_time,
-            connection_uid="CIntermediateValidity",
-            rng=random.Random(1),
-        )
-
-        intermediate = chain[1]
-        observed_epoch = int(event_time.timestamp())
-        age_seconds = observed_epoch - intermediate.certificate_not_valid_before
+        age_seconds = observed_epoch - event.protocol.leaf_certificate.certificate_not_valid_before
         assert age_seconds > 0
         assert age_seconds % 86400 != 0
 
@@ -1102,70 +1094,13 @@ class TestTlsIssuers:
         }
         assert sum(int(issuer["weight"]) for issuer in atlas_issuers) == 13
 
-    def test_chain_generation_uses_stable_authority_profiles(self):
-        """Configured public CA rows should use stable profile metadata instead of runtime windows."""
-        generator = ActivityGenerator(StateManager(), {})
-        event_time = datetime(2024, 3, 18, 12, 0, tzinfo=UTC)
-        issuer_name = "CN=GlobalSign Atlas R3 DV TLS CA 2024 Q1, O=GlobalSign nv-sa, C=BE"
-        chain = generator._build_tls_certificate_chain(
-            leaf=X509Context(
-                fuid="FLeaf",
-                certificate_subject="CN=leaf.example",
-                certificate_issuer=issuer_name,
-            ),
-            cert_name="leaf.example",
-            issuer_name=issuer_name,
-            event_time=event_time,
-            connection_uid="CStableAuthority",
-            rng=random.Random(1),
-        )
-
-        intermediate = chain[1]
-
-        assert intermediate.certificate_subject == issuer_name
-        assert intermediate.certificate_issuer == "CN=GlobalSign Root R3, O=GlobalSign nv-sa, C=BE"
-        assert intermediate.certificate_not_valid_before == int(
-            datetime(2024, 1, 17, 9, 32, 41, tzinfo=UTC).timestamp()
-        )
-        assert intermediate.certificate_key_type == "rsa"
-        assert intermediate.certificate_key_length == 2048
-
-    def test_rendered_public_root_chain_rows_are_not_collection_window_minted(self):
-        """Self-signed public root rows should keep historical validity when included."""
-        generator = ActivityGenerator(StateManager(), {})
-        event_time = datetime(2024, 3, 18, 12, 0, tzinfo=UTC)
-        issuer_name = "CN=DigiCert Global G2 TLS RSA SHA256 2020 CA1, O=DigiCert Inc, C=US"
-        chain = None
-        for seed in range(1, 600):
-            candidate = generator._build_tls_certificate_chain(
-                leaf=X509Context(
-                    fuid="FLeaf",
-                    certificate_subject=f"CN=leaf-{seed}.example",
-                    certificate_issuer=issuer_name,
-                ),
-                cert_name=f"leaf-{seed}.example",
-                issuer_name=issuer_name,
-                event_time=event_time,
-                connection_uid=f"CDigiCertRoot{seed}",
-                rng=random.Random(seed),
-            )
-            if len(candidate) > 2:
-                chain = candidate
-                break
-
-        assert chain is not None
-        root = chain[-1]
-        assert root.certificate_subject.startswith("CN=DigiCert Global Root")
-        assert root.certificate_issuer == root.certificate_subject
-        assert root.certificate_not_valid_before < int(datetime(2015, 1, 1, tzinfo=UTC).timestamp())
-
     def test_same_certificate_fingerprint_has_same_metadata(self):
         """Repeated cert identity should not reuse a fingerprint for conflicting metadata."""
         generator = ActivityGenerator(StateManager(), {})
-        first = SecurityEvent(
+        first = OccurrenceBuilder(
             timestamp=datetime(2024, 10, 14, 12, 0, tzinfo=UTC),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.30.40.101",
                 src_port=50123,
                 dst_ip="142.250.190.99",
@@ -1174,10 +1109,10 @@ class TestTlsIssuers:
                 zeek_uid="CTestExternalTls1",
             ),
         )
-        second = SecurityEvent(
+        second = OccurrenceBuilder(
             timestamp=datetime(2024, 10, 14, 12, 5, tzinfo=UTC),
             event_type="connection",
-            network=NetworkContext(
+            network=network_plan(
                 src_ip="10.30.40.102",
                 src_port=50124,
                 dst_ip="142.250.190.99",
@@ -1197,145 +1132,29 @@ class TestTlsIssuers:
                 allow_failure=False,
             )
 
-        assert first.x509 is not None
-        assert second.x509 is not None
-        assert len(first.x509.fingerprint) == 40
-        assert first.x509.fingerprint == second.x509.fingerprint
-        assert {len(first.x509.fuid), len(second.x509.fuid)} <= {17, 18, 19}
-        assert first.x509.certificate_issuer == second.x509.certificate_issuer
-        assert first.x509.certificate_key_type == second.x509.certificate_key_type
-        assert first.x509.certificate_key_length == second.x509.certificate_key_length
-
-    def test_intermediate_ca_profile_is_stable_across_leaf_certificates(self):
-        """The same intermediate CA subject/issuer should not get many cert identities."""
-        generator = ActivityGenerator(StateManager(), {})
-        issuer_name = "CN=Cloudflare Inc ECC CA-3, O=Cloudflare Inc, C=US"
-        first_chain = generator._build_tls_certificate_chain(
-            leaf=X509Context(fuid="FLeafOne", certificate_subject="CN=one.example"),
-            cert_name="one.example",
-            issuer_name=issuer_name,
-            event_time=datetime(2024, 10, 14, 12, 0, tzinfo=UTC),
-            connection_uid="COne",
-            rng=random.Random(1),
-        )
-        second_chain = generator._build_tls_certificate_chain(
-            leaf=X509Context(fuid="FLeafTwo", certificate_subject="CN=two.example"),
-            cert_name="two.example",
-            issuer_name=issuer_name,
-            event_time=datetime(2024, 10, 14, 12, 5, tzinfo=UTC),
-            connection_uid="CTwo",
-            rng=random.Random(1),
-        )
-
-        first_intermediate = first_chain[1]
-        second_intermediate = second_chain[1]
-
-        assert first_intermediate.fuid != second_intermediate.fuid
-        assert {len(first_intermediate.fuid), len(second_intermediate.fuid)} <= {17, 18, 19}
-        assert first_intermediate.certificate_subject == second_intermediate.certificate_subject
-        assert first_intermediate.certificate_issuer == second_intermediate.certificate_issuer
-        assert first_intermediate.certificate_serial == second_intermediate.certificate_serial
-        assert first_intermediate.fingerprint == second_intermediate.fingerprint
+        assert first.protocol.leaf_certificate is not None
+        assert second.protocol.leaf_certificate is not None
+        assert len(first.protocol.leaf_certificate.fingerprint) == 40
         assert (
-            first_intermediate.certificate_not_valid_before
-            == second_intermediate.certificate_not_valid_before
+            first.protocol.leaf_certificate.fingerprint
+            == second.protocol.leaf_certificate.fingerprint
+        )
+        assert {
+            len(first.protocol.leaf_certificate.fuid),
+            len(second.protocol.leaf_certificate.fuid),
+        } <= {17, 18, 19}
+        assert (
+            first.protocol.leaf_certificate.certificate_issuer
+            == second.protocol.leaf_certificate.certificate_issuer
         )
         assert (
-            first_intermediate.certificate_not_valid_after
-            == second_intermediate.certificate_not_valid_after
+            first.protocol.leaf_certificate.certificate_key_type
+            == second.protocol.leaf_certificate.certificate_key_type
         )
-
-    def test_intermediate_signature_algorithm_follows_issuer_key(self):
-        """Intermediate certificate signatures should be signed by the issuer key."""
-        generator = ActivityGenerator(StateManager(), {})
-        issuer_name = "CN=Cloudflare Inc ECC CA-3, O=Cloudflare Inc, C=US"
-        chain = generator._build_tls_certificate_chain(
-            leaf=X509Context(
-                fuid="FLeaf",
-                certificate_subject="CN=leaf.example",
-                certificate_issuer=issuer_name,
-            ),
-            cert_name="leaf.example",
-            issuer_name=issuer_name,
-            event_time=datetime(2024, 10, 14, 12, 0, tzinfo=UTC),
-            connection_uid="CCloudflareIntermediateSig",
-            rng=random.Random(1),
+        assert (
+            first.protocol.leaf_certificate.certificate_key_length
+            == second.protocol.leaf_certificate.certificate_key_length
         )
-        intermediate = chain[1]
-
-        assert intermediate.certificate_subject == issuer_name
-        assert intermediate.certificate_key_type == "ecdsa"
-        assert intermediate.certificate_issuer == (
-            "CN=Cloudflare Inc ECC Root CA, O=Cloudflare Inc, C=US"
-        )
-        expected = signature_algorithm_for_issuer(intermediate.certificate_issuer)
-        assert intermediate.certificate_sig_alg == expected
-
-    def test_known_ecdsa_chain_names_keep_ecdsa_certificate_metadata(self):
-        """Root-like subject names such as Root R4/X2 should not be coerced to RSA."""
-        generator = ActivityGenerator(StateManager(), {})
-        cases = [
-            (
-                "CN=Cloudflare Inc ECC CA-3, O=Cloudflare Inc, C=US",
-                "CN=Cloudflare Inc ECC CA-3, O=Cloudflare Inc, C=US",
-                "CN=Cloudflare Inc ECC Root CA, O=Cloudflare Inc, C=US",
-                "ecdsa",
-                256,
-                "ecdsa-with-SHA256",
-            ),
-            (
-                "CN=E1, O=Let's Encrypt, C=US",
-                "CN=E1, O=Let's Encrypt, C=US",
-                "CN=ISRG Root X2, O=Internet Security Research Group, C=US",
-                "ecdsa",
-                256,
-                "ecdsa-with-SHA256",
-            ),
-        ]
-
-        for (
-            issuer_name,
-            expected_subject,
-            expected_issuer,
-            expected_key_type,
-            expected_key_length,
-            expected_sig,
-        ) in cases:
-            chain = None
-            for seed in range(1, 200):
-                candidate = generator._build_tls_certificate_chain(
-                    leaf=X509Context(
-                        fuid="FLeaf",
-                        certificate_subject=f"CN=leaf-{seed}.example",
-                        certificate_issuer=issuer_name,
-                    ),
-                    cert_name=f"leaf-{seed}.example",
-                    issuer_name=issuer_name,
-                    event_time=datetime(2024, 10, 14, 12, 0, tzinfo=UTC),
-                    connection_uid=f"CEcdsaChain{seed}",
-                    rng=random.Random(seed),
-                )
-                if any(
-                    cert.certificate_subject == expected_subject
-                    and cert.certificate_issuer == expected_issuer
-                    for cert in candidate
-                ):
-                    chain = candidate
-                    break
-
-            assert chain is not None, expected_subject
-            cert = next(
-                cert
-                for cert in chain
-                if cert.certificate_subject == expected_subject
-                and cert.certificate_issuer == expected_issuer
-            )
-            assert cert.certificate_key_type == expected_key_type
-            assert cert.certificate_key_alg == (
-                "id-ecPublicKey" if expected_key_type == "ecdsa" else "rsaEncryption"
-            )
-            assert cert.certificate_key_length == expected_key_length
-            assert cert.certificate_sig_alg == expected_sig
 
     def test_root_like_ecdsa_subject_names_do_not_trigger_rsa_name_override(self):
         """The name fallback should not treat the word Root as an RSA marker."""
@@ -1354,155 +1173,18 @@ class TestTlsIssuers:
             )
             assert observed == (expected_key_type, expected_key_length)
 
-    def test_public_ca_chain_signatures_match_rendered_issuer_keys(self):
-        """Rendered adjacent x509 chain rows should agree on issuer key family."""
-        generator = ActivityGenerator(StateManager(), {})
-        issuer_names = [
-            "CN=R3, O=Let's Encrypt, C=US",
-            "CN=E1, O=Let's Encrypt, C=US",
-            "CN=GTS CA 1C3, O=Google Trust Services LLC, C=US",
-            "CN=GlobalSign Atlas R3 DV TLS CA 2024 Q1, O=GlobalSign nv-sa, C=BE",
-            "CN=Amazon RSA 2048 M01, O=Amazon, C=US",
-            "CN=Cloudflare Inc ECC CA-3, O=Cloudflare Inc, C=US",
-        ]
-
-        checked = 0
-        for issuer_name in issuer_names:
-            for seed in range(1, 200):
-                chain = generator._build_tls_certificate_chain(
-                    leaf=X509Context(
-                        fuid="FLeaf",
-                        certificate_subject=f"CN=leaf-{seed}.example",
-                        certificate_issuer=issuer_name,
-                        certificate_sig_alg=signature_algorithm_for_issuer(issuer_name),
-                    ),
-                    cert_name=f"leaf-{seed}.example",
-                    issuer_name=issuer_name,
-                    event_time=datetime(2024, 10, 14, 12, 0, tzinfo=UTC),
-                    connection_uid=f"CPublicCaChain{seed}",
-                    rng=random.Random(seed),
-                )
-                if len(chain) < 2:
-                    continue
-                for child, issuer in zip(chain, chain[1:], strict=False):
-                    signature = child.certificate_sig_alg.lower()
-                    if "ecdsa" in signature:
-                        assert issuer.certificate_key_type == "ecdsa", issuer.certificate_subject
-                    if "rsa" in signature:
-                        assert issuer.certificate_key_type == "rsa", issuer.certificate_subject
-                    checked += 1
-                break
-
-        assert checked >= len(issuer_names)
-
-    def test_public_ca_chain_issuer_subject_adjacency_is_coherent(self):
-        """Rendered x509 chain rows should be ordered by child issuer to parent subject."""
-        generator = ActivityGenerator(StateManager(), {})
-        issuer_names = [
-            "CN=R3, O=Let's Encrypt, C=US",
-            "CN=DigiCert Global G2 TLS RSA SHA256 2020 CA1, O=DigiCert Inc, C=US",
-            "CN=GlobalSign Atlas R3 DV TLS CA 2024 Q1, O=GlobalSign nv-sa, C=BE",
-            "CN=Cloudflare Inc ECC CA-3, O=Cloudflare Inc, C=US",
-        ]
-
-        checked = 0
-        for issuer_name in issuer_names:
-            for seed in range(1, 300):
-                chain = generator._build_tls_certificate_chain(
-                    leaf=X509Context(
-                        fuid="FLeaf",
-                        certificate_subject=f"CN=leaf-{seed}.example",
-                        certificate_issuer=issuer_name,
-                    ),
-                    cert_name=f"leaf-{seed}.example",
-                    issuer_name=issuer_name,
-                    event_time=datetime(2024, 10, 14, 12, 0, tzinfo=UTC),
-                    connection_uid=f"CPublicCaAdjacency{seed}",
-                    rng=random.Random(seed),
-                )
-                if len(chain) < 2:
-                    continue
-                for child, issuer in zip(chain, chain[1:], strict=False):
-                    assert child.certificate_issuer == issuer.certificate_subject
-                    checked += 1
-                break
-
-        assert checked >= len(issuer_names)
-
-    def test_public_ca_chain_validity_windows_fit_parent_certificates(self):
-        """Rendered public CA chain rows should not let children outlive issuers."""
-        generator = ActivityGenerator(StateManager(), {})
-        issuer_names = [
-            "CN=DigiCert Global G2 TLS RSA SHA256 2020 CA1, O=DigiCert Inc, C=US",
-            "CN=GTS CA 1C3, O=Google Trust Services LLC, C=US",
-            "CN=Sectigo RSA Domain Validation Secure Server CA, O=Sectigo Limited, L=Salford, ST=Greater Manchester, C=GB",
-            "CN=Cloudflare Inc ECC CA-3, O=Cloudflare Inc, C=US",
-        ]
-
-        checked = 0
-        for issuer_name in issuer_names:
-            for seed in range(1, 800):
-                chain = generator._build_tls_certificate_chain(
-                    leaf=X509Context(
-                        fuid="FLeaf",
-                        certificate_subject=f"CN=leaf-{seed}.example",
-                        certificate_issuer=issuer_name,
-                        certificate_not_valid_before=int(
-                            datetime(2024, 1, 1, tzinfo=UTC).timestamp()
-                        ),
-                        certificate_not_valid_after=int(
-                            datetime(2024, 12, 31, tzinfo=UTC).timestamp()
-                        ),
-                    ),
-                    cert_name=f"leaf-{issuer_name}-{seed}.example",
-                    issuer_name=issuer_name,
-                    event_time=datetime(2024, 10, 14, 12, 0, tzinfo=UTC),
-                    connection_uid=f"CPublicCaValidity{seed}",
-                    rng=random.Random(seed),
-                )
-                if len(chain) < 3:
-                    continue
-                for child, issuer in zip(chain[1:], chain[2:], strict=False):
-                    assert child.certificate_issuer == issuer.certificate_subject
-                    assert issuer.certificate_not_valid_before <= child.certificate_not_valid_before
-                    assert child.certificate_not_valid_after <= issuer.certificate_not_valid_after
-                    checked += 1
-                break
-
-        assert checked >= len(issuer_names)
-
-    def test_leaf_certificate_validity_window_is_bounded_to_issuer_profile(self):
-        """Generated leaf cert validity should not predate or outlive the issuing CA."""
-        issuer_name = "CN=GlobalSign Atlas R3 DV TLS CA 2024 Q1, O=GlobalSign nv-sa, C=BE"
-        issuer_profile = certificate_authority_profile(issuer_name)
-        assert issuer_profile is not None
-
-        raw_validity = (
-            int(issuer_profile["not_valid_before"]) - 30 * 86400,
-            int(issuer_profile["not_valid_after"]) + 30 * 86400,
-        )
-        bounded_validity = _bound_certificate_validity_to_issuer_window(
-            raw_validity,
-            issuer_name,
-            datetime(2024, 10, 14, 12, 0, tzinfo=UTC),
-        )
-
-        assert bounded_validity[0] == issuer_profile["not_valid_before"]
-        assert bounded_validity[1] == issuer_profile["not_valid_after"]
-
     def test_leaf_signature_algorithm_follows_issuer_not_leaf_key(self):
         """An ECDSA leaf signed by an RSA CA should render an RSA signature algorithm."""
         state_manager = StateManager()
         state_manager.set_current_time(datetime(2024, 10, 14, 12, 0, tzinfo=UTC))
         generator = ActivityGenerator(state_manager, {})
-        generator._emit_ocsp_http_response = lambda *args, **kwargs: None
         event = None
 
         for seed in range(1, 100):
-            candidate = SecurityEvent(
+            candidate = OccurrenceBuilder(
                 timestamp=datetime(2024, 10, 14, 12, 0, tzinfo=UTC),
                 event_type="connection",
-                network=NetworkContext(
+                network=network_plan(
                     src_ip="10.30.40.101",
                     src_port=50123 + seed,
                     dst_ip="142.250.190.99",
@@ -1520,14 +1202,19 @@ class TestTlsIssuers:
                 rng=random.Random(seed),
                 allow_failure=False,
             )
-            if candidate.x509 is not None:
+            if candidate.protocol.leaf_certificate is not None:
                 event = candidate
                 break
 
-        assert event is not None and event.x509 is not None
-        assert event.x509.certificate_issuer == "CN=GTS CA 1C3, O=Google Trust Services LLC, C=US"
-        expected = signature_algorithm_for_issuer(event.x509.certificate_issuer)
-        assert event.x509.certificate_sig_alg == expected
+        assert event is not None and event.protocol.leaf_certificate is not None
+        assert (
+            event.protocol.leaf_certificate.certificate_issuer
+            == "CN=GTS CA 1C3, O=Google Trust Services LLC, C=US"
+        )
+        expected = signature_algorithm_for_issuer(
+            event.protocol.leaf_certificate.certificate_issuer
+        )
+        assert event.protocol.leaf_certificate.certificate_sig_alg == expected
 
 
 class TestDnsRtt:

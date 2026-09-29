@@ -24,28 +24,28 @@
 
 from typing import Any
 
-from evidenceforge.events.base import SecurityEvent
+from evidenceforge.events.base import CanonicalOccurrence
 from evidenceforge.generation.emitters.zeek_base import SensorMultiplexEmitter
 
 
 class ZeekNtpEmitter(SensorMultiplexEmitter):
     """Emitter for Zeek ntp.log format (NDJSON).
 
-    Generates NTP protocol logs. Shares conn.log UID via NetworkContext.
+    Generates NTP protocol logs. Shares conn.log UID via NetworkTransactionPlan.
     """
 
     _log_filename = "ntp.json"
     _flat_filename = "zeek_ntp.json"
     _supported_types: set[str] = {"connection"}
 
-    def can_handle(self, event: SecurityEvent) -> bool:
+    def can_handle(self, event: CanonicalOccurrence) -> bool:
         return (
             event.event_type in self._supported_types
             and event.network is not None
             and event.ntp is not None
         )
 
-    def emit(self, event: SecurityEvent) -> None:
+    def emit(self, event: CanonicalOccurrence) -> None:
         net = event.network
         ntp = event.ntp
         event_data: dict[str, Any] = {
@@ -68,10 +68,8 @@ class ZeekNtpEmitter(SensorMultiplexEmitter):
             "rec_time": ntp.rec_ts,
             "xmt_time": ntp.xmt_ts,
             "num_exts": ntp.num_exts,
-            "_sensor_hostnames": event._sensor_hostnames_by_format.get(self.format_def.name, []),
+            **self._sensor_metadata(event, self.format_def.name),
         }
-        if event._nat_swaps_by_sensor:
-            event_data["_nat_swaps_by_sensor"] = event._nat_swaps_by_sensor
         self.emit_event(event_data)
 
     def _render_event(self, event_data: dict[str, Any]) -> str:

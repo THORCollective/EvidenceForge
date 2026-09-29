@@ -26,13 +26,13 @@ def _harness(os_name: str = "macOS 14"):
     state.set_current_time(START - timedelta(minutes=5))
     events: list = []
     dispatcher = EventDispatcher(state_manager=state, emitters={})
-    original_dispatch = dispatcher.dispatch
+    original_prepare = dispatcher.prepare_builder
 
-    def capture(event):
+    def capture(event, *args, **kwargs):
         events.append(event)
-        original_dispatch(event)
+        return original_prepare(event, *args, **kwargs)
 
-    dispatcher.dispatch = capture
+    dispatcher.prepare_builder = capture
     generator = ActivityGenerator(state, {}, dispatcher=dispatcher)
     user = User(username="jappleseed", full_name="J Appleseed", email="j@example.local")
     system = System(
@@ -55,11 +55,13 @@ def _harness(os_name: str = "macOS 14"):
     return generator, state, events, user, system, logon_id
 
 
-def test_plist_create_produces_btm_launch_item_add_after_file_create() -> None:
-    """A LaunchAgents plist create on macOS yields both file_create and BTM events."""
+def test_macos_process_image_is_not_self_written() -> None:
+    """A macOS process cannot write its own executable, so no image create is guaranteed.
+
+    The executable was dropped earlier by a downloader or installer outside the
+    process; LaunchAgents drops are authored as storyline ``file`` events.
+    """
     generator, state, events, user, system, logon_id = _harness()
-    # On macOS the new image is written by the (already running) parent
-    # before the exec, so the parent shell is the plist's writer here.
     state.set_current_time(START - timedelta(seconds=30))
     launchd_pid = state.create_process(
         system.hostname,
@@ -87,32 +89,19 @@ def test_plist_create_produces_btm_launch_item_add_after_file_create() -> None:
         system=system,
         time=START,
         logon_id=logon_id,
-        process_name=LAUNCH_AGENT_PLIST,
-        command_line=f"cp /tmp/payload {LAUNCH_AGENT_PLIST}",
+        process_name="/Users/jappleseed/Downloads/payload",
+        command_line="/Users/jappleseed/Downloads/payload",
         parent_pid=shell_pid,
         ensure_file_event=True,
         from_storyline=True,
     )
 
-    file_creates = [e for e in events if e.event_type == "file_create"]
-    btm_events = [e for e in events if e.event_type == "btm_launch_item_add"]
-
-    assert len(file_creates) == 1
-    assert file_creates[0].file.path == LAUNCH_AGENT_PLIST
-    assert file_creates[0].process.pid == shell_pid
-    assert file_creates[0].timestamp < START
-    assert len(btm_events) == 1
-    btm = btm_events[0]
-    assert btm.file is not None
-    assert btm.file.path == LAUNCH_AGENT_PLIST
-    assert btm.file.action == "create"
-    # Consequent: BTM registration lands strictly after the plist create,
-    # within the configured 50-1200ms window.
-    delta = (btm.timestamp - file_creates[0].timestamp).total_seconds()
-    assert delta > 0
-    assert 0.05 <= delta <= 1.2
-    assert btm.src_host is not None
-    assert btm.edr is not None and btm.edr.object_id
+    image_creates = [
+        e
+        for e in events
+        if e.event_type == "file_create" and e.file.path == "/Users/jappleseed/Downloads/payload"
+    ]
+    assert image_creates == []
 
 
 def test_btm_carries_responsible_process_from_state() -> None:

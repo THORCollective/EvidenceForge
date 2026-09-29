@@ -22,13 +22,13 @@
 
 """Parser for eCAR (NDJSON) files."""
 
-import json
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from . import LogParser, ParsedRecord, register_parser
+from . import LogParser, ParsedRecord, iter_bounded_text_lines, register_parser
+from .json_record import decode_record
 
 
 @register_parser
@@ -39,12 +39,11 @@ class EcarParser(LogParser):
         return path.name == "ecar.json"
 
     def parse_file(self, path: Path) -> Iterator[ParsedRecord]:
-        with path.open(encoding="utf-8") as f:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                if not line:
-                    continue
-                yield self._parse_line(line, line_num)
+        for line_num, line in iter_bounded_text_lines(path):
+            line = line.strip()
+            if not line:
+                continue
+            yield self._parse_line(line, line_num)
 
     def _parse_line(self, raw: str, line_num: int) -> ParsedRecord:
         fields: dict[str, Any] = {}
@@ -52,10 +51,15 @@ class EcarParser(LogParser):
         timestamp = None
 
         try:
-            data = json.loads(raw)
+            data = decode_record(raw)
 
             # Flatten properties into top-level fields
             properties = data.pop("properties", {})
+            if not isinstance(properties, dict):
+                raise ValueError("Expected object for eCAR properties")
+            conflicts = data.keys() & properties.keys()
+            if conflicts:
+                raise ValueError(f"Duplicate eCAR properties: {sorted(conflicts)}")
             fields = {**data, **properties}
 
             # Normalize "-" sentinel to absent for IP fields
@@ -68,10 +72,10 @@ class EcarParser(LogParser):
             if ts_ms is not None:
                 try:
                     timestamp = datetime.fromtimestamp(int(ts_ms) / 1000.0, tz=UTC)
-                except (ValueError, TypeError, OSError):
+                except (ValueError, TypeError, OSError, OverflowError):
                     errors.append(f"Invalid timestamp_ms: {ts_ms}")
 
-        except json.JSONDecodeError as e:
+        except (ValueError, TypeError) as e:
             errors.append(f"JSON parse error: {e}")
 
         return ParsedRecord(

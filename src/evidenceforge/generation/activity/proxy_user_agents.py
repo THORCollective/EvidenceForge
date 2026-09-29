@@ -103,6 +103,23 @@ def _pick_package_manager_agent(
     return None
 
 
+def is_package_manager_destination(
+    source_system: "System | None",
+    hostname: str | None,
+) -> bool:
+    """Return whether the destination belongs to this host's package manager."""
+    if source_system is None:
+        return False
+    data = load_proxy_user_agents()
+    probe_rng = random.Random(
+        _stable_seed(
+            "package_manager_destination:"
+            f"{source_system.hostname}:{source_system.os}:{hostname or ''}"
+        )
+    )
+    return _pick_package_manager_agent(probe_rng, source_system, hostname, data) is not None
+
+
 def _package_manager_keys_matching_os(data: dict[str, Any], os_name: str) -> set[str]:
     """Return package-manager config keys compatible with the source OS."""
     compatible: set[str] = set()
@@ -364,6 +381,43 @@ def browser_user_agent_for_process(
         rng,
         source_system,
         rng.choice(candidates),
+        hostname=hostname,
+        domain_tags=domain_tags,
+    )
+
+
+def stable_browser_user_agent_for_process(
+    source_system: "System | None",
+    process_image: str,
+    process_identity: str,
+    *,
+    hostname: str | None = None,
+    domain_tags: list[str] | None = None,
+) -> str:
+    """Return one browser User-Agent for the lifetime of a canonical process.
+
+    Destination and request identity intentionally do not participate in selection. A browser
+    process cannot change family or installed major version merely because it opens a new URL.
+    """
+    source_key = "unmodeled"
+    if source_system is not None:
+        source_key = ":".join(
+            str(part)
+            for part in (
+                getattr(source_system, "hostname", ""),
+                getattr(source_system, "ip", ""),
+                getattr(source_system, "os", ""),
+            )
+        )
+    stable_rng = random.Random(
+        _stable_seed(
+            f"process_browser_user_agent:{source_key}:{process_image.casefold()}:{process_identity}"
+        )
+    )
+    return browser_user_agent_for_process(
+        stable_rng,
+        source_system,
+        process_image,
         hostname=hostname,
         domain_tags=domain_tags,
     )

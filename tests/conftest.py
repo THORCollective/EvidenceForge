@@ -26,6 +26,7 @@ This module provides common fixtures used across unit and integration
 test suites.
 """
 
+import hashlib
 import random
 from pathlib import Path
 
@@ -37,28 +38,95 @@ from evidenceforge.utils.rng import _thread_local
 def pytest_addoption(parser):
     """Register custom CLI options."""
     parser.addoption(
-        "--include-slow",
-        action="store_true",
-        default=False,
-        help="Include slow tests (large dataset generation, 100+ users)",
-    )
-    parser.addoption(
         "--include-external-parsers",
         action="store_true",
         default=False,
         help="Include tests that run third-party parser containers",
     )
+    parser.addoption(
+        "--slow-shard-count",
+        action="store",
+        default=1,
+        type=int,
+        help="Split slow tests into this many deterministic shards",
+    )
+    parser.addoption(
+        "--slow-shard-index",
+        action="store",
+        default=0,
+        type=int,
+        help="Run this zero-based deterministic slow-test shard",
+    )
 
 
+def _slow_shard_index(nodeid: str, shard_count: int) -> int:
+    """Return the stable shard index for one collected slow test."""
+
+    digest = hashlib.sha256(nodeid.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big") % shard_count
+
+
+def _validate_slow_shard_coordinates(*, shard_count: int, shard_index: int) -> None:
+    """Reject invalid slow-test shard coordinates."""
+
+    if shard_count < 1:
+        raise pytest.UsageError("--slow-shard-count must be at least 1")
+    if shard_index < 0 or shard_index >= shard_count:
+        raise pytest.UsageError("--slow-shard-index must be between 0 and --slow-shard-count - 1")
+
+
+def _partition_slow_items(
+    items: list[pytest.Item],
+    *,
+    shard_count: int,
+    shard_index: int,
+) -> tuple[list[pytest.Item], list[pytest.Item]]:
+    """Partition slow items while leaving other marker selection to pytest."""
+
+    retained: list[pytest.Item] = []
+    deselected: list[pytest.Item] = []
+    for item in items:
+        if (
+            "slow" not in item.keywords
+            or _slow_shard_index(item.nodeid, shard_count) == shard_index
+        ):
+            retained.append(item)
+        else:
+            deselected.append(item)
+    return retained, deselected
+
+
+def _validate_test_tiers(items: list[pytest.Item]) -> None:
+    """Reject tests assigned to more than one cost tier."""
+
+    overlapping = [
+        item.nodeid for item in items if "slow" in item.keywords and "soak" in item.keywords
+    ]
+    if overlapping:
+        rendered = "\n".join(f"  - {nodeid}" for nodeid in overlapping)
+        raise pytest.UsageError("Tests must not be marked both 'slow' and 'soak':\n" + rendered)
+
+
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
-    """Skip opt-in test groups unless their matching CLI flag is passed."""
-    skip_slow = pytest.mark.skip(reason="slow test — pass --include-slow to run")
+    """Enforce exclusive cost tiers and skip unrequested external parser tests."""
+    _validate_test_tiers(items)
+    shard_count = config.getoption("slow_shard_count")
+    shard_index = config.getoption("slow_shard_index")
+    _validate_slow_shard_coordinates(shard_count=shard_count, shard_index=shard_index)
+    if shard_count > 1:
+        retained, deselected = _partition_slow_items(
+            items,
+            shard_count=shard_count,
+            shard_index=shard_index,
+        )
+        items[:] = retained
+        config.hook.pytest_deselected(items=deselected)
+
     skip_external_parser = pytest.mark.skip(
         reason="external parser test — pass --include-external-parsers to run"
     )
     for item in items:
-        if "slow" in item.keywords and not config.getoption("--include-slow"):
-            item.add_marker(skip_slow)
         if "external_parser" in item.keywords and not config.getoption(
             "--include-external-parsers"
         ):

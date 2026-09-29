@@ -176,3 +176,54 @@ presentation-ready despite a green suite. Fixed on `macos-eslogger`:
   after its child; macOS now nests correctly.
 - Validator still warns "no prior logon" for storyline actors whose sessions
   come from baseline (visible in a live `eforge validate`).
+
+## Upstream v2.1.2 Sync (2026-09-28)
+
+Merged `Cisco-Talos/EvidenceForge` `main` (v2.1.2, 946 commits, v1.12 -> v2.1.2) into the macOS
+work on branch `macos-eslogger-upstream-sync` (merge, not rebase: `macos-eslogger` is pushed).
+Upstream's 2.0 architecture moved or replaced most of what the branch touched, so the port was
+semantic rather than textual:
+
+- **Canonical events** — `SecurityEvent` is gone; producers build `OccurrenceBuilder` and publish
+  through `dispatch_builder`/`prepare_builder`, and emitters receive sealed `CanonicalOccurrence`.
+  `EventKind` and `FormatKind` are closed enums with per-kind contracts (`events/contracts.py`):
+  added `file_open/write/rename/unlink`, `privilege_elevation`, `btm_launch_item_add`, and
+  `ESLOGGER` as a consumer of process, file-create, logoff, SSH-session, and lock/unlock kinds.
+- **Source catalog** — `eslogger` is a macOS host source (`events/source_catalog.py`) with process,
+  auth, session, file, and SSH capabilities and deliberately no network capability.
+- **Storyline** — typed events dispatch through `engine/typed_handlers/`; the `file` event is
+  `typed_handlers/file.py`; `process_ref` on connections and `working_directory` live in the
+  network/process handlers.
+- **Process execution** — lives in `actions/process_execution_service.py` and
+  `actions/process_support/`. macOS parent rules (launchd for app bundles, Terminal -> login ->
+  zsh, time-nested ancestors, per-session shells) are in `process_support/parents.py`; macOS cwd
+  derivation is `process_support/actors.py::derive_macos_current_directory`. Parents must share
+  the child's session on macOS as on Windows (`queries._parent_process_matches_logon`), which
+  upstream's lifecycle registry enforces. macOS no longer fabricates a process-owned image create.
+- **Boot trees** — planned as a `_BootHostSpec` (`emitter_setup._build_macos_boot_host_spec`).
+- **PIDs** — macOS reuses upstream's logical allocator (reorder lanes, reservations, checkpoint
+  sealing) with its own ring (100..99998, start 250-400). `pidversion` derives from the
+  process's `pid_logical_position`. `create_process(os_category=...)` is back for macOS.
+- **SSH** — macOS destinations share the Linux auth timing plan but skip syslog; the session id is
+  the ES audit-session id. macOS Remote Login is now opt-in: a Mac accepts SSH only with an `ssh`
+  service or a server role (was: every Mac).
+- **Evaluation** — co-occurrence rules moved into `config/formats/eslogger.yaml` validators
+  (warning severity); `eslogger` is a native validation route. Two causal-pair tests had been
+  passing vacuously (0/0 scored 100); they now parse through `ESLoggerParser`.
+- **Checkpoints/behavior** — `_macos_audit_session_counters` is in the checkpoint owner inventory;
+  generation-behavior manifest revision 155 records the change. Re-hash the manifest after any
+  generation-code edit (`generation_behavior_surface_digest`) or `eforge generate` refuses to run.
+- **Dropped** — `reset_reverse_dns` (upstream no longer writes scenario hosts into `REVERSE_DNS`).
+
+### Open items after the sync
+
+- The eslogger emitter keeps its own seq counters and openssh-login set outside checkpoint state,
+  so resuming a macOS run from a checkpoint is not yet proven byte-identical.
+- Screen lock/unlock and cfprefsd `write` churn are probabilistic and did not fire in the current
+  demo seed (they did pre-merge); the hunts do not depend on them.
+- `has_implicit_ssh_client_owner` returns False for macOS sources (compatibility SSH path only).
+- `eforge eval` on the demo after the sync: schema, constraints, co-occurrence, causal ordering,
+  and storyline trace coverage are 100%. Event presence, temporal integrity, and pivot
+  linkability stay at the pre-merge values (40/40/low): ES records carry uids rather than
+  usernames, so the evaluator cannot match storyline actors to eslogger rows. Fix in the
+  evaluator (uid -> username mapping) before quoting eval scores in the talk.

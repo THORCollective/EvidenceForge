@@ -28,13 +28,14 @@ from unittest.mock import Mock
 
 import pytest
 
-from evidenceforge.events.base import SecurityEvent
+from evidenceforge.events.base import OccurrenceBuilder
 from evidenceforge.events.contexts import (
     AuthContext,
     HostContext,
     ProcessAccessContext,
     ProcessContext,
 )
+from evidenceforge.events.identity import EventIdentityPlan, ProcessIdentity, ThreadIdentity
 from evidenceforge.generation.emitters.ecar import EcarEmitter
 
 
@@ -73,7 +74,7 @@ class TestCreateRemoteThread:
 
     def test_object_action(self, emitter, ts, windows_host, tmp_path):
         """THREAD/REMOTE_CREATE has correct object and action."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="create_remote_thread",
             src_host=windows_host,
@@ -101,7 +102,40 @@ class TestCreateRemoteThread:
 
     def test_source_target_pids_in_properties(self, emitter, ts, windows_host, tmp_path):
         """Properties should include src_pid and target_pid as strings."""
-        event = SecurityEvent(
+        source = ProcessIdentity(
+            hostname="WKS-01",
+            object_id="source-process",
+            pid=2120,
+            parent_pid=572,
+            image=r"C:\Program Files\VMware\VMware Tools\vmtoolsd.exe",
+            command_line="",
+            principal="SYSTEM",
+            logon_id="",
+            started_at=ts,
+            lifecycle_group_id="source-lifecycle",
+        )
+        target = ProcessIdentity(
+            hostname="WKS-01",
+            object_id="target-process",
+            pid=4,
+            parent_pid=0,
+            image=r"C:\Windows\System32\svchost.exe",
+            command_line="",
+            principal="SYSTEM",
+            logon_id="",
+            started_at=ts,
+            lifecycle_group_id="target-lifecycle",
+        )
+        thread = ThreadIdentity(
+            hostname="WKS-01",
+            process_object_id=target.object_id,
+            pid=target.pid,
+            tid=840,
+            object_id="target-thread",
+            started_at=ts,
+            kind="remote",
+        )
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="create_remote_thread",
             src_host=windows_host,
@@ -117,6 +151,7 @@ class TestCreateRemoteThread:
                 target_server=r"C:\Windows\System32\svchost.exe",
                 source_port=4,
             ),
+            identity_plan=EventIdentityPlan(subject=thread, actor=source, target=target),
         )
         emitter.emit(event)
         emitter.close()
@@ -126,12 +161,15 @@ class TestCreateRemoteThread:
         props = record["properties"]
         assert props["src_pid"] == "2120"
         assert props["target_pid"] == "4"
-        assert "target_process_uuid" in props
+        assert props["target_process_uuid"] == "target-process"
+        assert props["source_process_uuid"] == "source-process"
+        assert props["target_tid"] == "840"
+        assert "tid" not in record
         assert "start_address" in props
 
     def test_top_level_pid_is_source(self, emitter, ts, windows_host, tmp_path):
         """Top-level pid should be the source process PID."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="create_remote_thread",
             src_host=windows_host,
@@ -158,7 +196,7 @@ class TestCreateRemoteThread:
 
     def test_properties_all_strings(self, emitter, ts, windows_host, tmp_path):
         """All property values must be strings per eCAR spec."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="create_remote_thread",
             src_host=windows_host,
@@ -185,7 +223,7 @@ class TestCreateRemoteThread:
 
     def test_can_handle_create_remote_thread(self, emitter, ts, windows_host):
         """eCAR emitter should handle create_remote_thread events."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="create_remote_thread",
             src_host=windows_host,
@@ -221,7 +259,7 @@ class TestProcessAccess:
 
     def test_object_action(self, emitter, ts, windows_host, tmp_path):
         """PROCESS/OPEN has correct object and action."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="process_access",
             src_host=windows_host,
@@ -247,7 +285,7 @@ class TestProcessAccess:
 
     def test_granted_access_in_properties(self, emitter, ts, windows_host, tmp_path):
         """Properties should include granted_access mask."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="process_access",
             src_host=windows_host,
@@ -273,7 +311,7 @@ class TestProcessAccess:
 
     def test_target_process_fields_are_explicit(self, emitter, ts, windows_host, tmp_path):
         """Target process details should not be overloaded into command_line."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="process_access",
             src_host=windows_host,
@@ -299,11 +337,71 @@ class TestProcessAccess:
         assert props["target_pid"] == "672"
         assert props["target_image_path"] == r"C:\Windows\System32\lsass.exe"
 
+    def test_process_open_renders_canonical_source_and_target_roles(
+        self, emitter, ts, windows_host, tmp_path
+    ):
+        """PROCESS/OPEN object and actor fields must preserve both canonical sides."""
+        source = ProcessIdentity(
+            hostname="WKS-01",
+            object_id="source-process",
+            pid=2064,
+            parent_pid=556,
+            image=r"C:\ProgramData\Microsoft\Windows Defender\Platform\MsMpEng.exe",
+            command_line="MsMpEng.exe -Scan",
+            principal="SYSTEM",
+            logon_id="",
+            started_at=ts,
+            lifecycle_group_id="source-lifecycle",
+        )
+        target = ProcessIdentity(
+            hostname="WKS-01",
+            object_id="target-process",
+            pid=672,
+            parent_pid=4,
+            image=r"C:\Windows\System32\lsass.exe",
+            command_line="lsass.exe",
+            principal="SYSTEM",
+            logon_id="",
+            started_at=ts,
+            lifecycle_group_id="target-lifecycle",
+        )
+        event = OccurrenceBuilder(
+            timestamp=ts,
+            event_type="process_access",
+            src_host=windows_host,
+            process=ProcessContext(
+                pid=source.pid,
+                parent_pid=source.parent_pid,
+                image=source.image,
+                command_line=source.command_line,
+                username=source.principal,
+            ),
+            auth=AuthContext(username="SYSTEM"),
+            process_access=self._access_context(),
+            identity_plan=EventIdentityPlan(subject=target, actor=source, target=target),
+        )
+
+        emitter.emit(event)
+        emitter.close()
+
+        output_file = tmp_path / "WKS-01.corp.local" / "ecar.json"
+        record = json.loads(output_file.read_text().strip())
+        props = record["properties"]
+        assert record["objectID"] == target.object_id
+        assert record["actorID"] == source.object_id
+        assert record["pid"] == source.pid
+        assert "tid" not in record
+        assert props["source_process_uuid"] == source.object_id
+        assert props["source_pid"] == str(source.pid)
+        assert props["source_tid"] == "4321"
+        assert props["target_process_uuid"] == target.object_id
+        assert props["target_pid"] == str(target.pid)
+
     def test_process_open_parent_image_uses_source_parent(
         self, emitter, ts, windows_host, tmp_path
     ):
         """PROCESS/OPEN parent_image_path should preserve the source process parent."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="process_access",
             src_host=windows_host,
@@ -329,7 +427,7 @@ class TestProcessAccess:
 
     def test_source_image_in_properties(self, emitter, ts, windows_host, tmp_path):
         """image_path in properties should be the source process image."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="process_access",
             src_host=windows_host,
@@ -354,7 +452,7 @@ class TestProcessAccess:
 
     def test_can_handle_process_access(self, emitter, ts, windows_host):
         """eCAR emitter should handle process_access events."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="process_access",
             src_host=windows_host,
@@ -370,7 +468,7 @@ class TestProcessAccess:
 
     def test_properties_all_strings(self, emitter, ts, windows_host, tmp_path):
         """All property values must be strings per eCAR spec."""
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=ts,
             event_type="process_access",
             src_host=windows_host,

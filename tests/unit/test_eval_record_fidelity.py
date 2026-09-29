@@ -33,12 +33,82 @@ from evidenceforge.evaluation.pillars.parseability import (
     ParseabilityScorer,
     _normalize_for_validation,
 )
-from evidenceforge.evaluation.pillars.plausibility import PlausibilityScorer
+from evidenceforge.evaluation.pillars.plausibility import (
+    PlausibilityScorer,
+    _score_http_file_consistency,
+)
 
 # Alias for tests that use the old RecordFidelityScorer name
 RecordFidelityScorer = ParseabilityScorer
 
 GOOD_FIXTURES = Path(__file__).parent.parent / "fixtures" / "eval" / "good"
+
+
+def test_http_upload_file_consistency_checks_direction_size_mime_and_uid() -> None:
+    """Evaluator accepts a fully correlated originator-side HTTP file row."""
+
+    http = _make_record(
+        "zeek_http",
+        {
+            "uid": "CUpload",
+            "request_body_len": 44_040_192,
+            "orig_fuids": ["FUpload"],
+            "orig_mime_types": ["application/vnd.rar"],
+        },
+    )
+    file_record = _make_record(
+        "zeek_files",
+        {
+            "fuid": "FUpload",
+            "conn_uids": ["CUpload"],
+            "is_orig": True,
+            "total_bytes": 44_040_192,
+            "mime_type": "application/vnd.rar",
+        },
+    )
+
+    matched, agreeing, failures = _score_http_file_consistency(
+        {"zeek_http": [http], "zeek_files": [file_record]}
+    )
+
+    assert matched == agreeing == 5
+    assert failures == []
+
+
+def test_http_multipart_consistency_accepts_sparse_vectors_and_envelope_overhead() -> None:
+    """Multipart filenames/MIME are present-value vectors, not FUID-aligned arrays."""
+
+    http = _make_record(
+        "zeek_http",
+        {
+            "uid": "CMultipart",
+            "request_body_len": 440,
+            "orig_fuids": ["F1", "F2", "F3", "F4"],
+            "orig_filenames": ["file"],
+            "orig_mime_types": ["text/plain"],
+        },
+    )
+    files = [
+        _make_record(
+            "zeek_files",
+            {
+                "fuid": f"F{index}",
+                "conn_uids": ["CMultipart"],
+                "is_orig": True,
+                "seen_bytes": size,
+                **({"filename": "file"} if index == 3 else {}),
+                **({"mime_type": "text/plain"} if index == 4 else {}),
+            },
+        )
+        for index, size in enumerate((38, 1, 6, 22), start=1)
+    ]
+
+    matched, agreeing, failures = _score_http_file_consistency(
+        {"zeek_http": [http], "zeek_files": files}
+    )
+
+    assert matched == agreeing
+    assert failures == []
 
 
 def _make_record(format_name: str, fields: dict, errors: list[str] | None = None) -> ParsedRecord:
@@ -171,8 +241,7 @@ class TestTierC:
             ),
         ]
 
-        scorer = PlausibilityScorer()
-        tier_c = scorer._score_co_occurrence({"zeek_http": records})
+        tier_c = RecordFidelityScorer()._score_format_constraints({"zeek_http": records})
 
         assert tier_c.score == 100.0
 
@@ -189,8 +258,7 @@ class TestTierC:
             ),
         ]
 
-        scorer = PlausibilityScorer()
-        tier_c = scorer._score_co_occurrence({"zeek_http": records})
+        tier_c = RecordFidelityScorer()._score_format_constraints({"zeek_http": records})
 
         assert tier_c.score < 100.0
 
@@ -234,12 +302,12 @@ class TestOverallDimension:
         assert result.score is not None
         assert len(result.sub_scores) == 2
 
-    def test_empty_records_score_perfect(self):
-        """No records means nothing to fail — default to 100."""
+    def test_empty_records_do_not_score_perfect(self):
+        """An empty dataset cannot prove source-schema conformance."""
         scorer = RecordFidelityScorer()
         scenario = MagicMock()
         result = scorer.score({}, scenario)
-        assert result.score == 100.0
+        assert result.score == 0.0
 
 
 class TestWindowsVariantMapCoverage:
@@ -275,6 +343,33 @@ class TestWindowsVariantMapCoverage:
 
         assert WINDOWS_VARIANT_MAP[4800] == "workstation_locked"
         assert WINDOWS_VARIANT_MAP[4801] == "workstation_unlocked"
+
+    def test_event_4648_provider_field_snapshot(self):
+        """Event 4648 uses provider-native XML names and manifest field order."""
+
+        from evidenceforge.formats import load_format
+
+        fmt = load_format("windows_event_security")
+        variant = next(item for item in fmt.variants if item.event_id == "4648")
+
+        assert [field.name for field in variant.fields] == [
+            "SubjectUserSid",
+            "SubjectUserName",
+            "SubjectDomainName",
+            "SubjectLogonId",
+            "LogonGuid",
+            "TargetUserName",
+            "TargetDomainName",
+            "TargetLogonGuid",
+            "TargetServerName",
+            "TargetInfo",
+            "ProcessId",
+            "ProcessName",
+            "IpAddress",
+            "IpPort",
+        ]
+        assert "NetworkAddress" not in fmt.output.template
+        assert "NetworkPort" not in fmt.output.template
 
     def test_sysmon_event_data_variant_resolves(self):
         """Sysmon EventID 3 must validate against its event-specific fields."""

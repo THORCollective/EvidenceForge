@@ -22,6 +22,7 @@
 
 """Unit tests for eforge install-skills command."""
 
+import re
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,9 @@ from typer.testing import CliRunner
 
 from evidenceforge.cli.commands import EXIT_SUCCESS, app
 from evidenceforge.cli.install_skills import (
+    _CHATGPT_COMMAND_REWRITES,
+    _CHATGPT_REFERENCES_BY_SKILL,
+    CHATGPT_SKILL_NAMES,
     find_evidenceforge_chatgpt_skills,
     install_chatgpt_skills,
     install_codex_skills,
@@ -37,12 +41,99 @@ from evidenceforge.cli.install_skills import (
 )
 
 runner = CliRunner()
+REPOSITORY_ROOT = Path(__file__).parents[2]
+CANONICAL_COMMAND_ROOT = REPOSITORY_ROOT / "commands" / "eforge"
 
-# Minimum expected files — auto-discovery may find more, but these must exist.
-EXPECTED_SKILL_FILES = {"scenario.md", "generate.md", "validate.md", "evaluate.md", "config.md"}
-EXPECTED_REFERENCES_MIN = {
-    "references/scenario-reference.md",
-    "references/evidence-formats.md",
+EXPECTED_SKILL_FILES = {
+    "config.md",
+    "evaluate.md",
+    "generate.md",
+    "industry-pack.md",
+    "organization-pack.md",
+    "pack.md",
+    "scenario.md",
+    "validate.md",
+}
+EXPECTED_REFERENCE_FILES = {
+    path.relative_to(CANONICAL_COMMAND_ROOT).as_posix()
+    for path in (CANONICAL_COMMAND_ROOT / "references").glob("*.md")
+}
+EVIDENCE_REFERENCES = {
+    "references/evidence-endpoint-linux.md",
+    "references/evidence-endpoint-macos.md",
+    "references/evidence-network-ids.md",
+    "references/evidence-web-email.md",
+    "references/evidence-windows.md",
+    "references/generation-bundle-targets.md",
+}
+PROJECT_CONTEXT_REFERENCE = {"references/project-context.md"}
+EXPECTED_CHATGPT_REFERENCES = {
+    "config": PROJECT_CONTEXT_REFERENCE
+    | {
+        "references/config-apps-processes.md",
+        "references/config-compatibility.md",
+        "references/config-dependency-graph.md",
+        "references/config-dns-network.md",
+        "references/config-host-activity.md",
+        "references/config-ids.md",
+        "references/config-personas.md",
+        "references/config-validation.md",
+    },
+    "evaluate": EVIDENCE_REFERENCES,
+    "generate": EVIDENCE_REFERENCES
+    | PROJECT_CONTEXT_REFERENCE
+    | {"references/checkpoint-recovery.md"},
+    "industry-pack": PROJECT_CONTEXT_REFERENCE
+    | {
+        "references/pack-reference.md",
+        "references/scenario-baseline-output.md",
+        "references/scenario-core.md",
+        "references/scenario-environment-identities.md",
+        "references/scenario-environment-network.md",
+        "references/scenario-environment.md",
+        "references/scenario-smb.md",
+    },
+    "organization-pack": PROJECT_CONTEXT_REFERENCE
+    | {
+        "references/pack-reference.md",
+        "references/scenario-baseline-output.md",
+        "references/scenario-email.md",
+        "references/scenario-environment-identities.md",
+        "references/scenario-environment-network.md",
+        "references/scenario-environment.md",
+        "references/scenario-http.md",
+        "references/scenario-smb.md",
+    },
+    "pack": PROJECT_CONTEXT_REFERENCE | {"references/pack-reference.md"},
+    "scenario": EVIDENCE_REFERENCES
+    | PROJECT_CONTEXT_REFERENCE
+    | {
+        "references/scenario-briefing.md",
+        "references/scenario-baseline-output.md",
+        "references/scenario-core.md",
+        "references/scenario-email.md",
+        "references/scenario-environment.md",
+        "references/scenario-environment-identities.md",
+        "references/scenario-environment-network.md",
+        "references/scenario-environment-overrides.md",
+        "references/scenario-events-endpoint.md",
+        "references/scenario-events-network.md",
+        "references/scenario-http.md",
+        "references/scenario-pack-consumption.md",
+        "references/scenario-payloads.md",
+        "references/scenario-smb.md",
+        "references/scenario-storyline.md",
+    },
+    "validate": PROJECT_CONTEXT_REFERENCE
+    | {
+        "references/validation-safety.md",
+        "references/validation-storage.md",
+    },
+}
+
+EXPECTED_CHATGPT_REFERENCES = {
+    name: refs | {"references/record-validation.md"}
+    for name, refs in EXPECTED_CHATGPT_REFERENCES.items()
 }
 
 
@@ -58,7 +149,7 @@ class TestInstallSkills:
         assert (eforge_dir / "references").is_dir()
 
     def test_copies_all_skill_files(self, tmp_path):
-        """All three skill markdown files are installed."""
+        """All canonical skill markdown files are installed."""
         install_skills(tmp_path)
 
         eforge_dir = tmp_path / "eforge"
@@ -69,30 +160,197 @@ class TestInstallSkills:
         """Reference docs are copied to references/."""
         install_skills(tmp_path)
 
-        for ref_path in EXPECTED_REFERENCES_MIN:
+        for ref_path in EXPECTED_REFERENCE_FILES:
             ref = tmp_path / "eforge" / ref_path
             assert ref.is_file(), f"Missing reference: {ref_path}"
-            content = ref.read_text()
+            content = ref.read_text(encoding="utf-8")
             assert len(content) > 100, f"Reference doc appears empty or truncated: {ref_path}"
 
         # Auto-discovery should find all .md files in references/
         refs_dir = tmp_path / "eforge" / "references"
         all_refs = list(refs_dir.glob("*.md"))
-        assert len(all_refs) >= len(EXPECTED_REFERENCES_MIN), (
-            f"Expected at least {len(EXPECTED_REFERENCES_MIN)} references, got {len(all_refs)}"
+        assert {f"references/{path.name}" for path in all_refs} == EXPECTED_REFERENCE_FILES
+
+    def test_project_context_is_installed_for_every_project_aware_skill(self, tmp_path):
+        """Fresh Claude and ChatGPT installs share the cwd-only project contract."""
+
+        claude_root = tmp_path / "claude"
+        chatgpt_root = tmp_path / "chatgpt"
+        install_skills(claude_root)
+        install_chatgpt_skills(chatgpt_root)
+
+        project_contexts = [
+            claude_root / "eforge" / "references" / "project-context.md",
+            *chatgpt_root.glob("eforge-*/references/project-context.md"),
+        ]
+        assert project_contexts
+        for project_context in project_contexts:
+            text = project_context.read_text(encoding="utf-8")
+            assert "Run from the intended working directory and omit `--project-root`" in text
+            assert "Never search parents, siblings, the home directory" in text
+
+    def test_installed_config_skills_use_canonical_public_identity_registry(self, tmp_path):
+        """Claude, ChatGPT, and Codex installs inherit canonical identity guidance."""
+
+        claude_root = tmp_path / "claude"
+        chatgpt_root = tmp_path / "chatgpt"
+        codex_root = tmp_path / "codex"
+        install_skills(claude_root)
+        install_chatgpt_skills(chatgpt_root)
+        install_codex_skills(codex_root)
+
+        skill_files = (
+            claude_root / "eforge" / "config.md",
+            chatgpt_root / "eforge-config" / "SKILL.md",
+            codex_root / "eforge-config" / "SKILL.md",
+        )
+        for skill_file in skill_files:
+            text = skill_file.read_text(encoding="utf-8")
+            assert "public_identity_profiles.yaml" in text
+            assert "Do not recreate public identity pools" in text
+
+        for root in (chatgpt_root, codex_root):
+            reference = root / "eforge-config" / "references" / "config-dns-network.md"
+            text = reference.read_text(encoding="utf-8")
+            assert "Canonical providers and roles keyed by `id`" in text
+
+    def test_long_reference_docs_have_navigation(self):
+        """References over 100 lines expose their scope before detailed content."""
+
+        for reference in sorted((CANONICAL_COMMAND_ROOT / "references").glob("*.md")):
+            text = reference.read_text(encoding="utf-8")
+            if len(text.splitlines()) > 100:
+                assert "contents" in text[:2_500].lower(), reference.name
+
+    def test_exhaustive_public_scenario_reference_is_not_a_skill_resource(self):
+        """The human manual does not compete with focused installed skill references."""
+
+        assert (REPOSITORY_ROOT / "docs" / "reference" / "scenario-reference.md").is_file()
+        assert not (CANONICAL_COMMAND_ROOT / "references" / "scenario-reference.md").exists()
+
+    def test_focused_evidence_references_track_bundle_and_smtp_contracts(self):
+        """Focused references retain the generated bundle and SMTP contracts."""
+        bundle_reference = (
+            CANONICAL_COMMAND_ROOT / "references" / "generation-bundle-targets.md"
+        ).read_text(encoding="utf-8")
+        email_reference = (
+            CANONICAL_COMMAND_ROOT / "references" / "evidence-web-email.md"
+        ).read_text(encoding="utf-8")
+
+        for sidecar in (
+            "COLLECTION_PROFILE.json",
+            "STORAGE_MANIFEST.json",
+            "RESOLVED_SCENARIO.yaml",
+            "GENERATION_MANIFEST.json",
+        ):
+            assert sidecar in bundle_reference
+        assert "SMTP" in email_reference
+        assert "No SMTP log" not in email_reference
+
+    def test_installed_skills_include_cross_platform_smb_contract(self, tmp_path):
+        """Installed guidance retains cross-platform SMB and host-file-set semantics."""
+
+        install_skills(tmp_path)
+        root = tmp_path / "eforge"
+        scenario_reference = (root / "references" / "scenario-smb.md").read_text(encoding="utf-8")
+        bundle_reference = (root / "references" / "generation-bundle-targets.md").read_text(
+            encoding="utf-8"
+        )
+        endpoint_reference = (root / "references" / "evidence-endpoint-linux.md").read_text(
+            encoding="utf-8"
+        )
+        network_reference = (root / "references" / "evidence-network-ids.md").read_text(
+            encoding="utf-8"
+        )
+        windows_reference = (root / "references" / "evidence-windows.md").read_text(
+            encoding="utf-8"
+        )
+        host_config_reference = (root / "references" / "config-host-activity.md").read_text(
+            encoding="utf-8"
+        )
+        validation_reference = (root / "references" / "config-validation.md").read_text(
+            encoding="utf-8"
         )
 
-    def test_installed_config_skill_mentions_identity_pools(self, tmp_path):
-        """Installed config skill and references document generated identity pools."""
-        install_skills(tmp_path)
+        assert "client_access" in scenario_reference
+        assert "smb_principal" in scenario_reference
+        assert "/mnt/<mapping-id>" in scenario_reference
+        assert "schema version 3" in bundle_reference
+        assert "file_sets" in scenario_reference
+        assert "backing_file_set" in scenario_reference
+        assert "`directory` always means" in scenario_reference
+        assert "Only a declared share exposes files over SMB" in scenario_reference
+        assert "mounted CIFS" in endpoint_reference
+        assert "Samba" in endpoint_reference
+        assert "wire-advertised" in network_reference
+        assert "never fabricate Windows" in windows_reference
+        assert "smb_profiles.yaml" in host_config_reference
+        assert "linux_cifs_mount" in host_config_reference
+        assert "per-transport `smbd`" in host_config_reference
+        assert "source_path" in host_config_reference
+        assert "transfer" in host_config_reference
+        assert "source_path" in validation_reference
+        assert "`transfer` requires" in validation_reference
 
-        config_skill = (tmp_path / "eforge" / "config.md").read_text()
-        config_ref = (tmp_path / "eforge" / "references" / "config-dns-network.md").read_text()
-        validation_ref = (tmp_path / "eforge" / "references" / "config-validation.md").read_text()
+    def test_installed_generate_skill_retains_lifecycle_diagnostics_and_linux_contract(
+        self,
+        tmp_path,
+    ):
+        """Generated ChatGPT skills include the compact defect rule and focused evidence detail."""
 
-        assert "identity_pools" in config_skill
-        assert "external_actor_profiles.yaml" in config_ref
-        assert "command_parameter_pools.yaml" in validation_ref
+        install_chatgpt_skills(tmp_path)
+        generate = (tmp_path / "eforge-generate" / "SKILL.md").read_text(encoding="utf-8")
+        endpoint = (
+            tmp_path / "eforge-generate" / "references" / "evidence-endpoint-linux.md"
+        ).read_text(encoding="utf-8")
+
+        assert "Lifecycle/channel/continuation invariant failures are generator defects" in generate
+        assert "do not rewrite scenario timing to mask them" in generate
+        assert "retirement remains provable after the shared channel tombstone expires" in endpoint
+        assert "`sleep 30`, `sleep 30.5`, and `sleep .5`" in endpoint
+        assert "1,425 ms release" in endpoint
+
+    def test_chatgpt_manifest_covers_every_canonical_command(self):
+        """Every canonical top-level command has an explicit ChatGPT install mapping."""
+        repository = Path(__file__).parents[2]
+        source_names = {path.stem for path in (repository / "commands" / "eforge").glob("*.md")}
+
+        assert set(CHATGPT_SKILL_NAMES) == source_names
+        assert set(_CHATGPT_REFERENCES_BY_SKILL) == source_names
+
+    def test_chatgpt_reference_manifest_matches_direct_command_invocations(self):
+        """Each command bundles every directly invoked reference and no others."""
+        claude_pattern = re.compile(r"/eforge:references:([a-z0-9-]+)")
+        local_pattern = re.compile(r"`(references/[a-z0-9-]+\.md)`")
+
+        for source in sorted(CANONICAL_COMMAND_ROOT.glob("*.md")):
+            content = source.read_text(encoding="utf-8")
+            invoked = {f"references/{name}.md" for name in claude_pattern.findall(content)}
+            invoked.update(local_pattern.findall(content))
+            assert invoked == set(_CHATGPT_REFERENCES_BY_SKILL[source.stem]), source.name
+
+    def test_chatgpt_pack_command_rewrite_mappings_are_complete(self):
+        """Pack-to-pack routing has ChatGPT-compatible command rewrites."""
+        assert _CHATGPT_COMMAND_REWRITES["/eforge pack"] == "the `eforge-pack` skill"
+        assert _CHATGPT_COMMAND_REWRITES["/eforge industry-pack"] == (
+            "the `eforge-industry-pack` skill"
+        )
+        assert _CHATGPT_COMMAND_REWRITES["/eforge organization-pack"] == (
+            "the `eforge-organization-pack` skill"
+        )
+
+    def test_chatgpt_rewrites_do_not_create_nested_inline_code(self, tmp_path):
+        """Generated skills consume canonical invocation backticks exactly once."""
+
+        install_chatgpt_skills(tmp_path)
+
+        for markdown in tmp_path.rglob("*.md"):
+            content = markdown.read_text(encoding="utf-8")
+            assert "`the `eforge-" not in content, markdown
+            assert "``references/" not in content, markdown
+        pack_skill = (tmp_path / "eforge-pack" / "SKILL.md").read_text(encoding="utf-8")
+        assert "Use the `eforge-industry-pack` skill" in pack_skill
+        assert "Read `references/pack-reference.md`" in pack_skill
 
     def test_no_persona_files_installed(self, tmp_path):
         """Persona YAMLs are NOT installed (skills use eforge info instead)."""
@@ -103,20 +361,20 @@ class TestInstallSkills:
             "personas/ should not be installed — skills use eforge info"
         )
 
-    def test_scenario_uses_subskill_references(self, tmp_path):
-        """Installed scenario.md uses sub-skill invocation, not file paths."""
+    def test_canonical_commands_have_valid_minimal_frontmatter(self, tmp_path):
+        """Every canonical command and Claude copy has only name and description metadata."""
         install_skills(tmp_path)
 
-        scenario = (tmp_path / "eforge" / "scenario.md").read_text()
-        assert "/eforge:references:scenario-reference" in scenario
-        assert "references/scenario-reference.md" not in scenario
-
-    def test_claude_install_preserves_source_frontmatter(self, tmp_path):
-        """Claude command installs preserve Claude-only source frontmatter."""
-        install_skills(tmp_path)
-
-        scenario = (tmp_path / "eforge" / "scenario.md").read_text()
-        assert "\nlicense: Copyright (c) 2026 Cisco Systems, Inc. and its affiliates;" in scenario
+        for source in sorted(CANONICAL_COMMAND_ROOT.glob("*.md")):
+            canonical = source.read_text(encoding="utf-8")
+            installed = (tmp_path / "eforge" / source.name).read_text(encoding="utf-8")
+            assert installed == canonical
+            assert canonical.startswith("---\n")
+            frontmatter = canonical.split("---\n", 2)[1]
+            parsed = yaml.safe_load(frontmatter)
+            assert set(parsed) == {"name", "description"}
+            assert parsed["name"] == f"eforge-{source.stem}"
+            assert parsed["description"]
 
     def test_idempotent(self, tmp_path):
         """Running install twice succeeds without error."""
@@ -167,7 +425,7 @@ class TestInstallSkills:
         assert len(installed) > 0
         for skill in EXPECTED_SKILL_FILES:
             assert skill in installed, f"Missing skill in installed list: {skill}"
-        for ref in EXPECTED_REFERENCES_MIN:
+        for ref in EXPECTED_REFERENCE_FILES:
             assert ref in installed, f"Missing reference in installed list: {ref}"
         assert not any(f.startswith("personas/") for f in installed), (
             "Personas should not be installed"
@@ -192,7 +450,7 @@ class TestInstallChatGPTSkills:
 
         for skill_file in EXPECTED_SKILL_FILES:
             command_name = skill_file.removesuffix(".md")
-            skill = (tmp_path / f"eforge-{command_name}" / "SKILL.md").read_text()
+            skill = (tmp_path / f"eforge-{command_name}" / "SKILL.md").read_text(encoding="utf-8")
             assert skill.startswith("---\n")
             frontmatter = skill.split("---\n", 2)[1]
             parsed = yaml.safe_load(frontmatter)
@@ -200,44 +458,78 @@ class TestInstallChatGPTSkills:
             assert parsed["name"] == f"eforge-{command_name}"
             assert parsed["description"]
 
-    def test_chatgpt_frontmatter_removes_claude_license(self, tmp_path):
-        """ChatGPT SKILL.md files drop Claude-only license frontmatter fields."""
-        install_chatgpt_skills(tmp_path)
-
-        for skill_file in EXPECTED_SKILL_FILES:
-            command_name = skill_file.removesuffix(".md")
-            skill = (tmp_path / f"eforge-{command_name}" / "SKILL.md").read_text()
-            frontmatter = skill.split("---\n", 2)[1]
-            assert "license:" not in frontmatter
-
     def test_chatgpt_references_are_bundled(self, tmp_path):
         """Reference docs are copied beside each ChatGPT skill."""
         install_chatgpt_skills(tmp_path)
 
-        for ref_path in EXPECTED_REFERENCES_MIN:
+        for ref_path in EXPECTED_CHATGPT_REFERENCES["scenario"]:
             ref = tmp_path / "eforge-scenario" / ref_path
             assert ref.is_file(), f"Missing reference: {ref_path}"
-            assert len(ref.read_text()) > 100
+            assert len(ref.read_text(encoding="utf-8")) > 100
 
-    def test_chatgpt_config_skill_mentions_identity_pools(self, tmp_path):
-        """Installed ChatGPT config skill includes identity-pool references."""
+    def test_chatgpt_reference_bundle_matches_each_skill_contract(self, tmp_path):
+        """Each ChatGPT skill receives exactly the references required by its workflow."""
         install_chatgpt_skills(tmp_path)
 
-        config_skill = (tmp_path / "eforge-config" / "SKILL.md").read_text()
-        config_ref = (
-            tmp_path / "eforge-config" / "references" / "config-dns-network.md"
-        ).read_text()
+        for skill_name, expected in EXPECTED_CHATGPT_REFERENCES.items():
+            references_dir = tmp_path / f"eforge-{skill_name}" / "references"
+            actual = {
+                path.relative_to(references_dir.parent).as_posix()
+                for path in references_dir.rglob("*.md")
+            }
+            assert actual == expected, skill_name
 
-        assert "identity_pools" in config_skill
-        assert "mail_public_identities.yaml" in config_ref
+    def test_chatgpt_reference_bundles_exclude_large_or_unrelated_contracts(self):
+        """Focused skills exclude exhaustive and engine-owned references from their context."""
+        scenario_refs = set(_CHATGPT_REFERENCES_BY_SKILL["scenario"])
+        assert scenario_refs == EXPECTED_CHATGPT_REFERENCES["scenario"]
+        assert (
+            not {
+                "references/pack-reference.md",
+                "references/scenario-authoring.md",
+                "references/scenario-reference.md",
+            }
+            & scenario_refs
+        )
 
-    def test_chatgpt_references_are_limited_per_skill(self, tmp_path):
-        """ChatGPT skills only receive the references they need."""
+        assert (
+            set(_CHATGPT_REFERENCES_BY_SKILL["evaluate"]) == EXPECTED_CHATGPT_REFERENCES["evaluate"]
+        )
+        assert (
+            set(_CHATGPT_REFERENCES_BY_SKILL["generate"]) == EXPECTED_CHATGPT_REFERENCES["generate"]
+        )
+        assert set(_CHATGPT_REFERENCES_BY_SKILL["validate"]) == {
+            "references/record-validation.md",
+            "references/project-context.md",
+            "references/validation-safety.md",
+            "references/validation-storage.md",
+        }
+        assert not {
+            "references/config-evaluation.md",
+            "references/config-formats.md",
+        } & set(_CHATGPT_REFERENCES_BY_SKILL["config"])
+        assert all(
+            "references/evidence-formats.md" not in references
+            for references in _CHATGPT_REFERENCES_BY_SKILL.values()
+        )
+
+    def test_chatgpt_core_skill_bodies_stay_within_context_budget(self, tmp_path):
+        """Frequently used core skill bodies remain concise enough for small chat contexts."""
         install_chatgpt_skills(tmp_path)
 
-        assert (tmp_path / "eforge-config" / "references" / "config-personas.md").is_file()
-        assert not (tmp_path / "eforge-scenario" / "references" / "config-personas.md").exists()
-        assert not (tmp_path / "eforge-validate" / "references" / "evidence-formats.md").exists()
+        for skill_name in ("config", "evaluate", "generate", "scenario", "validate"):
+            skill = (tmp_path / f"eforge-{skill_name}" / "SKILL.md").read_text(encoding="utf-8")
+            assert len(skill.split()) <= 1_500, skill_name
+
+    def test_core_skills_prefer_the_checkout_cli_during_development(self):
+        """Development skills cannot silently exercise an older globally installed CLI."""
+
+        for skill_name in ("config", "evaluate", "generate", "scenario", "validate"):
+            skill = (CANONICAL_COMMAND_ROOT / f"{skill_name}.md").read_text(encoding="utf-8")
+            assert "In an EvidenceForge source checkout, use `uv run eforge`" in skill, skill_name
+            assert "Outside a source checkout, use the installed `eforge` command" in skill, (
+                skill_name
+            )
 
     def test_chatgpt_install_prunes_no_longer_needed_references(self, tmp_path):
         """ChatGPT reinstall removes references left by older all-reference installs."""
@@ -254,9 +546,51 @@ class TestInstallChatGPTSkills:
         """ChatGPT skills use local reference paths instead of Claude sub-skill syntax."""
         install_chatgpt_skills(tmp_path)
 
-        skill = (tmp_path / "eforge-scenario" / "SKILL.md").read_text()
-        assert "/eforge:references:scenario-reference" not in skill
-        assert "`references/scenario-reference.md`" in skill
+        for skill_name, references in EXPECTED_CHATGPT_REFERENCES.items():
+            skill = (tmp_path / f"eforge-{skill_name}" / "SKILL.md").read_text(encoding="utf-8")
+            for reference in references:
+                invocation = f"/eforge:references:{Path(reference).stem}"
+                assert invocation not in skill
+                assert f"`{reference}`" in skill
+
+    def test_chatgpt_skills_do_not_retain_claude_invocations(self, tmp_path):
+        """Generated frontmatter, bodies, and references contain no Claude invocation syntax."""
+        install_chatgpt_skills(tmp_path)
+
+        claude_invocations = set(_CHATGPT_COMMAND_REWRITES)
+        for skill_file in tmp_path.glob("eforge-*/**/*.md"):
+            content = skill_file.read_text(encoding="utf-8")
+            for invocation in claude_invocations:
+                assert invocation not in content, f"{skill_file}: {invocation}"
+            assert "/eforge" not in content, skill_file
+            assert re.search(r"(?<![\w-])eforge:", content) is None, skill_file
+
+    def test_chatgpt_inline_reference_paths_resolve(self, tmp_path):
+        """Every rewritten inline reference invocation resolves within its skill bundle."""
+        install_chatgpt_skills(tmp_path)
+        reference_pattern = re.compile(r"`(references/[a-z0-9-]+\.md)`")
+
+        for skill_dir in tmp_path.glob("eforge-*"):
+            for markdown in skill_dir.rglob("*.md"):
+                content = markdown.read_text(encoding="utf-8")
+                for target in reference_pattern.findall(content):
+                    assert (skill_dir / target).is_file(), f"{markdown}: missing {target}"
+
+    def test_chatgpt_skill_local_markdown_links_resolve(self, tmp_path):
+        """Every relative Markdown-document link in a generated skill resolves locally."""
+        install_chatgpt_skills(tmp_path)
+        link_pattern = re.compile(r"\[[^]]+\]\(([^)]+)\)")
+
+        for markdown in tmp_path.glob("eforge-*/**/*.md"):
+            content = markdown.read_text(encoding="utf-8")
+            for raw_target in link_pattern.findall(content):
+                target = raw_target.split("#", 1)[0]
+                if not target or "://" in target or target.startswith("mailto:"):
+                    continue
+                if not target.endswith(".md"):
+                    continue
+                linked_path = markdown.parent / target
+                assert linked_path.is_file(), f"{markdown}: missing local link {raw_target}"
 
     def test_chatgpt_preserves_user_managed_eforge_skills(self, tmp_path):
         """ChatGPT install preserves sibling eforge-* skills it does not own."""
@@ -271,7 +605,7 @@ class TestInstallChatGPTSkills:
         _, removed = install_chatgpt_skills(tmp_path)
 
         assert "eforge-assess" not in removed
-        assert sentinel.read_text() == "keep me"
+        assert sentinel.read_text(encoding="utf-8") == "keep me"
         assert (assess_dir / "SKILL.md").is_file()
 
     def test_chatgpt_rejects_symlinked_skill_directory(self, tmp_path):
@@ -294,7 +628,7 @@ class TestInstallChatGPTSkills:
         with pytest.raises(PermissionError, match="symlinked path"):
             install_chatgpt_skills(tmp_path)
 
-        assert victim_file.read_text() == "do not overwrite"
+        assert victim_file.read_text(encoding="utf-8") == "do not overwrite"
 
     def test_chatgpt_rejects_symlinked_reference_directory(self, tmp_path):
         """install_chatgpt_skills rejects nested symlinked reference directories."""
@@ -335,6 +669,10 @@ class TestInstallChatGPTSkills:
             "eforge-config",
             "eforge-evaluate",
             "eforge-generate",
+            "eforge-industry-pack",
+            "eforge-organization-pack",
+            "eforge-pack",
+            "eforge-pack-release",
             "eforge-scenario",
             "eforge-validate",
         }
@@ -351,7 +689,9 @@ class TestInstallSkillsCli:
 
         assert result.exit_code == EXIT_SUCCESS, f"Output: {result.stdout}"
         assert (tmp_path / ".claude" / "commands" / "eforge" / "scenario.md").is_file()
+        assert (tmp_path / ".claude" / "commands" / "eforge" / "pack.md").is_file()
         assert (tmp_path / ".agents" / "skills" / "eforge-scenario" / "SKILL.md").is_file()
+        assert (tmp_path / ".agents" / "skills" / "eforge-organization-pack" / "SKILL.md").is_file()
 
     def test_install_skills_global(self, tmp_path, monkeypatch):
         """The default global install creates both user-wide skill trees."""
@@ -362,6 +702,7 @@ class TestInstallSkillsCli:
         assert result.exit_code == EXIT_SUCCESS, f"Output: {result.stdout}"
         assert (tmp_path / ".claude" / "commands" / "eforge" / "scenario.md").is_file()
         assert (tmp_path / ".agents" / "skills" / "eforge-scenario" / "SKILL.md").is_file()
+        assert (tmp_path / ".agents" / "skills" / "eforge-industry-pack" / "SKILL.md").is_file()
 
     def test_install_skills_explicit_all(self, tmp_path, monkeypatch):
         """--agent all installs each canonical agent exactly once."""
@@ -393,8 +734,10 @@ class TestInstallSkillsCli:
 
         assert result.exit_code == EXIT_SUCCESS, f"Output: {result.stdout}"
         assert (tmp_path / ".agents" / "skills" / "eforge-scenario" / "SKILL.md").is_file()
+        assert (tmp_path / ".agents" / "skills" / "eforge-pack" / "SKILL.md").is_file()
         assert not (tmp_path / ".claude").exists()
         assert "eforge-scenario" in result.stdout
+        assert "eforge-industry-pack" in result.stdout
 
     @pytest.mark.parametrize("agent", ["chatgpt", "codex"])
     def test_install_skills_chatgpt_global(self, tmp_path, monkeypatch, agent):
@@ -415,6 +758,7 @@ class TestInstallSkillsCli:
 
         assert result.exit_code == EXIT_SUCCESS, f"Output: {result.stdout}"
         assert (tmp_path / ".agents" / "skills" / "eforge-config" / "SKILL.md").is_file()
+        assert (tmp_path / ".agents" / "skills" / "eforge-organization-pack" / "SKILL.md").is_file()
         assert "Installing EvidenceForge skills for chatgpt" in result.stdout
 
     def test_install_skills_rejects_unknown_agent(self, tmp_path, monkeypatch):
@@ -438,6 +782,11 @@ class TestInstallSkillsCli:
         assert "generate.md" in result.stdout
         assert "validate.md" in result.stdout
         assert "config.md" in result.stdout
+        assert "pack.md" in result.stdout
+        assert "industry-pack.md" in result.stdout
+        assert "organization-pack.md" in result.stdout
+        assert "/eforge pack" in result.stdout
+        assert "eforge-industry-pack" in result.stdout
         assert "installed" in result.stdout.lower() or "Installed" in result.stdout
 
     def test_install_skills_all_continues_after_one_failure(self, tmp_path, monkeypatch):
@@ -466,6 +815,8 @@ class TestInstallSkillsCli:
 
         assert result.exit_code == EXIT_SUCCESS, f"Output: {result.stdout}"
         assert "Legacy EvidenceForge skills" in result.stdout
-        assert ".codex/skills" in result.stdout
+        # Rich may wrap the long temporary home path at the slash depending on
+        # the pytest worker suffix; normalize line wrapping before matching.
+        assert ".codex/skills" in result.stdout.replace("\n", "").replace("\\", "/")
         assert "These legacy files were not modified" in result.stdout
-        assert sentinel.read_text() == "preserve me"
+        assert sentinel.read_text(encoding="utf-8") == "preserve me"

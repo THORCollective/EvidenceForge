@@ -179,6 +179,31 @@ class TestProcessPoolSize:
         ]
         assert all("ntdsutil.exe" not in image for image in picks)
 
+    def test_remote_access_service_stack_is_one_deployment_cohort(self):
+        """One deployment should not independently mix competing VPN/SASE services."""
+        host_a = SimpleNamespace(hostname="WS-01", os="Windows 11", type="workstation")
+        host_b = SimpleNamespace(hostname="WS-02", os="Windows 11", type="workstation")
+        product_exes = {
+            "vpnagent.exe": "cisco",
+            "pangps.exe": "globalprotect",
+            "zsaservice.exe": "zscaler",
+            "zsatunnel.exe": "zscaler",
+        }
+        observed: set[str] = set()
+        for host in (host_a, host_b):
+            for seed in range(500):
+                image = pick_system_service_process(
+                    random.Random(seed),
+                    "workstation",
+                    host,
+                    "meridianhcs.local",
+                )[0]
+                exe = image.rsplit("\\", 1)[-1].lower()
+                if exe in product_exes:
+                    observed.add(product_exes[exe])
+
+        assert len(observed) == 1
+
     def test_workstation_update_tasks_do_not_run_on_domain_controllers(self):
         """Desktop updater scheduled tasks should stay on workstation hosts."""
         workstation_update_exes = {
@@ -210,7 +235,7 @@ class TestProcessPoolSize:
         dc_host = SimpleNamespace(os="Windows Server 2022", type="domain_controller")
         server_host = SimpleNamespace(os="Windows Server 2022", type="server")
         ws_host = SimpleNamespace(os="Windows 11 Enterprise", type="workstation")
-        noisy_exes = {"cleanmgr.exe", "compattelrunner.exe"}
+        noisy_exes = {"cleanmgr.exe", "compattelrunner.exe", "wsqmcons.exe"}
 
         dc_entries = get_scheduled_task_entries(dc_host)
         server_entries = get_scheduled_task_entries(server_host)
@@ -228,6 +253,29 @@ class TestProcessPoolSize:
             )
             assert entry["max_per_host_window"] == 1
             assert entry["cooldown_hours"] >= 24
+
+    def test_third_party_updater_inventory_varies_by_host_and_stays_coherent(self):
+        """A workstation should schedule only the updater installed in its service inventory."""
+        updater_names = {"googleupdate.exe", "adobearm.exe", "dropboxupdate.exe"}
+        selected_by_host: dict[str, str] = {}
+
+        for index in range(24):
+            hostname = f"WS-{index:02d}"
+            host = SimpleNamespace(
+                hostname=hostname,
+                os="Windows 11 Enterprise",
+                type="workstation",
+            )
+            entries = get_scheduled_task_entries(host)
+            selected = {
+                entry["image"].rsplit("\\", 1)[-1].lower()
+                for entry in entries
+                if entry["image"].rsplit("\\", 1)[-1].lower() in updater_names
+            }
+            assert len(selected) == 1
+            selected_by_host[hostname] = next(iter(selected))
+
+        assert len(set(selected_by_host.values())) >= 2
 
 
 class TestBaselinePatterns:

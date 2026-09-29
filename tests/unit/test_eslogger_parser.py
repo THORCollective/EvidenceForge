@@ -37,7 +37,7 @@ from pathlib import Path
 from evidenceforge.evaluation.parsers import ParsedRecord, discover_log_files
 from evidenceforge.evaluation.parsers.eslogger import ESLoggerParser
 from evidenceforge.evaluation.pillars.plausibility import PlausibilityScorer
-from evidenceforge.events.base import SecurityEvent
+from evidenceforge.events.base import OccurrenceBuilder
 from evidenceforge.events.contexts import FileContext, HostContext, ProcessContext
 from evidenceforge.formats.loader import load_format
 from evidenceforge.generation.emitters.eslogger import ESLoggerEmitter
@@ -81,7 +81,7 @@ def _write_real_eslogger_output(base_dir: Path) -> Path:
         start_time=T0,
     )
     emitter.emit(
-        SecurityEvent(timestamp=T0, event_type="process_create", src_host=host, process=proc)
+        OccurrenceBuilder(timestamp=T0, event_type="process_create", src_host=host, process=proc)
     )
     emitter.close()
 
@@ -154,7 +154,7 @@ class TestParsesRealEmitterOutput:
         host = _mac_host()
         proc = ProcessContext(1700, 1, "/usr/bin/osascript", "osascript", "alice", start_time=T0)
         emitter.emit(
-            SecurityEvent(
+            OccurrenceBuilder(
                 timestamp=T0,
                 event_type="file_create",
                 src_host=host,
@@ -243,3 +243,25 @@ class TestNanosecondTimestamps:
             fields["event.btm_launch_item_add.item.item_path"]
             == "/Users/a/Library/LaunchAgents/x y.plist"
         )
+
+
+class TestSourceHost:
+    def test_parse_file_attributes_records_to_host_directory(self, tmp_path: Path) -> None:
+        host_dir = tmp_path / "data" / "MAC-01.corp.local"
+        host_dir.mkdir(parents=True)
+        log = host_dir / "eslogger.ndjson"
+        log.write_text(json.dumps({"time": "2024-03-15T10:00:00.000000001Z"}) + "\n")
+
+        records = list(ESLoggerParser().parse_file(log))
+
+        assert [r.source_host for r in records] == ["MAC-01.corp.local"]
+
+    def test_parse_file_without_host_directory_has_no_source_host(self, tmp_path: Path) -> None:
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        log = data_dir / "eslogger.ndjson"
+        log.write_text(json.dumps({"time": "2024-03-15T10:00:00.000000001Z"}) + "\n")
+
+        records = list(ESLoggerParser().parse_file(log))
+
+        assert records[0].source_host is None

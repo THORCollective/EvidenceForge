@@ -13,7 +13,7 @@ from pydantic import ValidationError
 
 from evidenceforge.config import get_activity_directory
 from evidenceforge.config.overlay import extend_list, load_with_overlay, merge_keyed_list
-from evidenceforge.config.schemas import DnsTunnelRttConfig
+from evidenceforge.config.schemas import DnsTunnelRttConfig, NmapCommandProbeConfig
 from evidenceforge.utils.rng import _stable_seed
 
 _CACHED_DATA: dict[str, Any] | None = None
@@ -93,6 +93,17 @@ def merge_network_params(default: dict[str, Any], overlay: dict[str, Any]) -> di
         result["public_ntp_servers"] = extend_list(
             default.get("public_ntp_servers", []), overlay["public_ntp_servers"]
         )
+    if "public_dns_resolvers" in overlay:
+        result["public_dns_resolvers"] = merge_keyed_list(
+            default.get("public_dns_resolvers", []),
+            overlay["public_dns_resolvers"],
+            "name",
+        )
+    if "external_client_excluded_cidrs" in overlay:
+        result["external_client_excluded_cidrs"] = extend_list(
+            default.get("external_client_excluded_cidrs", []),
+            overlay["external_client_excluded_cidrs"],
+        )
     if isinstance(overlay.get("dns_tunnel_rtt"), dict):
         result["dns_tunnel_rtt"] = dict(overlay["dns_tunnel_rtt"])
     if "dns_tunnel_response_templates" in overlay:
@@ -111,6 +122,17 @@ def merge_network_params(default: dict[str, Any], overlay: dict[str, Any]) -> di
             overlay["external_scanner_port_profiles"],
             "name",
         )
+    if "linux_smb_connection_owners" in overlay:
+        result["linux_smb_connection_owners"] = merge_keyed_list(
+            default.get("linux_smb_connection_owners", []),
+            overlay["linux_smb_connection_owners"],
+            "role",
+        )
+    if isinstance(overlay.get("nmap_command_probe"), dict):
+        result["nmap_command_probe"] = {
+            **default.get("nmap_command_probe", {}),
+            **overlay["nmap_command_probe"],
+        }
     if isinstance(overlay.get("dns_tunnel_rcode_weights"), dict):
         result["dns_tunnel_rcode_weights"] = dict(overlay["dns_tunnel_rcode_weights"])
     if isinstance(overlay.get("proxy_connect_status_messages"), dict):
@@ -140,9 +162,29 @@ def reset_network_params_cache() -> None:
 
 
 def public_ntp_servers() -> list[dict[str, Any]]:
-    """Return configured public NTP server profiles."""
-    servers = load_network_params().get("public_ntp_servers", [])
-    return [server for server in servers if isinstance(server, dict)]
+    """Return canonical public NTP identities through the retained helper shape."""
+
+    from evidenceforge.generation.activity.public_identity_profiles import (
+        default_public_identity_registry,
+    )
+
+    return [
+        {
+            "name": binding.trait("name", binding.ptr),
+            "ip": binding.ip,
+            "operator": binding.trait("operator", binding.provider),
+            "stratum": binding.trait("stratum", 2),
+            "ref_id": binding.trait("ref_id", ".GPS."),
+            "weight": weight,
+        }
+        for binding, weight in default_public_identity_registry().fixed_binding_records("ntp")
+    ]
+
+
+def nmap_command_probe_config() -> NmapCommandProbeConfig:
+    """Return validated bounded planning settings for nmap process effects."""
+
+    return NmapCommandProbeConfig.model_validate(load_network_params().get("nmap_command_probe"))
 
 
 def public_ntp_ips() -> list[str]:
@@ -152,6 +194,131 @@ def public_ntp_ips() -> list[str]:
         for server in public_ntp_servers()
         if isinstance(server.get("ip"), str) and server["ip"]
     ]
+
+
+def public_dns_resolvers() -> list[dict[str, Any]]:
+    """Return canonical DNS identities through the retained helper shape."""
+
+    from evidenceforge.generation.activity.public_identity_profiles import (
+        default_public_identity_registry,
+    )
+
+    return [
+        {
+            "name": binding.trait("name", binding.ptr),
+            "ip": binding.ip,
+            "operator": binding.trait("operator", binding.provider),
+            "weight": weight,
+        }
+        for binding, weight in default_public_identity_registry().fixed_binding_records("dns")
+    ]
+
+
+def external_client_excluded_cidrs() -> list[str]:
+    """Return globally assigned CIDRs unsuitable for ordinary external clients."""
+    values = load_network_params().get("external_client_excluded_cidrs", [])
+    if not isinstance(values, list):
+        return []
+    return [str(value) for value in values if isinstance(value, str) and value]
+
+
+def linux_smb_connection_owner(
+    roles: set[str],
+    target: str,
+) -> tuple[str, str, str, str] | None:
+    """Return configured role-owned Linux SMB process metadata."""
+
+    profiles = load_network_params().get("linux_smb_connection_owners", [])
+    if not isinstance(profiles, list):
+        return None
+    normalized_roles = {role.lower() for role in roles}
+    for profile in profiles:
+        if (
+            not isinstance(profile, dict)
+            or str(profile.get("role", "")).lower() not in normalized_roles
+        ):
+            continue
+        values = tuple(
+            str(profile.get(field, "")) for field in ("key", "image", "command_line", "username")
+        )
+        if not all(values):
+            return None
+        key, image, command_line, username = values
+        # These workers expose their repository peer in the process command line.
+        # Scope the durable process identity to that peer so a process created for
+        # one repository can never be reused to attribute a flow to another.
+        return f"{key}:{target}", image, command_line.format(target=target), username
+    return None
+
+
+def public_dns_resolver_ips(scope_key: str | None = None) -> list[str]:
+    """Return public resolver IPs, optionally pinned to one operator per client scope."""
+
+    resolvers = [
+        resolver
+        for resolver in public_dns_resolvers()
+        if isinstance(resolver.get("ip"), str) and resolver["ip"]
+    ]
+    if scope_key is None:
+        return [str(resolver["ip"]) for resolver in resolvers]
+
+    by_operator: dict[str, list[dict[str, Any]]] = {}
+    for resolver in resolvers:
+        operator = str(resolver.get("operator") or resolver.get("name") or resolver["ip"])
+        by_operator.setdefault(operator, []).append(resolver)
+    if not by_operator:
+        return []
+
+    def _weight(resolver: dict[str, Any]) -> float:
+        try:
+            value = float(resolver.get("weight", 1.0))
+        except (OverflowError, TypeError, ValueError):
+            return 1.0
+        return value if math.isfinite(value) and value > 0 else 1.0
+
+    operators = sorted(by_operator)
+    resolver_weights = [_weight(resolver) for resolver in resolvers]
+    max_weight = max(resolver_weights)
+    operator_weights = [
+        sum(_weight(resolver) / max_weight for resolver in by_operator[operator])
+        for operator in operators
+    ]
+
+    rng = random.Random(_stable_seed(f"public_dns_operator:{scope_key}"))
+    threshold = rng.random() * sum(operator_weights)
+    cumulative = 0.0
+    selected_operator = operators[-1]
+    for operator, weight in zip(operators, operator_weights, strict=True):
+        cumulative += weight
+        if threshold <= cumulative:
+            selected_operator = operator
+            break
+    selected = sorted(
+        by_operator[selected_operator],
+        key=lambda resolver: (
+            -_weight(resolver),
+            str(resolver.get("name", "")),
+        ),
+    )
+    return [str(resolver["ip"]) for resolver in selected]
+
+
+def activity_dns_resolver_ips(activity_generator: Any, source_ip: str) -> list[str]:
+    """Read resolver policy through the canonical generator or a thin compatibility adapter."""
+
+    resolver = getattr(activity_generator, "_dns_resolver_ips_for_source", None)
+    if callable(resolver):
+        resolved = resolver(source_ip)
+        if isinstance(resolved, list | tuple):
+            cleaned = [value for value in resolved if isinstance(value, str) and value]
+            if cleaned:
+                return cleaned
+    configured = getattr(activity_generator, "_dns_server_ips", None)
+    if isinstance(configured, list | tuple):
+        cleaned = [value for value in configured if isinstance(value, str) and value]
+        if cleaned:
+            return cleaned
+    return public_dns_resolver_ips(source_ip)
 
 
 def dns_tunnel_rtt_range() -> tuple[float, float]:

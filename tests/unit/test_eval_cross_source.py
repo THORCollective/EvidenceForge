@@ -40,6 +40,17 @@ CrossSourceScorer = CausalityScorer
 
 T0 = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
 
+CAUSALITY_SUB_SCORE_KEYS = [
+    "causal_ordering",
+    "event_presence",
+    "indicator_accuracy",
+    "pivot_linkability",
+    "temporal_integrity",
+    "storyline_trace_coverage",
+    "intent_reconciliation",
+    "effect_reconciliation",
+]
+
 
 def _record(fmt: str, fields: dict, ts: datetime | None = None) -> ParsedRecord:
     return ParsedRecord(source_format=fmt, raw="test", fields=fields, timestamp=ts)
@@ -177,8 +188,8 @@ class TestSourceCorrectness:
 
 
 class TestFieldAgreement:
-    def test_matching_timestamps(self):
-        """Records from different formats within 30s should agree."""
+    def test_unjoinable_records_are_explicitly_skipped(self):
+        """Timestamp proximity alone is not a configured cross-source pivot."""
         records = {
             "windows_event_security": [
                 _record("windows_event_security", {"Computer": "WS-01"}, ts=T0),
@@ -189,10 +200,11 @@ class TestFieldAgreement:
         }
         scorer = PlausibilityScorer()
         result = scorer._score_field_agreement(records)
-        assert result.score == 100.0
+        assert result.score is None
+        assert result.skipped
 
-    def test_drifted_timestamps(self):
-        """Records from different formats > 30s apart should disagree."""
+    def test_unjoinable_same_bucket_does_not_receive_vacuous_credit(self):
+        """Sharing a coarse time bucket does not prove field agreement."""
         records = {
             "windows_event_security": [
                 _record("windows_event_security", {"Computer": "WS-01"}, ts=T0),
@@ -202,9 +214,10 @@ class TestFieldAgreement:
             ],
         }
         scorer = PlausibilityScorer()
-        # Same bucket → agree
+        # Same bucket alone is not an agreement denominator.
         r1 = scorer._score_field_agreement(records)
-        assert r1.score == 100.0
+        assert r1.score is None
+        assert r1.skipped
 
 
 class TestBaselineAggregate:
@@ -259,8 +272,8 @@ class TestEndToEnd:
         assert result.number == 3
         assert result.name == "Causality"
         assert result.weight == 0.25
-        assert result.score is not None
-        assert len(result.sub_scores) == 6
+        assert result.score is None
+        assert [sub_score.key for sub_score in result.sub_scores] == CAUSALITY_SUB_SCORE_KEYS
 
     def test_with_retail_scenario(self):
         """Run on real fixtures — should produce valid scores."""
@@ -286,7 +299,7 @@ class TestEndToEnd:
         scorer = CrossSourceScorer()
         result = scorer.score(records, scenario)
         assert result.score is not None
-        assert len(result.sub_scores) == 6
+        assert [sub_score.key for sub_score in result.sub_scores] == CAUSALITY_SUB_SCORE_KEYS
 
 
 def _make_scenario_with_domain(domain="example.com"):
@@ -1015,6 +1028,186 @@ class TestBeaconProxyMatcher:
             event,
         )
 
+    def test_explicit_proxy_client_leg_uses_proxy_listener_port(self):
+        """Logical HTTPS traffic should retain its physical client-to-proxy trace."""
+        from evidenceforge.evaluation.storyline import ResolvedEvent
+
+        event = ResolvedEvent(
+            index=0,
+            time=T0,
+            actor="jsmith",
+            system="WS-01",
+            system_ip="10.0.10.50",
+            activity="HTTPS upload through explicit proxy",
+            details={"dst_ip": "192.0.2.20", "dst_port": 443},
+            event_types=["connection"],
+        )
+        scorer = CrossSourceScorer()
+        scorer._proxy_mode = "explicit"
+        scorer._proxy_ips = {"10.0.20.20"}
+        scorer._proxy_listener_port = 8080
+
+        assert scorer._connection_matches_zeek(
+            {
+                "id.orig_h": "10.0.10.50",
+                "id.orig_p": 54000,
+                "id.resp_h": "10.0.20.20",
+                "id.resp_p": 8080,
+            },
+            event,
+        )
+        assert not scorer._connection_matches_zeek(
+            {
+                "id.orig_h": "10.0.10.50",
+                "id.orig_p": 54000,
+                "id.resp_h": "10.0.20.20",
+                "id.resp_p": 3128,
+            },
+            event,
+        )
+
+    def test_http_connection_matches_proxy_transaction_trace(self):
+        """Logical HTTP connections should retain source-aware protocol evidence."""
+        from evidenceforge.evaluation.storyline import ResolvedEvent
+
+        event = ResolvedEvent(
+            index=0,
+            time=T0,
+            actor="jsmith",
+            system="WS-01",
+            system_ip="10.0.10.50",
+            activity="HTTP upload through explicit proxy",
+            details={
+                "dst_ip": "192.0.2.20",
+                "dst_port": 443,
+                "hostname": "upload.example.test",
+            },
+            event_types=["connection"],
+        )
+        scorer = CrossSourceScorer()
+        scorer._proxy_mode = "explicit"
+        scorer._proxy_ips = {"10.0.20.20"}
+
+        assert scorer._record_matches(
+            _record(
+                "proxy_access",
+                {
+                    "client_ip": "10.0.10.50",
+                    "host": "upload.example.test",
+                    "url": "upload.example.test:443",
+                },
+                ts=T0,
+            ),
+            "proxy_access",
+            event,
+            "connection",
+        )
+        assert not scorer._record_matches(
+            _record(
+                "proxy_access",
+                {
+                    "client_ip": "10.0.10.99",
+                    "host": "upload.example.test",
+                    "url": "upload.example.test:443",
+                },
+                ts=T0,
+            ),
+            "proxy_access",
+            event,
+            "connection",
+        )
+
+    def test_http_connection_rejects_unrelated_direct_client(self):
+        """Destination proximity alone must not attach another client's HTTP trace."""
+        from evidenceforge.evaluation.storyline import ResolvedEvent
+
+        event = ResolvedEvent(
+            index=0,
+            time=T0,
+            actor="jsmith",
+            system="WS-01",
+            system_ip="10.0.10.50",
+            activity="Direct HTTP request",
+            details={
+                "dst_ip": "192.0.2.20",
+                "dst_port": 80,
+                "hostname": "upload.example.test",
+            },
+            event_types=["connection"],
+        )
+        scorer = CrossSourceScorer()
+        scorer._proxy_ips = set()
+
+        assert scorer._record_matches(
+            _record(
+                "zeek_http",
+                {
+                    "id.orig_h": "10.0.10.50",
+                    "id.resp_h": "192.0.2.20",
+                    "host": "upload.example.test",
+                },
+                ts=T0,
+            ),
+            "zeek_http",
+            event,
+            "connection",
+        )
+        assert not scorer._record_matches(
+            _record(
+                "zeek_http",
+                {
+                    "id.orig_h": "10.0.10.99",
+                    "id.resp_h": "192.0.2.20",
+                    "host": "upload.example.test",
+                },
+                ts=T0,
+            ),
+            "zeek_http",
+            event,
+            "connection",
+        )
+
+    def test_dns_query_step_matches_each_typed_sub_event(self):
+        """A multi-query storyline step should not collapse to its final query."""
+        from evidenceforge.evaluation.storyline import ResolvedEvent
+
+        event = ResolvedEvent(
+            index=0,
+            time=T0,
+            actor="root",
+            system="APP-01",
+            system_ip="10.0.20.30",
+            activity="Resolve attacker infrastructure",
+            details={"query": "last.example.test", "rcode": "NXDOMAIN"},
+            event_types=["dns_query"],
+            sub_details=[
+                {
+                    "query": "first.example.test",
+                    "rcode": "NOERROR",
+                    "answer": "192.0.2.20",
+                },
+                {"query": "last.example.test", "rcode": "NXDOMAIN"},
+            ],
+        )
+        scorer = CrossSourceScorer()
+
+        assert scorer._record_matches(
+            _record(
+                "zeek_dns",
+                {"query": "first.example.test", "answers": ["192.0.2.20"]},
+                ts=T0,
+            ),
+            "zeek_dns",
+            event,
+            "dns_query",
+        )
+        assert scorer._record_matches(
+            _record("zeek_dns", {"query": "last.example.test"}, ts=T0),
+            "zeek_dns",
+            event,
+            "dns_query",
+        )
+
     def test_ecar_connection_match_uses_directional_ip_roles(self):
         """A reverse callback should not match an earlier inbound upload tuple."""
         from evidenceforge.evaluation.storyline import ResolvedEvent
@@ -1135,6 +1328,134 @@ class TestBeaconProxyMatcher:
 
         assert CrossSourceScorer._username_indicator_matches("aisha.johnson", event)
         assert not CrossSourceScorer._username_indicator_matches("root", event)
+        scorer = CrossSourceScorer()
+        assert scorer._record_matches(
+            _record(
+                "windows_event_security",
+                {
+                    "EventID": 4625,
+                    "Computer": "WS-AJOHNSON-01.meridianhcs.local",
+                    "TargetUserName": "aisha.johnson",
+                },
+                ts=T0,
+            ),
+            "windows_event_security",
+            ResolvedEvent(
+                index=0,
+                time=T0,
+                actor="root",
+                system="WS-AJOHNSON-01",
+                system_ip="10.10.1.35",
+                activity="wrong password fumble",
+                details={"target_username": "aisha.johnson"},
+                event_types=["failed_logon"],
+            ),
+            "failed_logon",
+        )
+
+    def test_failed_logon_source_sentinel_is_an_indicator_mismatch(self):
+        """An explicit source must not receive credit when a source-bearing trace loses it."""
+        from evidenceforge.evaluation.storyline import ResolvedEvent
+
+        event = ResolvedEvent(
+            index=0,
+            time=T0,
+            actor="root",
+            system="WS-AJOHNSON-01",
+            system_ip="10.10.1.35",
+            activity="wrong password fumble",
+            details={"source_ip": "10.10.1.99", "target_username": "aisha.johnson"},
+            event_types=["failed_logon"],
+        )
+        trace = _record(
+            "ecar",
+            {
+                "hostname": "WS-AJOHNSON-01",
+                "object": "USER_SESSION",
+                "action": "LOGIN",
+                "principal": "aisha.johnson",
+                "src_ip": "-",
+            },
+            ts=T0,
+        )
+
+        assert ("source_ip", False) in CrossSourceScorer()._check_indicators(event, trace)
+
+        del trace.fields["src_ip"]
+        assert ("source_ip", False) in CrossSourceScorer()._check_indicators(event, trace)
+
+    def test_failed_logon_dc_supporting_traces_use_requester_identity(self):
+        """4771/4776 support a failed logon without borrowing the target as requester."""
+        from evidenceforge.evaluation.storyline import ResolvedEvent
+        from evidenceforge.models.scenario import System
+
+        source = System(
+            hostname="LT-MRIVERA-02",
+            ip="10.10.1.99",
+            os="Linux Ubuntu 22.04",
+            type="workstation",
+        )
+        target = System(
+            hostname="WS-AJOHNSON-01",
+            ip="10.10.1.35",
+            os="Windows 10",
+            type="workstation",
+        )
+        dc = System(
+            hostname="DC-01",
+            ip="10.10.2.10",
+            os="Windows Server 2022",
+            type="domain_controller",
+        )
+        scenario = _make_scenario(systems=[source, target, dc])
+        event = ResolvedEvent(
+            index=0,
+            time=T0,
+            actor="root",
+            system=target.hostname,
+            system_ip=target.ip,
+            activity="wrong password fumble",
+            details={"source_ip": source.ip, "target_username": "aisha.johnson"},
+            event_types=["failed_logon"],
+        )
+        scorer = CrossSourceScorer()
+        scorer._initialize_pivot_identity(scenario)
+        kerberos = _record(
+            "windows_event_security",
+            {
+                "EventID": 4771,
+                "Computer": "DC-01.meridianhcs.local",
+                "TargetUserName": "aisha.johnson",
+                "IpAddress": "::ffff:10.10.1.99",
+            },
+            ts=T0,
+        )
+        ntlm = _record(
+            "windows_event_security",
+            {
+                "EventID": 4776,
+                "Computer": "DC-01.meridianhcs.local",
+                "TargetUserName": "aisha.johnson",
+                "Workstation": "LT-MRIVERA-02",
+            },
+            ts=T0,
+        )
+
+        assert scorer._record_matches(kerberos, "windows_event_security", event, "failed_logon")
+        assert scorer._record_matches(ntlm, "windows_event_security", event, "failed_logon")
+        assert all(result for _name, result in scorer._check_indicators(event, kerberos))
+        assert all(result for _name, result in scorer._check_indicators(event, ntlm))
+
+        kerberos.fields["IpAddress"] = "10.10.1.88"
+        ntlm.fields["Workstation"] = target.hostname
+        assert ("source_ip", False) in scorer._check_indicators(event, kerberos)
+        assert ("source_workstation", False) in scorer._check_indicators(event, ntlm)
+
+        index = scorer._build_host_time_index({"windows_event_security": [kerberos, ntlm]})
+        assert scorer._search_for_event_indexed(event, "failed_logon", index) == [
+            kerberos,
+            ntlm,
+        ]
 
     def test_ipv4_mapped_source_indicator_matches_plain_ipv4(self):
         """Windows IPv4-mapped addresses should not create source mismatch noise."""

@@ -5,11 +5,15 @@
 
 import random
 import re
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
+
+import pytest
 
 from evidenceforge.generation.activity.edr_pools import (
     _sanitize_edr_pools,
     defender_platform_version,
+    file_path_templates_for_process,
     file_path_templates_for_user,
     get_dll_pool,
     get_file_paths,
@@ -19,7 +23,10 @@ from evidenceforge.generation.activity.edr_pools import (
     load_edr_pools,
     materialize_edr_template,
     materialize_edr_template_group,
+    materialize_registry_effect,
     normalize_defender_platform_path,
+    registry_entries_for_process,
+    registry_value_type,
     select_ambient_file_churn_effect,
     select_command_file_side_effect,
     select_file_side_effect,
@@ -37,6 +44,7 @@ class TestLoadEdrPools:
         assert "registry_keys_hklm" in pools
         assert "dll_pool" in pools
         assert "runmru_commands" in pools
+        assert "registry_mru_filenames" in pools
         assert "installed_software_products" in pools
         assert "group_policy_extension_guids" in pools
 
@@ -49,6 +57,7 @@ class TestLoadEdrPools:
             "registry_keys_hklm",
             "dll_pool",
             "runmru_commands",
+            "registry_mru_filenames",
             "file_side_effect_profiles",
             "installed_software_products",
             "group_policy_extension_guids",
@@ -241,7 +250,19 @@ class TestLoadEdrPools:
 
         assert effect is not None
         _action, path = effect
-        assert path.startswith(("/var/log/apt/", "/var/lib/dpkg/", "/var/lib/dnf/"))
+        assert path.startswith(("/var/log/apt/", "/var/lib/dpkg/"))
+        assert not path.startswith("/var/lib/dnf/")
+
+    def test_root_dnf_keeps_only_rpm_state_side_effects(self):
+        effect = select_file_side_effect(
+            process_name="/usr/bin/dnf",
+            command_line="dnf makecache --timer",
+            os_category="linux",
+            rng=random.Random(5),
+            user="root",
+        )
+
+        assert effect == ("modify", "/var/lib/dnf/history.sqlite")
 
 
 class TestFilePaths:
@@ -342,6 +363,34 @@ class TestFilePaths:
 
         assert effect is None
 
+    def test_generic_windows_paths_exclude_unowned_system_temp_template(self):
+        """Generic churn must not assign one Windows Temp grammar to arbitrary processes."""
+        paths = get_file_paths("windows")
+
+        assert not any(path.startswith("C:\\Windows\\Temp\\") for path in paths)
+
+        installer_paths = {
+            effect[1]
+            for seed in range(20)
+            if (
+                effect := select_file_side_effect(
+                    process_name=r"C:\Windows\System32\msiexec.exe",
+                    command_line="msiexec.exe /i package.msi /quiet",
+                    os_category="windows",
+                    rng=random.Random(seed),
+                    user="SYSTEM",
+                )
+            )
+            is not None
+        }
+        assert any(path.startswith(r"C:\Windows\Temp\MSI") for path in installer_paths)
+        assert all(
+            path.startswith(
+                (r"C:\Windows\Temp\MSI", "C:\\Windows\\SoftwareDistribution\\Download\\")
+            )
+            for path in installer_paths
+        )
+
     def test_linux_generic_paths_avoid_action_incompatible_sources(self):
         paths = get_file_paths("linux")
         assert not any(re.fullmatch(r"/proc/(?:\{rand\}|\d+)/status", path) for path in paths)
@@ -389,7 +438,8 @@ class TestFilePaths:
             }
 
             assert all(effect is not None for effect in effects)
-            assert all(effect[0] == "modify" for effect in effects if effect is not None)
+            expected_action = "read" if "dbus-daemon" in process_name else "modify"
+            assert all(effect[0] == expected_action for effect in effects if effect is not None)
             assert not any(
                 effect is not None
                 and (effect[1].startswith(("/tmp/", "/var/tmp/")) or "/.cache-" in effect[1])
@@ -409,6 +459,38 @@ class TestFilePaths:
         )
 
         assert effect is None
+
+    def test_application_service_principals_skip_generic_user_file_churn(self):
+        for principal in ("dovecot", "meridian-app", "postfix"):
+            effect = select_ambient_file_churn_effect(
+                "/usr/libexec/vendor/service",
+                "/usr/libexec/vendor/service --foreground",
+                "linux",
+                random.Random(5),
+                principal,
+                get_file_paths("linux"),
+                ["create"],
+                [1],
+            )
+
+            assert effect is None
+
+    def test_dbus_ambient_state_is_read_only(self):
+        effects = {
+            select_ambient_file_churn_effect(
+                "/usr/bin/dbus-daemon",
+                "/usr/bin/dbus-daemon --system",
+                "linux",
+                random.Random(seed),
+                "messagebus",
+                get_file_paths("linux"),
+                ["modify"],
+                [1],
+            )
+            for seed in range(10)
+        }
+
+        assert all(effect is not None and effect[0] == "read" for effect in effects)
 
     def test_linux_web_daemon_ambient_churn_uses_matching_service_family(self):
         generic_paths = get_file_paths("linux")
@@ -506,6 +588,73 @@ class TestRegistryKeys:
         assert not any(r"App Paths\WinSCP.exe" in key for key in rendered)
         assert not any("WDigest" in key for key in rendered)
 
+    def test_registry_artifacts_require_source_native_process_owners(self):
+        entries = get_registry_keys_hkcu() + get_registry_keys_hklm()
+
+        assert not any(
+            "Component Based Servicing" in key
+            for key, _name, _value in registry_entries_for_process(entries, "svchost.exe")
+        )
+        assert any(
+            "Component Based Servicing" in key
+            for key, _name, _value in registry_entries_for_process(entries, "TiWorker.exe")
+        )
+        assert not any(
+            "Microsoft\\Office" in key
+            for key, _name, _value in registry_entries_for_process(entries, "powershell.exe")
+        )
+        assert any(
+            "Microsoft\\Office" in key
+            for key, _name, _value in registry_entries_for_process(entries, "WINWORD.EXE")
+        )
+        assert not any(
+            "\\Excel\\" in key or "\\PowerPoint\\" in key
+            for key, _name, _value in registry_entries_for_process(entries, "OUTLOOK.EXE")
+        )
+        assert not any(
+            "\\Word\\" in key
+            for key, _name, _value in registry_entries_for_process(entries, "EXCEL.EXE")
+        )
+        assert not any(
+            "Internet Settings" in key
+            for key, _name, _value in registry_entries_for_process(entries, "WINWORD.EXE")
+        )
+        assert not any(
+            name in {"EnableLUA", "SecurityHealthSystray"}
+            for _key, name, _value in registry_entries_for_process(entries, "dllhost.exe")
+        )
+        assert any(
+            name == "NoAutoUpdate"
+            for _key, name, _value in registry_entries_for_process(entries, "usoclient.exe")
+        )
+        assert not any(
+            "SearchboxTaskbarMode" == name
+            for _key, name, _value in registry_entries_for_process(entries, "powershell.exe")
+        )
+        assert any(
+            "SearchboxTaskbarMode" == name
+            for _key, name, _value in registry_entries_for_process(entries, "explorer.exe")
+        )
+        assert not any(
+            "Windows Defender\\Exclusions" in key
+            for key, _name, _value in registry_entries_for_process(entries, "MsMpEng.exe")
+        )
+
+
+def test_windows_ambient_file_artifacts_require_source_native_process_owners():
+    templates = get_file_paths("windows")
+
+    generic = file_path_templates_for_process(templates, "svchost.exe")
+    assert not any("\\WER\\ReportQueue\\" in path for path in generic)
+    assert not any("\\DetectionHistory\\" in path for path in generic)
+    assert not any("\\SoftwareDistribution\\" in path for path in generic)
+
+    defender = file_path_templates_for_process(templates, "MsMpEng.exe")
+    assert any("\\DetectionHistory\\" in path for path in defender)
+
+    servicing = file_path_templates_for_process(templates, "TiWorker.exe")
+    assert any("\\SoftwareDistribution\\" in path for path in servicing)
+
 
 class TestDllPool:
     """Test DLL path pool content."""
@@ -555,6 +704,7 @@ class TestTemplateMaterialization:
     def test_materializes_userassist_runpath_values(self):
         import random
 
+        occurrence_time = datetime(2027, 8, 15, 14, 51, 15, 89067, tzinfo=UTC)
         key, value_name, details = materialize_edr_template_group(
             (
                 r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist\{CEBFF5CD-ACE2-4F4F-9178-9926F41749EA}\Count",
@@ -563,6 +713,7 @@ class TestTemplateMaterialization:
             ),
             random.Random(17),
             "alice.smith",
+            occurrence_time=occurrence_time,
         )
 
         assert "UserAssist" in key
@@ -570,8 +721,181 @@ class TestTemplateMaterialization:
         assert not value_name.removeprefix("HRZR_EHACNGU").isdigit()
         assert "\\" in value_name
         detail_bytes = details.split()
-        assert len(detail_bytes) >= 32
+        assert len(detail_bytes) == 72
         assert all(len(byte) == 2 for byte in detail_bytes)
+
+        payload = bytes(int(byte, 16) for byte in detail_bytes)
+        assert int.from_bytes(payload[4:8], "little") >= 1
+        filetime = int.from_bytes(payload[60:68], "little")
+        decoded = datetime(1601, 1, 1, tzinfo=UTC) + timedelta(microseconds=filetime // 10)
+        assert decoded == occurrence_time
+
+    def test_userassist_requires_occurrence_time(self):
+        with pytest.raises(ValueError, match="requires occurrence_time"):
+            materialize_edr_template("{userassist_binary}", random.Random(17))
+
+    def test_registry_effect_keeps_userassist_time_monotonic_outside_march(self):
+        template = (
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist\{CEBFF5CD-ACE2-4F4F-9178-9926F41749EA}\Count",
+            "{userassist_value}",
+            "{userassist_binary}",
+        )
+        first_time = datetime(2027, 8, 15, 9, 0, tzinfo=UTC)
+        second_time = first_time + timedelta(hours=3)
+
+        first = materialize_registry_effect(template, random.Random(21), "alice.smith", first_time)
+        second = materialize_registry_effect(
+            template, random.Random(21), "alice.smith", second_time
+        )
+
+        assert first[1] == second[1]
+        assert first[3] == second[3] == "binary"
+        first_bytes = bytes.fromhex(first[2])
+        second_bytes = bytes.fromhex(second[2])
+        first_filetime = int.from_bytes(first_bytes[60:68], "little")
+        second_filetime = int.from_bytes(second_bytes[60:68], "little")
+        assert first_filetime < second_filetime
+
+    def test_binary_registry_siblings_have_native_shapes(self):
+        entries = get_registry_keys_hkcu()
+        assert sum("UserAssist" in key for key, _name, _value in entries) == 1
+        assert not any("hex:" in value.lower() for _key, _name, value in entries)
+
+        occurrence_time = datetime(2027, 8, 15, 9, 0, tzinfo=UTC)
+        accent_template = next(entry for entry in entries if entry[1] == "AccentPalette")
+        _key, _name, accent, accent_type = materialize_registry_effect(
+            accent_template, random.Random(31), "alice.smith", occurrence_time
+        )
+        assert accent_type == "binary"
+        assert len(bytes.fromhex(accent)) == 32
+
+        pidl_template = next(entry for entry in entries if "OpenSavePidlMRU" in entry[0])
+        _key, _name, pidl, pidl_type = materialize_registry_effect(
+            pidl_template, random.Random(32), "alice.smith", occurrence_time
+        )
+        pidl_bytes = bytes.fromhex(pidl)
+        assert pidl_type == "binary"
+        items, end_offset = self._decode_item_id_list(pidl_bytes)
+        assert end_offset == len(pidl_bytes)
+        assert items[0].startswith(b"\x1f\x50")
+        assert items[1].startswith(b"\x2fC:\\")
+        assert items[-1][0] == 0x32
+
+    @staticmethod
+    def _decode_item_id_list(data: bytes, offset: int = 0) -> tuple[list[bytes], int]:
+        """Decode generic SHITEMID framing without relying on generator internals."""
+        items: list[bytes] = []
+        while True:
+            assert offset + 2 <= len(data)
+            item_size = int.from_bytes(data[offset : offset + 2], "little")
+            offset += 2
+            if item_size == 0:
+                return items, offset
+            assert item_size >= 3
+            payload_end = offset + item_size - 2
+            assert payload_end <= len(data)
+            items.append(data[offset:payload_end])
+            offset = payload_end
+
+    @staticmethod
+    def _filesystem_item_name(payload: bytes) -> str:
+        assert payload[0] in {0x31, 0x32}
+        return payload[12:].split(b"\x00", 1)[0].decode("windows-1252")
+
+    def test_extension_specific_mru_artifacts_bind_key_and_filename_across_hosts(self):
+        entries = [
+            entry
+            for entry in get_registry_keys_hkcu()
+            if "OpenSavePidlMRU" in entry[0] or "RecentDocs" in entry[0]
+        ]
+        extension_entries = [entry for entry in entries if not entry[0].endswith(r"\*")]
+        observed_hosts: set[str] = set()
+
+        for host_index, host_key in enumerate(("WS-ALPHA-01", "WS-BRAVO-01", "WS-CHARLIE-01")):
+            for entry_index, template in enumerate(extension_entries):
+                key, _name, details, value_type = materialize_registry_effect(
+                    template,
+                    random.Random(100 * host_index + entry_index),
+                    "alice.smith",
+                    datetime(2027, 8, 15, 9, 0, tzinfo=UTC),
+                    host_key=host_key,
+                )
+                expected_extension = key.rsplit("\\", 1)[-1].removeprefix(".").lower()
+                data = bytes.fromhex(details)
+                if "RecentDocs" in key:
+                    leaf_name = data.decode("utf-16le").rstrip("\x00")
+                else:
+                    items, end_offset = self._decode_item_id_list(data)
+                    assert end_offset == len(data)
+                    leaf_name = self._filesystem_item_name(items[-1])
+                assert leaf_name.rsplit(".", 1)[-1].lower() == expected_extension
+                assert value_type == "binary"
+                observed_hosts.add(host_key)
+
+        assert len(observed_hosts) == 3
+
+    def test_pidl_families_use_native_item_lists_and_distinct_last_visited_framing(self):
+        entries = get_registry_keys_hkcu()
+        open_save = next(entry for entry in entries if entry[0].endswith(r"OpenSavePidlMRU\pdf"))
+        last_visited = next(entry for entry in entries if "LastVisitedPidlMRU" in entry[0])
+        occurrence_time = datetime(2027, 8, 15, 9, 0, tzinfo=UTC)
+
+        _key, _name, open_details, _type = materialize_registry_effect(
+            open_save, random.Random(41), "alice.smith", occurrence_time
+        )
+        open_data = bytes.fromhex(open_details)
+        open_items, open_end = self._decode_item_id_list(open_data)
+
+        _key, _name, last_details, _type = materialize_registry_effect(
+            last_visited, random.Random(42), "alice.smith", occurrence_time
+        )
+        last_data = bytes.fromhex(last_details)
+        application_end = next(
+            index
+            for index in range(0, len(last_data) - 1, 2)
+            if last_data[index : index + 2] == b"\x00\x00"
+        )
+        application = last_data[:application_end].decode("utf-16le")
+        last_items, last_end = self._decode_item_id_list(last_data, application_end + 2)
+
+        assert open_end == len(open_data)
+        assert last_end == len(last_data)
+        assert application.lower().endswith(".exe")
+        assert [item[0] for item in open_items[:2]] == [0x1F, 0x2F]
+        assert [item[0] for item in last_items[:2]] == [0x1F, 0x2F]
+        assert self._filesystem_item_name(open_items[-1]).endswith(".pdf")
+        assert b"C\x00:\x00\\\x00U\x00s\x00e\x00r\x00s\x00" not in open_data
+
+    def test_registry_value_type_preserves_nonbinary_values(self):
+        assert registry_value_type(r"HKLM\Software\Test\Enabled", "DWORD (0x00000001)") == ("dword")
+        assert registry_value_type(r"HKLM\Software\Test\Name", "Example") == "string"
+
+    def test_update_orchestrator_task_identity_is_host_stable(self):
+        template = (
+            "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tree\\"
+            "Microsoft\\Windows\\UpdateOrchestrator\\Schedule Scan",
+            "Id",
+            "{{{guid}}}",
+        )
+
+        first = materialize_edr_template_group(
+            template,
+            random.Random(1),
+            host_key="WS-01",
+        )
+        second = materialize_edr_template_group(
+            template,
+            random.Random(99),
+            host_key="WS-01",
+        )
+        other_host = materialize_edr_template_group(
+            template,
+            random.Random(1),
+            host_key="WS-02",
+        )
+
+        assert first[2] == second[2]
+        assert first[2] != other_host[2]
 
     def test_materializes_runmru_values_with_user_texture(self):
         import random
@@ -619,6 +943,19 @@ class TestTemplateMaterialization:
             details = materialize_edr_template("{runmru_command}", random.Random(3), "alice")
 
         assert details == r"cmd.exe /c echo {user:1000000000}\1"
+
+    def test_runmru_command_preserves_domain_qualified_username(self):
+        with patch(
+            "evidenceforge.generation.activity.edr_pools.load_edr_pools",
+            return_value={"runmru_commands": [r"cmd.exe /c echo {username}"]},
+        ):
+            details = materialize_edr_template(
+                "{runmru_command}",
+                random.Random(4),
+                r"RBH\Marcus.Chen",
+            )
+
+        assert details == r"cmd.exe /c echo RBH\Marcus.Chen\1"
 
     def test_materializes_host_ip_context(self):
         import random
@@ -767,9 +1104,13 @@ class TestTemplateMaterialization:
 
     def test_materializes_installed_product_identity_stably_per_host(self):
         product = {
+            "product_id": "contoso-endpoint-agent",
             "name": "Contoso Endpoint Agent",
             "publisher": "Contoso Ltd.",
             "version": "8.4.2",
+            "build": "8.4.2",
+            "architectures": ["neutral"],
+            "scope": "machine",
         }
         with patch(
             "evidenceforge.generation.activity.edr_pools.load_edr_pools",
@@ -802,9 +1143,13 @@ class TestTemplateMaterialization:
 
     def test_materializes_installed_product_related_values_together(self):
         product = {
+            "product_id": "contoso-endpoint-agent",
             "name": "Contoso Endpoint Agent",
             "publisher": "Contoso Ltd.",
             "version": "8.4.2",
+            "build": "8.4.2",
+            "architectures": ["neutral"],
+            "scope": "machine",
         }
         with patch(
             "evidenceforge.generation.activity.edr_pools.load_edr_pools",
@@ -823,6 +1168,48 @@ class TestTemplateMaterialization:
         assert "{" in key and "}" in key
         assert publisher == "Contoso Ltd."
         assert version == "8.4.2"
+
+    def test_materializes_installed_product_from_exact_compiled_inventory(self):
+        class Release:
+            name = "Compiled Endpoint Agent"
+            publisher = "Compiled Software Ltd."
+            version = "12.7.4"
+
+        class Registry:
+            def __init__(self) -> None:
+                self.ordinals: list[int] = []
+
+            def count_installed_software_on_host(self, hostname: str) -> int:
+                assert hostname == "WS-COMPILED-01"
+                return 1
+
+            def installed_software_on_host_at(self, hostname: str, ordinal: int):
+                assert hostname == "WS-COMPILED-01"
+                self.ordinals.append(ordinal)
+                return Release()
+
+        registry = Registry()
+        templates = (
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+            r"\{{{installed_product_guid}}}",
+            "{installed_product_publisher}",
+            "{installed_product_version}",
+        )
+        with patch(
+            "evidenceforge.generation.activity.edr_pools._is_valid_installed_software_products",
+            side_effect=AssertionError("legacy installed-software catalog was consulted"),
+        ):
+            key, publisher, version = materialize_edr_template_group(
+                templates,
+                random.Random(5),
+                host_key="WS-COMPILED-01",
+                deployment_registry=registry,
+            )
+
+        assert registry.ordinals == [0]
+        assert "{" in key and "}" in key
+        assert publisher == "Compiled Software Ltd."
+        assert version == "12.7.4"
 
     def test_materializes_defender_platform_with_product_version_shape(self):
         import random

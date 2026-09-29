@@ -40,14 +40,17 @@ class ESLoggerParser(LogParser):
         return path.name == "eslogger.ndjson"
 
     def parse_file(self, path: Path) -> Iterator[ParsedRecord]:
+        # eslogger records carry no hostname; the per-host output directory
+        # (``data/<host-fqdn>/eslogger.ndjson``) identifies the host.
+        hostname = None if path.parent.name in {"data", "logs", "output"} else path.parent.name
         with path.open(encoding="utf-8") as f:
             for line_num, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
                     continue
-                yield self._parse_line(line, line_num)
+                yield self._parse_line(line, line_num, hostname=hostname)
 
-    def _parse_line(self, raw: str, line_num: int) -> ParsedRecord:
+    def _parse_line(self, raw: str, line_num: int, hostname: str | None = None) -> ParsedRecord:
         fields: dict[str, Any] = {}
         errors: list[str] = []
         timestamp = None
@@ -59,7 +62,7 @@ class ESLoggerParser(LogParser):
             # "process": {"audit_token": {...}}) into dotted top-level
             # fields, matching co_occurrence.yaml/causal_pairs.yaml's
             # eslogger rules (e.g. "event.exec.args", "process.audit_token.pid").
-            fields = _flatten(data)
+            fields = _flatten(data, leaf_fields=_declared_leaf_fields())
 
             # BTM items identify their plist by file:// URL; expose the POSIX
             # path too so it can be correlated with the plist's create event.
@@ -71,11 +74,13 @@ class ESLoggerParser(LogParser):
             # eslogger reports nanoseconds; datetime holds microseconds, so the
             # fraction is truncated to six digits before parsing.
             ts_str = data.get("time")
-            if ts_str is not None:
+            if isinstance(ts_str, str):
                 try:
                     timestamp = datetime.fromisoformat(_truncate_to_micros(ts_str))
                 except ValueError:
                     errors.append(f"Invalid timestamp: {ts_str}")
+            elif ts_str is not None:
+                errors.append(f"Invalid timestamp: {ts_str!r}")
 
         except json.JSONDecodeError as e:
             errors.append(f"JSON parse error: {e}")
@@ -87,6 +92,7 @@ class ESLoggerParser(LogParser):
             timestamp=timestamp,
             parse_errors=errors,
             line_number=line_num,
+            source_host=hostname,
         )
 
 
@@ -101,7 +107,24 @@ def _truncate_to_micros(ts: str) -> str:
     return f"{head}.{digits[:6].ljust(6, '0')}{suffix}"
 
 
-def _flatten(obj: dict[str, Any], prefix: str = "") -> dict[str, Any]:
+_DECLARED_LEAF_FIELDS: frozenset[str] | None = None
+
+
+def _declared_leaf_fields() -> frozenset[str]:
+    """Return the dotted names the eslogger format declares as scalar/list leaves."""
+    global _DECLARED_LEAF_FIELDS
+    if _DECLARED_LEAF_FIELDS is None:
+        from evidenceforge.formats.loader import load_format
+
+        _DECLARED_LEAF_FIELDS = frozenset(field.name for field in load_format("eslogger").fields)
+    return _DECLARED_LEAF_FIELDS
+
+
+def _flatten(
+    obj: dict[str, Any],
+    prefix: str = "",
+    leaf_fields: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
     """Recursively flatten nested dict values into dot-joined top-level keys.
 
     Non-dict values (including lists, e.g. ``event.exec.args``) are kept
@@ -111,8 +134,10 @@ def _flatten(obj: dict[str, Any], prefix: str = "") -> dict[str, Any]:
     flat: dict[str, Any] = {}
     for key, value in obj.items():
         flat_key = f"{prefix}.{key}" if prefix else key
-        if isinstance(value, dict):
-            flat.update(_flatten(value, flat_key))
+        # A declared leaf keeps its native value even when it is an object, so
+        # a wrong-typed field fails validation instead of vanishing.
+        if isinstance(value, dict) and flat_key not in leaf_fields:
+            flat.update(_flatten(value, flat_key, leaf_fields))
         else:
             flat[flat_key] = value
     return flat

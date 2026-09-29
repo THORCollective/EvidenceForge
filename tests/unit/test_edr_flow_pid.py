@@ -26,6 +26,7 @@ Verifies that baseline and storyline connections carry realistic
 initiating process PIDs in eCAR FLOW records.
 """
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock
 
@@ -202,8 +203,7 @@ class TestConnectionPidPropagation:
         event = self._find_connection_event(mock_emitters)
         assert event is not None
         assert event.network.initiating_pid == -1
-        assert event.edr is not None
-        assert event.edr.actor_id == ""
+        assert event.identity_plan is None
 
     def test_inferred_dns_pid_from_source_ip(
         self, activity_gen, state_manager, timestamp, win_system, mock_emitters
@@ -233,8 +233,40 @@ class TestConnectionPidPropagation:
         event = self._find_connection_event(mock_emitters)
         assert event is not None
         assert event.network.initiating_pid == pid
-        assert event.edr is not None
-        assert event.edr.actor_id == state_manager.get_process_object_id("WKS-01", pid)
+        assert event.identity_plan is not None
+        assert event.identity_plan.actor_id == state_manager.get_process_object_id("WKS-01", pid)
+
+    def test_dns_connection_can_suppress_source_pid_inference(
+        self, activity_gen, state_manager, timestamp, win_system, mock_emitters
+    ):
+        """An explicitly processless DNS connection must not acquire the resolver PID."""
+
+        state_manager.set_current_time(timestamp)
+        pid = state_manager.create_process(
+            "WKS-01",
+            4,
+            r"C:\Windows\System32\svchost.exe",
+            "svchost.exe -k netsvcs",
+            "NETWORK SERVICE",
+            "System",
+        )
+        activity_gen._ip_to_system = {"10.0.10.1": win_system}
+        activity_gen._system_pids = {"WKS-01": {"svchost_netsvcs": pid}}
+
+        activity_gen.generate_connection(
+            src_ip="10.0.10.1",
+            dst_ip="10.0.0.10",
+            time=timestamp,
+            dst_port=53,
+            proto="udp",
+            service="dns",
+            suppress_source_pid_inference=True,
+        )
+
+        event = self._find_connection_event(mock_emitters)
+        assert event is not None
+        assert event.network.initiating_pid == -1
+        assert event.identity_plan is None
 
     def test_inferred_dns_pid_prefers_dns_client_service(
         self, activity_gen, state_manager, timestamp, win_system, mock_emitters
@@ -277,8 +309,10 @@ class TestConnectionPidPropagation:
         event = self._find_connection_event(mock_emitters)
         assert event is not None
         assert event.network.initiating_pid == local_svc_pid
-        assert event.edr is not None
-        assert event.edr.actor_id == state_manager.get_process_object_id("WKS-01", local_svc_pid)
+        assert event.identity_plan is not None
+        assert event.identity_plan.actor_id == state_manager.get_process_object_id(
+            "WKS-01", local_svc_pid
+        )
 
     @staticmethod
     def _browser_http_context() -> HttpContext:
@@ -601,9 +635,11 @@ class TestConnectionPidPropagation:
             "Medium",
             logon_id=second_logon_id,
         )
-        http_context = self._browser_http_context()
-        http_context.host = "WEB-EXT-01"
-        http_context.uri = "/"
+        http_context = replace(
+            self._browser_http_context(),
+            host="WEB-EXT-01",
+            uri="/",
+        )
 
         activity_gen.generate_connection(
             src_ip=win_system.ip,
@@ -656,9 +692,11 @@ class TestConnectionPidPropagation:
             "Medium",
             logon_id=logon_id,
         )
-        http_context = self._browser_http_context()
-        http_context.host = "WEB-EXT-01"
-        http_context.uri = "/"
+        http_context = replace(
+            self._browser_http_context(),
+            host="WEB-EXT-01",
+            uri="/",
+        )
 
         activity_gen.generate_connection(
             src_ip=win_system.ip,
@@ -746,8 +784,7 @@ class TestConnectionPidPropagation:
         assert event is not None
         assert event.network.initiating_pid == -1
         assert event.process is None
-        assert event.edr is not None
-        assert event.edr.actor_id == ""
+        assert event.identity_plan is None
         wfp_events = [
             call.args[0]
             for call in mock_emitters["windows_event_security"].emit.call_args_list
@@ -840,8 +877,7 @@ class TestConnectionPidPropagation:
         assert event is not None
         assert event.network.initiating_pid == -1
         assert event.process is None
-        assert event.edr is not None
-        assert event.edr.actor_id == ""
+        assert event.identity_plan is None
 
     def test_connection_drops_expired_one_shot_process_pid_attribution(
         self, activity_gen, state_manager, timestamp, win_system, mock_emitters
@@ -873,13 +909,12 @@ class TestConnectionPidPropagation:
         assert event is not None
         assert event.network.initiating_pid == -1
         assert event.process is None
-        assert event.edr is not None
-        assert event.edr.actor_id == ""
+        assert event.identity_plan is None
 
     def test_connection_with_pid_gets_edr_actor_id(
         self, activity_gen, state_manager, timestamp, win_system, mock_emitters
     ):
-        """FLOW with known pid should have EdrContext with actorID linking to the process."""
+        """FLOW with a known PID should link its canonical actor to the process."""
         state_manager.set_current_time(timestamp)
         pid = state_manager.create_process(
             "WKS-01", 4, r"C:\Windows\System32\svchost.exe", "svchost.exe", "SYSTEM", "System"
@@ -897,8 +932,8 @@ class TestConnectionPidPropagation:
         )
         event = self._find_connection_event(mock_emitters)
         assert event is not None
-        assert event.edr is not None
-        assert event.edr.actor_id == proc_obj_id
+        assert event.identity_plan is not None
+        assert event.identity_plan.actor_id == proc_obj_id
 
     def test_connection_without_pid_has_no_actor_id(
         self, activity_gen, state_manager, timestamp, win_system, mock_emitters
@@ -915,5 +950,4 @@ class TestConnectionPidPropagation:
         )
         event = self._find_connection_event(mock_emitters)
         assert event is not None
-        assert event.edr is not None
-        assert event.edr.actor_id == ""
+        assert event.identity_plan is None

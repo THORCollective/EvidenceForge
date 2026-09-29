@@ -29,6 +29,10 @@ import pytest
 
 from evidenceforge.formats import load_format
 from evidenceforge.generation.emitters import SysmonEventEmitter
+from evidenceforge.generation.source_timing import (
+    SourceTimingPlanner,
+    sysmon_process_render_key,
+)
 
 
 class TestSysmonEventEmitter:
@@ -212,6 +216,8 @@ class TestSysmonEventEmitter:
             "StartAddress": "0x02060000",
             "StartModule": r"C:\Windows\System32\kernel32.dll",
             "StartFunction": "BaseThreadInitThunk",
+            "SourceUser": r"CORP\jsmith",
+            "TargetUser": r"CORP\target",
         }
 
         emitter.emit_event(event_data)
@@ -228,6 +234,14 @@ class TestSysmonEventEmitter:
         assert '<Data Name="StartAddress">0x02060000</Data>' in content
         assert '<Data Name="StartModule">C:\\Windows\\System32\\kernel32.dll</Data>' in content
         assert '<Data Name="StartFunction">BaseThreadInitThunk</Data>' in content
+        assert r'<Data Name="SourceUser">CORP\jsmith</Data>' in content
+        assert r'<Data Name="TargetUser">CORP\target</Data>' in content
+        variant = next(
+            candidate
+            for candidate in format_def.variants
+            if candidate.name == "sysmon_create_remote_thread"
+        )
+        assert [field.name for field in variant.fields][-2:] == ["SourceUser", "TargetUser"]
 
     def test_emit_sysmon_process_terminate(self, format_def, temp_output):
         """Test emitting Sysmon Event 5 (ProcessTerminate)."""
@@ -260,9 +274,86 @@ class TestSysmonEventEmitter:
         assert '<Data Name="Image">C:\\Windows\\System32\\cmd.exe</Data>' in content
         assert '<Data Name="User">CORP\\jsmith</Data>' in content
 
+    def test_versioned_eventdata_uses_native_manifest_order(self, format_def, temp_output):
+        """Later-version Sysmon user fields must stay at their manifest positions."""
+        emitter = SysmonEventEmitter(format_def, temp_output, buffer_size=10)
+        common = {
+            "TimeCreated": datetime(2024, 1, 15, 10, 30, tzinfo=UTC),
+            "Computer": "WKS-01.corp.local",
+            "Channel": "Microsoft-Windows-Sysmon/Operational",
+            "Level": 4,
+            "ExecutionProcessID": 2756,
+            "ExecutionThreadID": 3632,
+            "UtcTime": "2024-01-15 10:30:00.000",
+            "ProcessGuid": "{12345678-abcd-ef01-2345-678901234567}",
+            "ProcessId": 8052,
+            "Image": r"C:\Windows\System32\cmd.exe",
+            "User": r"CORP\jsmith",
+        }
+        emitter.emit_event(
+            {
+                **common,
+                "EventID": 7,
+                "ImageLoaded": r"C:\Windows\System32\user32.dll",
+                "Signed": "true",
+                "Signature": "Microsoft Windows",
+                "SignatureStatus": "Valid",
+            }
+        )
+        emitter.emit_event(
+            {
+                **common,
+                "EventID": 10,
+                "SourceProcessGUID": common["ProcessGuid"],
+                "SourceProcessId": 8052,
+                "SourceThreadId": 8060,
+                "SourceImage": common["Image"],
+                "TargetProcessGUID": "{87654321-abcd-ef01-2345-678901234567}",
+                "TargetProcessId": 640,
+                "TargetImage": r"C:\Windows\System32\lsass.exe",
+                "GrantedAccess": "0x1010",
+                "CallTrace": "C:\\Windows\\SYSTEM32\\ntdll.dll+9d000",
+                "SourceUser": common["User"],
+                "TargetUser": r"NT AUTHORITY\SYSTEM",
+            }
+        )
+        emitter.emit_event(
+            {
+                **common,
+                "EventID": 11,
+                "TargetFilename": r"C:\Temp\sample.txt",
+                "CreationUtcTime": common["UtcTime"],
+            }
+        )
+        emitter.emit_event(
+            {
+                **common,
+                "EventID": 13,
+                "EventType": "SetValue",
+                "TargetObject": r"HKLM\Software\Example\Value",
+                "Details": "DWORD (0x00000001)",
+            }
+        )
+        emitter.close()
+
+        content = temp_output.read_text()
+
+        def names(event_id):
+            event_xml = re.search(
+                rf"<Event\b[^>]*>.*?<EventID>{event_id}</EventID>.*?</Event>",
+                content,
+                re.DOTALL,
+            ).group(0)
+            return re.findall(r'<Data Name="([^"]+)">', event_xml)
+
+        assert names(7)[-2:] == ["SignatureStatus", "User"]
+        assert names(10)[-4:] == ["GrantedAccess", "CallTrace", "SourceUser", "TargetUser"]
+        assert names(11)[-3:] == ["TargetFilename", "CreationUtcTime", "User"]
+        assert names(13)[-3:] == ["TargetObject", "Details", "User"]
+
     def test_emit_sysmon_process_terminate_via_event(self, format_def, tmp_path):
-        """Test Sysmon Event 5 via SecurityEvent dispatch."""
-        from evidenceforge.events.base import SecurityEvent
+        """Test Sysmon Event 5 via OccurrenceBuilder dispatch."""
+        from evidenceforge.events.base import OccurrenceBuilder
         from evidenceforge.events.contexts import AuthContext, HostContext, ProcessContext
 
         output_dir = tmp_path / "output"
@@ -279,7 +370,7 @@ class TestSysmonEventEmitter:
             fqdn="WKS-01.corp.local",
             netbios_domain="CORP",
         )
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="process_terminate",
             src_host=host,
@@ -294,6 +385,7 @@ class TestSysmonEventEmitter:
         )
 
         assert emitter.can_handle(event) is True
+        SourceTimingPlanner().plan_event(event, "windows_event_sysmon")
         emitter.emit(event)
         emitter.close()
 
@@ -305,26 +397,19 @@ class TestSysmonEventEmitter:
         assert 'SystemTime="2024-01-15T10:30:00.0000000Z"' not in content
         assert '<Data Name="UtcTime">2024-01-15 10:30:00.000</Data>' not in content
 
-    def test_logon_guid_is_stable_per_host_logon_session(self, format_def, temp_output):
-        """Sysmon LogonGuid should identify the logon session, not each process."""
+    def test_unknown_session_does_not_invent_emitter_owned_logon_guid(
+        self, format_def, temp_output
+    ):
+        """Sysmon must not recompute shared session identity inside the emitter."""
         emitter = SysmonEventEmitter(format_def, temp_output, buffer_size=10)
 
-        guid_a = emitter._generate_logon_guid("WKS-01", "0xabc123")
-        guid_b = emitter._generate_logon_guid("WKS-01", "0xabc123")
-        guid_other_session = emitter._generate_logon_guid("WKS-01", "0xdef456")
-        guid_other_host = emitter._generate_logon_guid("WKS-02", "0xabc123")
-
-        assert guid_a == guid_b
-        assert guid_a != guid_other_session
-        assert guid_a != guid_other_host
-        assert re.fullmatch(
-            r"\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}",
-            guid_a,
+        assert emitter._resolve_logon_guid("WKS-01", "0xabc123", None) == (
+            "{00000000-0000-0000-0000-000000000000}"
         )
 
     def test_process_create_uses_state_session_logon_guid(self, format_def, tmp_path):
         """Sysmon Event 1 should share the canonical session LogonGuid with Security 4624."""
-        from evidenceforge.events.base import SecurityEvent
+        from evidenceforge.events.base import OccurrenceBuilder
         from evidenceforge.events.contexts import AuthContext, HostContext, ProcessContext
         from evidenceforge.generation.state_manager import StateManager
 
@@ -335,6 +420,7 @@ class TestSysmonEventEmitter:
         state_manager.set_current_time(datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC))
         logon_id = state_manager.create_session("jsmith", "WKS-01", 3, "10.0.0.20")
         logon_guid = state_manager.get_or_create_session_logon_guid(logon_id, "WKS-01")
+        state_manager.end_session(logon_id, datetime(2024, 1, 15, 10, 30, 2, tzinfo=UTC))
         emitter._state_manager = state_manager
 
         host = HostContext(
@@ -347,7 +433,7 @@ class TestSysmonEventEmitter:
             fqdn="WKS-01.corp.local",
             netbios_domain="CORP",
         )
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 5, tzinfo=UTC),
             event_type="process_create",
             src_host=host,
@@ -372,7 +458,7 @@ class TestSysmonEventEmitter:
 
     def test_create_remote_thread_uses_canonical_context_values(self, format_def, tmp_path):
         """Sysmon Event 8 should not derive fields independently from eCAR."""
-        from evidenceforge.events.base import SecurityEvent
+        from evidenceforge.events.base import OccurrenceBuilder
         from evidenceforge.events.contexts import (
             AuthContext,
             HostContext,
@@ -394,7 +480,7 @@ class TestSysmonEventEmitter:
             fqdn="WKS-01.corp.local",
             netbios_domain="CORP",
         )
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="create_remote_thread",
             src_host=host,
@@ -423,13 +509,15 @@ class TestSysmonEventEmitter:
         content = output_file.read_text()
         assert '<Data Name="TargetProcessId">688</Data>' in content
         assert '<Data Name="NewThreadId">840</Data>' in content
-        assert '<Data Name="StartAddress">0x02060000</Data>' in content
+        assert '<Data Name="StartAddress">0x0000000002060000</Data>' in content
         assert '<Data Name="StartModule">C:\\Windows\\System32\\ntdll.dll</Data>' in content
         assert '<Data Name="StartFunction">NtCreateThreadEx</Data>' in content
+        assert r'<Data Name="SourceUser">CORP\jsmith</Data>' in content
+        assert r'<Data Name="TargetUser">NT AUTHORITY\SYSTEM</Data>' in content
 
     def test_process_terminate_guid_uses_process_create_render_time(self, format_def, tmp_path):
         """Event 5 ProcessGuid should match Event 1 even after process state is removed."""
-        from evidenceforge.events.base import SecurityEvent
+        from evidenceforge.events.base import OccurrenceBuilder
         from evidenceforge.events.contexts import AuthContext, HostContext, ProcessContext
 
         output_dir = tmp_path / "output"
@@ -448,7 +536,7 @@ class TestSysmonEventEmitter:
         )
         start_time = datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC)
         terminate_time = datetime(2024, 1, 15, 10, 35, 0, tzinfo=UTC)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=terminate_time,
             event_type="process_terminate",
             src_host=host,
@@ -463,8 +551,12 @@ class TestSysmonEventEmitter:
             auth=AuthContext(username="jsmith"),
         )
 
-        expected_guid = emitter._get_stable_process_guid("WKS-01", 8052, start_time)
-        terminate_time_guid = emitter._get_stable_process_guid("WKS-01", 8052, terminate_time)
+        SourceTimingPlanner().plan_event(event, "windows_event_sysmon")
+        create_render_time = event.source_timing.finalized_times[
+            sysmon_process_render_key("create", host.hostname)
+        ]
+        expected_guid = emitter._generate_process_guid("WKS-01", 8052, create_render_time)
+        terminate_time_guid = emitter._generate_process_guid("WKS-01", 8052, terminate_time)
 
         emitter.emit(event)
         emitter.close()
@@ -477,7 +569,7 @@ class TestSysmonEventEmitter:
     def test_process_terminate_payload_time_updates_after_followon_shift(
         self, format_def, temp_output
     ):
-        """Event 5 UtcTime should follow final source-native TimeCreated normalization."""
+        """Event 5 keeps native/envelope separation through ordering repair."""
         emitter = SysmonEventEmitter(format_def, temp_output, buffer_size=100)
         guid = "{12345678-abcd-ef01-2345-678901234567}"
         base = {
@@ -519,10 +611,15 @@ class TestSysmonEventEmitter:
         event5 = content.split("<EventID>5</EventID>", 1)[1]
         assert "2024-01-15 15:44:49.138" not in event5
         assert '<Data Name="UtcTime">2024-01-15 16:32:44.' in event5
+        system_time = event5.split('SystemTime="', 1)[1].split('"', 1)[0]
+        utc_time = event5.split('<Data Name="UtcTime">', 1)[1].split("<", 1)[0]
+        envelope = datetime.fromisoformat(system_time.replace("Z", "+00:00"))
+        native = datetime.strptime(utc_time, "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=UTC)
+        assert envelope > native
 
-    def test_interactive_process_create_uses_nonzero_terminal_session(self, format_def, tmp_path):
-        """Interactive user process creates should not all render TerminalSessionId 0."""
-        from evidenceforge.events.base import SecurityEvent
+    def test_interactive_process_without_canonical_session_uses_zero(self, format_def, tmp_path):
+        """Sysmon must not invent a terminal session when canonical state is unavailable."""
+        from evidenceforge.events.base import OccurrenceBuilder
         from evidenceforge.events.contexts import AuthContext, HostContext, ProcessContext
 
         output_dir = tmp_path / "output"
@@ -539,7 +636,7 @@ class TestSysmonEventEmitter:
             fqdn="WKS-01.corp.local",
             netbios_domain="CORP",
         )
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="process_create",
             src_host=host,
@@ -560,11 +657,11 @@ class TestSysmonEventEmitter:
         content = (output_dir / "WKS-01.corp.local" / "windows_event_sysmon.xml").read_text()
         match = re.search(r'<Data Name="TerminalSessionId">(\d+)</Data>', content)
         assert match is not None
-        assert int(match.group(1)) > 0
+        assert int(match.group(1)) == 0
 
     def test_process_create_prefers_canonical_auth_session_id(self, format_def, tmp_path):
         """Sysmon TerminalSessionId should reuse the StateManager-owned session ID."""
-        from evidenceforge.events.base import SecurityEvent
+        from evidenceforge.events.base import OccurrenceBuilder
         from evidenceforge.events.contexts import AuthContext, HostContext, ProcessContext
 
         output_dir = tmp_path / "output"
@@ -581,7 +678,7 @@ class TestSysmonEventEmitter:
             fqdn="WKS-01.corp.local",
             netbios_domain="CORP",
         )
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="process_create",
             src_host=host,
@@ -609,7 +706,7 @@ class TestSysmonEventEmitter:
 
     def test_process_create_keeps_terminal_session_stable_per_logon_id(self, format_def, tmp_path):
         """Sysmon TerminalSessionId should not drift for children in the same logon."""
-        from evidenceforge.events.base import SecurityEvent
+        from evidenceforge.events.base import OccurrenceBuilder
         from evidenceforge.events.contexts import AuthContext, HostContext, ProcessContext
 
         output_dir = tmp_path / "output"
@@ -627,7 +724,7 @@ class TestSysmonEventEmitter:
             netbios_domain="CORP",
         )
         logon_id = "0xabc123"
-        parent = SecurityEvent(
+        parent = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="process_create",
             src_host=host,
@@ -641,7 +738,7 @@ class TestSysmonEventEmitter:
             ),
             auth=AuthContext(username="jsmith", logon_id=logon_id, session_id=2, logon_type=2),
         )
-        child = SecurityEvent(
+        child = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 1, tzinfo=UTC),
             event_type="process_create",
             src_host=host,
@@ -653,7 +750,7 @@ class TestSysmonEventEmitter:
                 username="jsmith",
                 logon_id=logon_id,
             ),
-            auth=AuthContext(username="jsmith", logon_id=logon_id, session_id=4, logon_type=2),
+            auth=AuthContext(username="jsmith", logon_id=logon_id, session_id=2, logon_type=2),
         )
 
         emitter.emit(parent)
@@ -664,9 +761,56 @@ class TestSysmonEventEmitter:
         session_ids = re.findall(r'<Data Name="TerminalSessionId">(\d+)</Data>', content)
         assert session_ids == ["2", "2"]
 
+    def test_canonical_session_supersedes_earlier_unknown_value(self, format_def, tmp_path):
+        """A later canonical session ID must not be masked by emitter fallback state."""
+        from evidenceforge.events.base import OccurrenceBuilder
+        from evidenceforge.events.contexts import AuthContext, HostContext, ProcessContext
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        emitter = SysmonEventEmitter(format_def, output_dir, buffer_size=1)
+        host = HostContext(
+            hostname="WKS-01",
+            ip="10.0.0.50",
+            os="Windows 10",
+            os_category="windows",
+            system_type="workstation",
+            domain="corp.local",
+            fqdn="WKS-01.corp.local",
+            netbios_domain="CORP",
+        )
+        logon_id = "0xabc123"
+        for index, session_id in enumerate((0, 4)):
+            emitter.emit(
+                OccurrenceBuilder(
+                    timestamp=datetime(2024, 1, 15, 10, 30, index, tzinfo=UTC),
+                    event_type="process_create",
+                    src_host=host,
+                    process=ProcessContext(
+                        pid=8052 + (index * 4),
+                        parent_pid=4200,
+                        image=r"C:\Windows\System32\whoami.exe",
+                        command_line="whoami /all",
+                        username="jsmith",
+                        logon_id=logon_id,
+                    ),
+                    auth=AuthContext(
+                        username="jsmith",
+                        logon_id=logon_id,
+                        session_id=session_id,
+                        logon_type=10,
+                    ),
+                )
+            )
+        emitter.close()
+
+        content = (output_dir / "WKS-01.corp.local" / "windows_event_sysmon.xml").read_text()
+        session_ids = re.findall(r'<Data Name="TerminalSessionId">(\d+)</Data>', content)
+        assert session_ids == ["0", "4"]
+
     def test_process_create_renders_current_directory_from_context(self, format_def, tmp_path):
         """Sysmon Event 1 should preserve the process working directory."""
-        from evidenceforge.events.base import SecurityEvent
+        from evidenceforge.events.base import OccurrenceBuilder
         from evidenceforge.events.contexts import AuthContext, HostContext, ProcessContext
 
         output_dir = tmp_path / "output"
@@ -683,7 +827,7 @@ class TestSysmonEventEmitter:
             fqdn="WKS-01.corp.local",
             netbios_domain="CORP",
         )
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC),
             event_type="process_create",
             src_host=host,
@@ -707,7 +851,7 @@ class TestSysmonEventEmitter:
 
     def test_process_create_parent_guid_uses_context_parent_start_time(self, format_def, tmp_path):
         """ParentProcessGuid should not be recomputed from a later reused parent PID."""
-        from evidenceforge.events.base import SecurityEvent
+        from evidenceforge.events.base import OccurrenceBuilder
         from evidenceforge.events.contexts import AuthContext, HostContext, ProcessContext
 
         output_dir = tmp_path / "output"
@@ -727,7 +871,7 @@ class TestSysmonEventEmitter:
         parent_start = datetime(2024, 1, 15, 9, 59, 0, tzinfo=UTC)
         child_start = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
         later_reused_parent_start = datetime(2024, 1, 15, 10, 30, 0, tzinfo=UTC)
-        event = SecurityEvent(
+        event = OccurrenceBuilder(
             timestamp=child_start,
             event_type="process_create",
             src_host=host,
@@ -745,10 +889,14 @@ class TestSysmonEventEmitter:
             auth=AuthContext(username="jsmith", logon_id="0xabc123"),
         )
 
-        expected_parent_guid = emitter._get_stable_process_guid("WKS-01", 4200, parent_start)
-        later_parent_guid = emitter._get_stable_process_guid(
-            "WKS-01", 4200, later_reused_parent_start
+        expected_parent_time = emitter._compatibility_parent_process_render_time(
+            host, event.process, parent_start
         )
+        later_parent_time = emitter._compatibility_parent_process_render_time(
+            host, event.process, later_reused_parent_start
+        )
+        expected_parent_guid = emitter._generate_process_guid("WKS-01", 4200, expected_parent_time)
+        later_parent_guid = emitter._generate_process_guid("WKS-01", 4200, later_parent_time)
 
         emitter.emit(event)
         emitter.close()
@@ -815,6 +963,29 @@ class TestSysmonEventEmitter:
         emitter._shift_followons_after_process_create()
 
         assert emitter._event_dicts[0]["TimeCreated"] == create_time + timedelta(milliseconds=1)
+
+    def test_follow_on_native_utc_shifted_after_process_create(self, format_def, temp_output):
+        """Dependent payload UtcTime should not precede its owning Event 1 payload time."""
+        emitter = SysmonEventEmitter(format_def, temp_output, buffer_size=10)
+        process_guid = "{12345678-abcd-ef01-2345-678901234567}"
+        emitter._event_dicts = [
+            {
+                "EventID": 1,
+                "Computer": "WKS-01.corp.local",
+                "ProcessGuid": process_guid,
+                "UtcTime": "2024-01-15 10:00:10.000",
+            },
+            {
+                "EventID": 7,
+                "Computer": "WKS-01.corp.local",
+                "ProcessGuid": process_guid,
+                "UtcTime": "2024-01-15 10:00:09.998",
+            },
+        ]
+
+        emitter._shift_followon_utc_times_after_process_create()
+
+        assert emitter._event_dicts[1]["UtcTime"] == "2024-01-15 10:00:10.001"
 
     def test_process_create_shifted_after_visible_parent_create_transitively(
         self, format_def, temp_output

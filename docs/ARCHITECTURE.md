@@ -1,5 +1,37 @@
 # EvidenceForge Architecture
 
+## Trust Boundary
+
+EvidenceForge validates authored scenarios, composed packs, project configuration, payloads, and
+other external data before those values enter generation. Once validated and converted into exact
+engine-owned models, internal generation objects are trusted. The generator preserves ownership,
+version, lifecycle, RNG-drift, atomic commit, rollback, and recovery checks, but it does not attempt
+to defend against arbitrary Python code already executing inside the EvidenceForge process.
+
+This is not a supported public Python API boundary. In-process code can monkeypatch validators,
+invoke `object.__setattr__`, or otherwise rewrite interpreter state, so recursive graph validation
+and cryptographic authentication between engine-owned objects do not provide a meaningful security
+boundary. Internal plans therefore use constant-time owner and lifecycle fences; validation and
+copy isolation remain at external input boundaries.
+
+## Scenario compilation and authoritative inputs
+
+Authored Scenario 1.0 and Scenario 2.0 documents compile into a frozen per-run input containing the
+canonical `Scenario`, effective data configuration, embedded YAML assets, pack identities/digests,
+and portable provenance. Scenario 2.0 may remain monolithic or explicitly compose whole industry
+packs or one organization pack. Pack-safe public catalogs are adapted into internal configuration;
+project-only and engine-owned families remain separate.
+
+Generation runs inside the compiled configuration scope. Raw and derived legacy caches are cleared
+and restored under a compatibility lock so sequential and concurrent runs cannot observe another
+run's overlays. Successful bundles contain a generated `RESOLVED_SCENARIO.yaml` and a
+`GENERATION_MANIFEST.json` written last. Resolved loading bypasses includes, repositories, project
+discovery, installed YAML reads, and ambient caches. Pack/include traversal, duplicate YAML keys,
+symlink following, unbounded composition, executable hooks, policy overrides, and pack-granted OOB
+authorization are rejected at the compilation boundary.
+
+See [Scenario 2.0 and composable packs](reference/SCENARIO_PACKS.md) for the public contract.
+
 This document explains how EvidenceForge works — first at a high level for users, then in detail for contributors who want to extend it.
 
 ## Part 1: How It Works
@@ -74,7 +106,7 @@ This separation means scenario creation benefits from LLM reasoning about attack
           │    ActivityGenerator         │
           │  Emits evidence against     │
           │  planner-owned state and    │
-          │  builds SecurityEvents      │
+          │  builds canonical occurrences      │
           │  with composable contexts   │
           │                              │
           │  CausalExpansionEngine       │
@@ -100,18 +132,21 @@ This separation means scenario creation benefits from LLM reasoning about attack
 
 ### Consistency by Construction
 
-The core architectural principle is that **two emitters cannot disagree about shared fields because there is only one source of truth.**
+The architectural principle is that **two emitters cannot disagree about shared fields because
+there is only one source of truth.** Producers populate a private `OccurrenceBuilder`; the
+dispatcher validates and seals it into a frozen `CanonicalOccurrence` before state, observation,
+or projection can consume it.
 
-A `SecurityEvent` object carries all the data for one logical evidence-producing
+A `CanonicalOccurrence` object carries all the data for one logical evidence-producing
 occurrence. Multiple contexts on that event describe facets of the same occurrence
 when those facts must agree across sources. For example, a process-created
-occurrence can carry `AuthContext`, `ProcessContext`, and `EdrContext` so Windows,
+occurrence can carry `AuthContext`, `ProcessContext`, and `EventIdentityPlan` so Windows,
 Sysmon, and endpoint telemetry render the same PID, LogonID, parent, image, and
 actor identity.
 
 Multi-phase activities are modeled one level higher, as action bundles. An action
-bundle represents a real-world activity that can produce several coordinated
-`SecurityEvent`s. For example, an SSH session may produce transport connection
+bundle represents a real-world activity that can produce several coordinated canonical
+occurrences. For example, an SSH session may produce transport connection
 evidence, SSH auth syslog messages, endpoint `USER_SESSION` login/logout rows,
 sshd/bash process evidence, bash history commands, and close/teardown evidence.
 An email delivery similarly routes through the email action bundle, which owns
@@ -119,7 +154,7 @@ message identity, SMTP hop sequence, route-aware `Received` headers, artifacts,
 and TLS visibility while delegating DNS and TCP evidence to the existing DNS and
 network-connection bundles. The bundle owns lifecycle, timing constraints,
 observation intent, and durable anchors across those events; each
-`SecurityEvent` remains the canonical evidence unit dispatched to state and
+`CanonicalOccurrence` remains the canonical evidence unit dispatched to state and
 emitters.
 
 Bundle contracts compose only through canonical semantic layers. A higher-level
@@ -132,10 +167,10 @@ Windows XML event can be validated against sibling evidence, but it must not
 trigger generation of that sibling evidence; the sibling must come from a
 canonical event, context, or upstream bundle.
 
-`SecurityEvent.timestamp` is canonical world time. Source-native timestamps are
+`CanonicalOccurrence.timestamp` is canonical world time. Source-native timestamps are
 planned separately by `SourceTimingPlanner`
 (`src/evidenceforge/generation/source_timing.py`) and stored on
-`SecurityEvent.source_timing` during dispatch. Migrated emitters ask the planner
+`CanonicalOccurrence.source_timing` during dispatch. Migrated emitters ask the planner
 for a source time with explicit bounds instead of adding independent jitter
 locally. Causally related rows are constrained (`A < B` within one source
 stream), equal canonical timestamps are ordered only when a relationship requires
@@ -178,14 +213,17 @@ foundation for multi-event timing. It resolves preferred timestamps, hard
 not-before/not-after bounds, lifecycle windows, and directed "after this evidence
 by at least this gap" relationships deterministically. `SourceTimingPlanner`
 already uses this graph for paired source rows and "source after source" timing;
-future action bundles should use it when one activity produces dependent
-`SecurityEvent`s whose source-native observations must not invert.
+future action bundles should use it when one activity produces dependent canonical
+occurrences whose source-native observations must not invert.
 
 ```
-            ActionBundle / ActivityGenerator
+          ActionBundle / ActivityGenerator
                    │
                    ▼
-        ┌─── SecurityEvent ───┐
+          private OccurrenceBuilder
+                   │ validate + seal
+                   ▼
+        ┌─── CanonicalOccurrence ───┐
         │ timestamp: 09:15:23 │
         │ src_host: LNX-001   │
         │ auth:               │
@@ -220,40 +258,54 @@ log entries for that connection. A topology may omit sensors entirely; canonical
 connection activity, endpoint evidence, proxy logs, and application logs still
 model the activity, but no sensor-backed network logs are written.
 
-**Network Address Translation:** When firewall sensors have `nat_rules`, the dispatcher computes NAT translations for permitted cross-boundary connections. The `NatContext` on `SecurityEvent` carries mapped IPs. The ASA emitter renders both real and mapped addresses (305011/305012 + parenthesized IPs in Built messages). Zeek emitters swap IPs for post-NAT sensors via `_nat_swaps_by_sensor`, so inside sensors see real IPs while outside sensors see translated IPs.
+**Network Address Translation:** When firewall sensors have `nat_rules`, the dispatcher computes
+NAT translations for permitted cross-boundary connections. `NatContext` owns the translation and
+the finalized network transaction owns the canonical tuple. `NetworkObservationPlanner` combines
+those facts with sensor topology and freezes one `NetworkSensorObservation` tuple/locality view per
+sensor. The ASA emitter renders both real and mapped addresses (305011/305012 plus parenthesized
+addresses in Built messages); Zeek and IDS emitters consume the frozen sensor views, so inside
+sensors see real addresses while outside sensors see translated addresses. No mutable per-emitter
+NAT swap map is retained on the event.
 
 ---
 
 ## Part 2: Internals (For Contributors)
 
-### SecurityEvent Canonical Model
+### Canonical Occurrence Model
 
-The `SecurityEvent` dataclass (`src/evidenceforge/events/base.py`) is the central data structure:
+`src/evidenceforge/events/base.py` defines a private mutable `OccurrenceBuilder` construction
+surface and the frozen `CanonicalOccurrence` publication boundary:
 
 ```
-SecurityEvent
+CanonicalOccurrence
 ├── timestamp: datetime (UTC)
-├── event_type: str ("logon", "process_create", "connection", "privilege_elevation", ...)
+├── event_type: EventKind (closed internal enum)
 ├── src_host: HostContext (originating system — hostname, IP, OS, domain, FQDN)
 ├── dst_host: HostContext (target system — hostname, IP, OS, domain, FQDN)
 ├── auth: AuthContext (logon_id, logon_type, SID, failure codes)
 ├── process: ProcessContext (pid, parent_pid, image, command_line, start_time)
 ├── remote_thread: RemoteThreadContext (target_pid, new_thread_id, start_address)
-├── network: NetworkContext (src/dst IP/port, protocol, zeek_uid, bytes)
+├── network: NetworkTransactionPlan (src/dst IP/port, protocol, zeek_uid, bytes)
 ├── dns: DnsContext (query, type, response, TTL)
 ├── file: FileContext (path, hash, operation)
 ├── registry: RegistryContext (key, value, operation)
-├── ids: IdsContext (signature, severity, classification)
+├── ids_alerts: tuple[IdsAlertPlan, ...] (structured, validated IDS attachments)
 ├── syslog: SyslogContext (app_name, message, pid, facility, severity)
 ├── weird: WeirdContext (name, notice, peer, source)
 ├── kerberos: KerberosContext (ticket_type, service, encryption)
 ├── shell: ShellContext (command)
-├── ... (27 context types total)
+├── protocol: ProtocolTransactionPlan
+│   └── TLS, HTTP, X.509 chain, OCSP, proxy, PE, and file-transfer subplans
+├── ... (typed semantic context fields plus immutable plans)
+├── identity_plan: EventIdentityPlan (typed object/actor/session/process identity)
+├── occurrence_key: SemanticOccurrenceKey (required action-relative identity)
+├── contract_seal: ShadowSealResult (immutable dispatch-admission snapshot)
 ├── source_timing: SourceTimingPlan (planned source-native timestamps)
 └── _sensor_hostnames_by_format: dict (network visibility metadata)
 ```
 
-All contexts are `@dataclass(slots=True)` for memory efficiency. They're defined in `src/evidenceforge/events/contexts.py`.
+Contexts and plans use slotted dataclasses for compact storage. Published shared-truth plans are
+frozen; construction-only drafts remain private to their planner or builder.
 
 **Key design decisions:**
 - Host context uses a dual `src_host`/`dst_host` model — `src_host` is the system that originates or performs the action; `dst_host` is the target or receiver. For single-host events only one is set; for network events both may be set when both endpoints are known
@@ -261,19 +313,102 @@ All contexts are `@dataclass(slots=True)` for memory efficiency. They're defined
 - Contexts describe facets of one occurrence. They must not be used to pack a
   whole multi-phase activity into one event. If connection, auth, session open,
   process creation, command execution, and session close are distinct occurrences,
-  coordinate them with an action bundle and emit distinct `SecurityEvent`s.
-- All fields are optional except `timestamp` and `event_type` — emitters check for the contexts they need
+  coordinate them with an action bundle and emit distinct canonical occurrences.
+- Only `OccurrenceBuilder` is mutable. `dispatch_builder()` completes identity/lifecycle planning,
+  derives the semantic occurrence key, validates legal context combinations, seals a deep
+  snapshot, and then calls the sealed-only `dispatch()` path.
 - The syslog emitter renders from SyslogContext (app_name, message, pid, facility, severity). All syslog message construction is done by ActivityGenerator, not the emitter.
-- `RawLogEntry` exists solely for the user-facing `raw` event type in scenario YAML. All internal engine code uses canonical SecurityEvent dispatch exclusively
-- `privilege_elevation` is a macOS/eslogger-only canonical event type (sudo/su elevation, rendered as ES `sudo`/`su`). No other emitter renders it — Linux sudo/su elevation continues to render as syslog/bash-history evidence from `process_create`/`bash_command`, not this event type.
+- `RawProjectionRequest` serves the explicit user-facing `raw` event type. It is routed directly
+  to one source projector and remains outside canonical cross-source consistency guarantees.
+
+`src/evidenceforge/events/contracts.py` defines the closed `EventKind`, `ContextKind`, and
+`FormatKind` domains plus one `EventKindContract` per currently produced canonical kind. The
+dispatcher captures an immutable `CanonicalOccurrenceSnapshot` during contract validation and
+enforces missing/forbidden context and identity rules before deriving semantic occurrence
+identity, applying state, or routing to observation and projection. `shadow_seal()` is the
+table-driven validator used by inventory, tests, and the seal boundary. The user-facing `raw`
+path remains outside the registry and outside
+cross-source consistency guarantees. The unreachable emitter aliases `module_load` and
+`special_privileges` were removed; the canonical image-load kind is `image_load`, while Windows
+Event 4672 is a source-native fan-out of its owning elevated logon rather than a second canonical
+occurrence.
+
+`ActionAnchor.action_id` and `SemanticOccurrenceKey` provide stable action-relative identity.
+Instance keys use domain identities such as a connection, transfer, or authentication-attempt
+key; positional ordinals are reserved for otherwise indistinguishable peer repetitions and never
+depend on global dispatch order.
+
+Internal occurrence identity is deliberately namespaced away from source-native identifiers.
+`occurrence_id` is for action/ground-truth/observation reconciliation; it never replaces Windows
+`EventID` or `EventRecordID`, Zeek UID/FUID, eCAR record/object UUIDs, Snort GID/SID, syslog
+sequence fields, or another external schema field. Projectors may use private occurrence metadata
+to make source-native allocation deterministic, but they must render the source's own morphology
+and must never expose the internal identifier verbatim.
+
+Network application truth is one `ProtocolTransactionPlan` aggregate composed from focused frozen
+subplans for TLS, HTTP, certificate presentation/X.509, OCSP, proxy, PE, and transferred files.
+This is one aggregate per canonical network occurrence, not one plan per rendered log row: it
+keeps shared references together while avoiding a universal optional-field bag.
+
+`AuthoredIntentLedger` (`src/evidenceforge/generation/intent_ledger.py`) is captured from the
+validated scenario before planning. It remains independent from generated occurrence and
+observation data. `IntentExecutionLedger` records planner acknowledgement, stable action and
+occurrence identities, and intent-scoped source-observation outcomes
+at the dispatcher boundary. `GROUND_TRUTH.json` projects one reconciliation row for every authored
+typed storyline or red-herring specification, including rows that failed to plan or produced no
+event dictionary. Ground-truth schema v2 exposes semantic occurrence IDs and no longer exposes a
+dispatch-sequence identifier.
+
+### V2 Foundation Ownership and Scale
+
+Scenario 2.0 separates authored controls from engine-owned runtime truth. The current migration is
+incremental: a path becomes strict only after its callers use the canonical owner, while shadow
+diagnostics continue to expose parity defects on compatibility paths.
+
+| Runtime truth | Current owner | Boundary |
+|---|---|---|
+| Required/optional/external action consequences | `ExecutionEffectPlan` on migrated bundles | Allocation-free preflight, exact occurrence/sibling reconciliation, compact intent outcome |
+| Process/session holds, leases, transitions, and close barriers | `LifecycleRegistry` on migrated paths | Append-only logical lifecycle and exact indexed queries; emitters receive frozen identity |
+| Materialized live compatibility state and established ID allocation | `StateManager` | Compatibility projection for unmigrated paths, not an emitter repair source or second logical registry |
+| Host application/service/task/module placement and release/content identity | `HostDeployment` and `DeploymentContentRegistry` | Immutable host compilation, path-independent release identity, exact path binding, no payload bytes |
+| Source deployment and capability policy | `CompiledCollectionDeployment` | Immutable exact source instances and capability bitsets; ephemeral projection envelopes |
+| Persistent application transports and operations | `ApplicationChannelRegistry` plus protocol managers | Exact affinity/owner/binding indexes, immutable budgets, paged expiry |
+| Source clocks and migrated duration/latency sampling | `TimingRuntime` | Canonical timestamps remain immutable; finalized source timing is frozen before rendering |
+
+`ExecutionEffectPlan` is internal. Scenario authors continue to declare typed events; they never
+author effect nodes, lifecycle handles, leases, closure tickets, channel IDs, or content IDs. For a
+migrated bundle, preflight runs before PID, port, lifecycle, or StateManager allocation. Required
+nodes must become exact canonical occurrences, link to an explicit sibling/lifecycle identity, or
+fail with an actionable reason. Compact intent outcomes are retained instead of a duration-wide
+execution DAG.
+
+Binary release identity is independent of host, principal, and install path. A software
+installation places a release on a host/principal; module release, installed-software inventory,
+local artifact version, canonical file content, and source-native FUID remain separate identities.
+The dispatcher attaches resolved release/hash metadata to canonical process context before sealing,
+and Sysmon renders that frozen identity without a registry lookup.
+
+Collection projection runs in a fixed order: determine canonical targets, require an exact deployed
+source and capability bits, apply topology visibility, apply coherent missingness, finalize source
+timing/batching, then render. Projection envelopes are occurrence-local. The observation manifest
+retains aggregate diagnostics and, when applicable, the compiled source-deployment digest rather
+than every projection decision.
+
+The foundation indexes build on `CompactIndexedStore`, `SegmentedTemporalIndex`, and
+`ReferenceLeaseIndex`. Exact identity is amortized O(1), equality lookup is O(1 + returned rows),
+temporal lookup is O(log n + returned rows), and expiry/compaction is paged. Hot operations may not
+scan `values()`, sort an entire registry, rebuild a reverse index, or materialize an unbounded
+result. Lazy indexes keep small scenarios cheap; explicit retention horizons and leases make
+long-running retained counts plateau. Stable partition ownership and canonical commit ordering keep
+results independent of worker scheduling and hash seed.
 
 ### Action Bundles
 
 Action bundles sit between world/storyline/baseline intent and canonical
-`SecurityEvent` dispatch:
+occurrence dispatch:
 
 ```
-intent -> action bundle -> lifecycle/timing/observation -> SecurityEvents -> dispatcher/state/emitters
+intent -> action bundle -> lifecycle/timing/observation -> canonical occurrences -> dispatcher/state/emitters
 ```
 
 The source of intent can be a storyline event, background/persona scheduler,
@@ -313,6 +448,12 @@ it would delay the transport observation past remote authentication. The SSH
 auth graph accounts for both the resolved network-sensor transport timestamp and
 the canonical connection event's eCAR/EDR source-latency window before placing
 syslog authentication rows.
+Application-channel watermarks may retire an SSH sidecar, but they transfer only an
+authenticated terminal-channel proof into the exact SSH close continuation. The proof is
+registry-keyed and remains verifiable after the compact closed-channel tombstone expires.
+Watermark advancement never renders endpoint process termination, PAM/logind close, or
+`USER_SESSION/LOGOUT` evidence; the installed SSH lifecycle continuation remains the sole
+renderer, and failed proof adoption is retained for bounded retry before another manager page.
 
 RDP bundle callers supply one remote interactive Windows session intent. The
 `RdpSessionActionBundle` materializes source-side `mstsc.exe` when a modeled
@@ -332,6 +473,11 @@ interactive logons rather than inventing self-sourced RDP evidence.
 Endpoint FLOW rendering keeps RDP transport observations near the connection
 open, dropping late process identity when necessary instead of moving FLOW rows
 past target authentication.
+If source publication raises after the canonical RDP network/application commit, recovery uses
+the retained full materialization graph: transport result, authenticated RDP application receipt,
+and durable identity capture. Recovery installs the exact close continuation without
+redispatching source rows. A reservation is cancelled only after non-commit is proven; an
+indeterminate recovery retains the reservation and reports the recovery failure.
 
 Windows remote-admin callers supply explicit credential use or service-install
 intent. `ExplicitCredentialUseActionBundle` owns source-host 4648 evidence:
@@ -357,10 +503,9 @@ Network-connection callers supply one logical connection occurrence, and
 source/destination host semantics, source-port allocation, hostname/DNS/TLS/HTTP
 and file metadata, proxy/firewall/IDS/EDR flow correlation, packet accounting,
 visibility handoff, Zeek UID/state identity, source endpoint process ownership,
-and Windows WFP companions. Higher-level bundles still call the public
-`generate_connection()` compatibility entrypoint, but connection truth is routed
-through this shared bundle boundary before becoming one canonical
-`SecurityEvent` plus any source-native companion evidence. Endpoint FLOW
+and Windows WFP companions. Higher-level bundles call the internal
+`generate_connection()` adapter. Connection truth is routed through this shared bundle boundary
+before becoming one `CanonicalOccurrence` plus any source-native companion evidence. Endpoint FLOW
 timestamps are bounded by the canonical source-visible connection interval that
 is stored in state after Zeek/source observation jitter is resolved. When a very
 short connection cannot also satisfy source-visible process-create ordering, the
@@ -422,28 +567,108 @@ Zeek/web-access correlation. `ScheduledScanOverlapActionBundle` covers
 suspicious-but-benign scanner noise, and `NmapCommandProbeActionBundle` covers
 network probes caused by modeled nmap processes.
 
-IDS alert callers supply one data-driven signature or preset rule, and
-`IdsAlertActionBundle` builds the canonical alert context attached to network
+IDS alert callers may supply multiple data-driven signatures, and
+`IdsAlertActionBundle` builds canonical alert contexts attached to network
 evidence. The bundle owns `(gid, sid, rev)` identity,
 message/classification/priority normalization, and optional signature-owned DNS
-payload construction for DNS alerts. Snort/Suricata emitters render `IdsContext`
-only; signature choice and alert payload construction remain upstream.
+payload construction for DNS alerts. Typed transport owners (`connection`,
+`beacon`, SSH/RDP sessions, authored DHCP transactions, scans, and DNS activity)
+carry attachments only on their owned physical canonical connections. Automatic
+DHCP renewals and DNS-tunnel cover traffic do not inherit authored assertions;
+web-scan automatic alerts coexist with authored attachments, with authored
+contexts winning duplicate `(gid, sid)` identities. Explicit proxy-capable
+attachments follow each existing physical proxy leg. A network tuple alone is
+never sufficient to create an alert, and the current IDS model performs no
+decryption. The Snort emitter first consumes frozen sensor visibility, clock, and
+NAT/PAT projections, then stores candidates in a bounded-memory SQLite spool.
+Finalization sorts by sensor-observed time and stable identity before applying
+per-sensor `(gid, sid, tracked visible IP)` detection/event filters. This avoids
+storyline insertion-order effects and keeps long beacon campaigns from retaining
+all candidates in memory. Invisible, dropped, warm-up, clipped, and nonexistent
+proxy legs never advance policy state. Raw Snort events remain an explicit
+source-local escape hatch.
 
 File-transfer callers supply transfer intent layered on top of a transport path.
-`HttpResponseFileTransferActionBundle` and `SmbFileTransferMetadataActionBundle`
-build Zeek files.log metadata, FUIDs, analyzers, hashes, MIME types, filenames,
-byte counts, transfer direction, and optional PE analysis from one transfer
-description. `StagedArchiveSmbReadActionBundle` emits the SMB read that moves a
-staged archive before exfiltration, and `ScpReceiverFileActionBundle` emits only
+`HttpFileTransferActionBundle` builds HTTP file-analysis metadata from one transfer
+description. `SmbActivityActionBundle` composes the canonical network and
+provider-selected authentication contracts, then owns SMB sessions, trees, handles,
+file operations, storage mutations, and directional file observations across Windows
+and Linux. Generic TCP/445 connections are transport-only.
+
+The SMB contract preserves three identities instead of collapsing them: the local application
+actor/process, the SMB credential principal, and the server-side effective identity. Per-user
+mappings resolve a principal through the identity directory; fixed mappings and event-level
+`smb_principal` overrides change the credential identity without rewriting the local process owner.
+Samba authentication may additionally resolve an effective UID/GID without inventing a Windows
+LUID or a Linux PAM login.
+
+The storage world compiles ordinary host file sets and share catalogs through one bounded catalog
+compiler. A host file set owns persistent local file/content identities without implying an SMB
+listener or server role. A share may bind the exact same-system, same-root file set as an exported
+alias; local and share mutations then address the same canonical objects and manifests/forecasts do
+not count the alias twice. Client/server roles are connection-relative rather than permanent host
+classifications.
+
+Storage owns one canonical SMB-relative object path, then derives independent presentations: UNC,
+Windows drive mapping, Linux mount path, and server-local Windows or POSIX path. The server's
+backing filesystem is also independent from its advertised SMB filesystem; this is required for
+Samba on ext4/XFS that advertises NTFS. `STORAGE_MANIFEST.json` schema v3 exposes those distinctions,
+bounded host file sets and share bindings alongside platform-aware mappings and resolved storyline
+targets.
+
+For a client-file-set upload, the SMB action bundle reuses the owning authored process, opens one
+authenticated transport/session/tree lifecycle, emits one operation per selected file, and commits
+the destination objects through the existing idempotent SMB mutation journal. Relative source
+paths are preserved beneath the authored destination directory. Destination file objects are
+distinct from their sources but retain the same content lineage and hashes. A move commits its
+destination before retiring its source; publication recovery remains the only retry owner.
+
+Client and server lifecycle morphology is data-driven by `config/activity/smb_profiles.yaml`.
+Windows native access keeps its system-owned transport. Linux mounted CIFS keeps application-owned
+local file effects while marking transport as kernel-owned and unavailable for process attribution;
+`mount.cifs` is not the actor for every later operation. Direct `smbclient` is operation-scoped,
+while GVFS remains resident background process/transport texture and does not enter the canonical
+typed SMB file/auth/session lifecycle. Samba uses one listener/service profile plus per-transport
+`smbd` workers, so inbound FLOW and server FILE evidence can reference the active worker. Audit
+policy stays on the server/share contract: minimal emits auth/connection
+lifecycle, standard adds selected VFS operations and failures, and high projects modeled
+full-audit operations through existing syslog. Windows Security output remains Windows-only.
+The version-sensitive behavior follows the upstream
+[`mount.cifs`](https://man7.org/linux/man-pages/man8/mount.cifs.8.html),
+[`smb.conf`](https://www.samba.org/samba/docs/current/man-html/smb.conf.5.html),
+[`vfs_full_audit`](https://www.samba.org/samba/docs/current/man-html/vfs_full_audit.8.html), and
+[Zeek SMB](https://docs.zeek.org/en/lts/logs/smb.html) contracts.
+
+`StagedArchiveSmbReadActionBundle` delegates the SMB
+read that moves a staged archive before exfiltration to that canonical bundle, and
+`ScpReceiverFileActionBundle` emits only
 the receiver-side endpoint file evidence after the SSH bundle owns transport,
-auth, and session timing. Large or download-scale HTTP responses attach the HTTP
-file-transfer bundle deterministically after canonical HTTP metadata is known,
-including caller-provided HTTP contexts from browser-session, proxy,
-and storyline paths. Email delivery uses the same canonical file-transfer
+auth, and session timing. Every successfully transmitted, sensor-visible,
+nonempty plaintext/decrypted HTTP request or response entity attaches a
+directional file transfer. This includes tiny bodies, redirects, authentication
+failures, and other error pages; HEAD, 1xx, 204, 205, 304, successful CONNECT,
+zero-byte, failed-transport, and opaque TLS responses remain fileless. The same
+canonical path owns authored, baseline, beacon, API, red-herring, browser-session,
+and direct or explicit-proxy HTTP activity. Local
+source identity is separate from a wire-visible filename: a local curl path does
+not become an HTTP filename unless the message exposes one, such as multipart
+Content-Disposition. Multipart form-data and mixed entities are serialized as
+ordered entity trees without allocating their payloads: the HTTP/TCP ledger owns
+boundaries, headers, separators, and encoded bytes, while each nonempty decoded
+leaf owns one file transfer and optional PE analysis. Containers never become
+files. Detected MIME and wire filenames project as sparse vectors, capped at 15
+entries per direction even though every leaf remains in files.log. Span-aware
+observation loss can truncate one leaf without truncating every sibling. Local
+file-backed parts emit transmitting-process reads; literal parts do not invent
+endpoint activity. Response URLs do not invent filenames. A plaintext proxy
+MISS uses distinct leg-local FUIDs but one content identity across origin→proxy
+and proxy→client files; a HIT or proxy-generated error has only the client-leg
+file. Failure before an origin response creates no egress response file, and
+TLS-protected entities remain opaque. Email delivery uses
+the same canonical file-transfer
 context list for plaintext SMTP MIME parts, so `smtp.log.fuids` and `files.log`
 rows share the owning SMTP connection UID. STARTTLS-protected SMTP hops keep the
-message content opaque and do not attach MIME file contexts.
-process-command, or storyline paths. This keeps transport/session ownership
+message content opaque and do not attach MIME file contexts. This keeps transport/session ownership
 separate from file evidence while preventing each caller from inventing transfer
 metadata independently.
 
@@ -453,8 +678,14 @@ activity-key-to-command resolution, SSH/session-readiness alignment,
 per-user/per-host history scheduling, bash-history event emission, and optional
 foreground process telemetry through existing process helpers. The current slice
 keeps command pools, lifecycle clamps, and process side-effect builders as
-adapter hooks while moving the orchestration boundary above individual
-`SecurityEvent`s.
+adapter hooks while moving the orchestration boundary above individual canonical
+occurrences.
+For an exact two-token Linux `sleep <duration>` command, process planning models the bounded
+numeric duration rather than the generic short-command fallback. A foreground process close is
+clamped at least 1,425 ms before an owning session deadline: 1,400 ms for the maximum shell-release
+jitter plus a 25 ms lifecycle margin. Impossible action-cohort intervals are rejected before
+mutation; compatibility paths leave the close to the session owner instead of publishing an
+independent invalid termination.
 
 Process-execution callers supply one process create or process terminate intent.
 `ProcessExecutionActionBundle` and `ProcessTerminationActionBundle` own the
@@ -510,9 +741,9 @@ Action bundles own cross-event concerns:
   leases, file transfers, and proxy transactions.
 - Temporal constraints across dependent evidence.
 - Observation intent and source-family eligibility.
-- Expansion into one or more canonical `SecurityEvent`s.
+- Expansion into one or more canonical occurrences.
 
-`SecurityEvent` remains the shared truth unit underneath the bundle. Emitters still
+`CanonicalOccurrence` remains the shared truth unit underneath the bundle. Emitters still
 receive only canonical events and source-local render rules; they do not inspect or
 execute action bundles directly.
 
@@ -535,16 +766,40 @@ does not need cross-source lifecycle, timing, state, or identity ownership.
 The compiled world-model layer (`src/evidenceforge/generation/world_model.py`) sits above the canonical event model and answers the realism question the event model does not: "why would this user/system do this here?"
 
 - `WorldModel` compiles canonical host capabilities and user placement from scenario fields such as `user.primary_system`, `system.assigned_user`, `system.roles`, and `system.services`
+- Capabilities are typed and compiled once for DHCP servers, DNS resolvers, domain controllers,
+  forward proxies, SSH receivers, RDP receivers, SMB clients, and SMB servers; baseline and
+  storyline consumers do not independently reinterpret roles or services
+- Windows systems retain implicit native SMB-client capability, and Windows file servers/DCs
+  retain server capability. Linux Samba service markers or explicit storage topology provide server
+  capability; a generic Linux `file_server` role does not. Canonical Linux file activity requires a
+  CIFS-mount or `smbclient` marker. GVFS
+  markers provide opaque background transport/process texture only. Capability-driven baseline
+  selection connects only an eligible SMB client to an eligible server
+- Distinct-peer requests exclude the requesting host. Missing capability remains explicit:
+  optional baseline families skip, authored DHCP intent fails validation, and neither path invents
+  a hostname, address, or role
+- Validated public DNS/NTP configuration represents explicit external infrastructure for eligible
+  traffic; it does not turn into a synthetic scenario host
 - `WorldPlanner` centralizes session bootstrap for interactive, network, SSH, and RDP access, including remote source-host selection and planner-owned session allocation
 - Baseline and storyline call this shared layer instead of maintaining separate SSH/RDP/logon heuristics
-- `ActivityGenerator` then emits host/network evidence against that precomputed state using the canonical `SecurityEvent` pipeline
+- `ActivityGenerator` then emits host/network evidence against that precomputed state using the
+  `OccurrenceBuilder` → `CanonicalOccurrence` pipeline
+
+Distribution choices that must persist across a lifecycle live with their owner rather than being
+resampled by renderers. For example, the DHCP bundle selects T1 once per lease, the OCSP bundle
+plans response duration once per transaction, and observation applies one coherent decision to an
+OCSP transaction's Zeek HTTP/file/OCSP companions. Stable per-name DNS capability and host-scoped
+GPO/device profiles similarly prevent independently sampled source fingerprints.
 
 ### EventDispatcher
 
 The dispatcher (`src/evidenceforge/events/dispatcher.py`) routes events through two layers:
 
 ```
-SecurityEvent
+OccurrenceBuilder
+    │ validate + seal
+    ▼
+CanonicalOccurrence
     │
     ├──▶ StateManager.apply(event)    [side effects: session/process/connection state]
     │
@@ -580,8 +835,8 @@ StateManager
 
 **ID allocation pattern:**
 1. `WorldPlanner` or `ActivityGenerator` calls `state_manager.create_session()` / `create_process()` / `open_connection()` to allocate durable IDs and ownership metadata
-2. `ActivityGenerator` builds a `SecurityEvent` with those IDs
-3. Dispatches the event
+2. `ActivityGenerator` builds an `OccurrenceBuilder` with those IDs
+3. The dispatcher validates, seals, and publishes the `CanonicalOccurrence`
 4. `StateManager.apply()` records state from the event (teardown, byte updates — never allocates IDs)
 
 **Zeek UID correlation:** All Zeek log types for the same network connection share a `zeek_uid` stored on `OpenConnection`. This is the critical cross-log correlation key — conn.log, dns.log, http.log, ssl.log all reference the same UID.
@@ -596,9 +851,9 @@ All emitters inherit from `LogEmitter` (`src/evidenceforge/generation/emitters/b
 LogEmitter (ABC)
 ├── _supported_types: set[str]       # Which event types this emitter handles
 ├── can_handle(event) → bool         # Format eligibility check
-├── emit(event: SecurityEvent)       # New path: type-safe, context-aware
-├── emit_event(data: dict)           # Legacy path: raw dict rendering
-├── emit_raw(entry: RawLogEntry)     # Escape hatch (user `raw` event type only)
+├── emit(event: CanonicalOccurrence)  # Sealed, type-safe canonical projection
+├── emit_event(data: dict)            # Internal source-record buffering/rendering
+├── emit_raw(data: dict)              # RawProjectionRequest escape hatch only
 ├── _buffer: list                    # 10K event buffer before flush
 └── _flush()                         # Write buffer to file
 │
@@ -609,8 +864,8 @@ LogEmitter (ABC)
 │   ├── ZeekHttpEmitter              # http.log
 │   ├── ZeekSslEmitter               # ssl.log
 │   └── ... (10 more Zeek types)
-├── EcarEmitter                      # eCAR NDJSON (MITRE CAR model, objectID/actorID graph via EdrContext)
-├── ESLoggerEmitter                  # macOS Endpoint Security (eslogger) NDJSON — macOS-only, per-host FQDN routing
+├── EcarEmitter                      # eCAR NDJSON (MITRE CAR model, objectID/actorID graph via EventIdentityPlan)
+├── ESLoggerEmitter                  # macOS Endpoint Security (eslogger) NDJSON; macOS-only, per-host routing
 ├── SyslogEmitter                    # Linux syslog (default RFC5424 or sof-elk RFC3164/year)
 ├── BashHistoryEmitter               # Per-user bash history
 ├── SnortEmitter                     # Snort IDS alerts
@@ -631,13 +886,76 @@ legacy/default during evaluation.
 
 **Threading:** Each emitter optionally runs in a background thread with a bounded queue (50K max). Hour-level flush barriers ensure temporal consistency.
 
-**Two rendering paths:**
-- `emit(SecurityEvent)` — primary path for all event types (storyline + baseline)
-- `emit_event(dict)` — legacy path for user `raw` event type in scenario YAML only
+**Two admission paths:**
+- `emit(CanonicalOccurrence)` — canonical path for baseline, storyline, startup, red-herring, and
+  causal occurrences
+- `dispatch_raw(RawProjectionRequest)` → `emit_raw(dict)` — explicitly source-local raw escape
+  hatch; it cannot create sibling evidence or claim cross-source consistency
+
+### Generation Checkpoints
+
+Fresh CLI runs checkpoint every 24 completed simulated hours by default; `--checkpoint-hours 0`
+disables new recovery points. Cadence is continuous across warm-up and collection and does not add
+initialization, phase-boundary, or pre-finalization checkpoints. The engine offers a post-hour
+cursor only after emitter quiescence, lifecycle/network retirement, watermark advancement, and
+transient-owner validation.
+
+Checkpoint state is assembled from explicit participants. Each mutable owner classifies its fields
+as a bounded live head, immutable incremental records, deterministically rebuilt state, or
+transient state that must be empty. There is no generic object-graph fallback and no executable
+serialization. Pydantic validates small manifests while versioned stdlib-packed binary segments
+carry primitive state; RNG state uses an explicit numeric schema.
+
+`.eforge-generation/` contains a protected staged bundle, content-addressed immutable segments,
+the latest two recovery points, self-contained resolved input, and the run lock. Recovery manifests
+share unchanged segments through a size-tiered catalog. A cadence commit seals only new records and
+bounded heads; it never rereads, rehashes, or rewrites inherited segments. Active emitter spools
+remain in their runtime locations and expose append, SQLite-row, immutable-run, or protected-file
+incremental adapters.
+
+The protected workspace also exposes a small cooperative control plane. `eforge checkpoint status`
+reads and authenticates the recovery index, both retained generations, referenced content, runtime
+fingerprint, lock, and non-overlapping managed storage without probing or modifying the filesystem.
+`eforge checkpoint suspend` atomically publishes an idempotent request for an active controller.
+At the next completed-hour barrier, the engine performs the same quiescence, retirement, transient
+validation, and participant transaction as a cadence checkpoint, acknowledges the request only
+after manifest publication, and exits without terminal finalization. This explicit off-cadence
+commit does not alter the modulo-based cadence anchor.
+
+The foreground generator also installs a two-stage SIGINT controller during execution. Its first
+Ctrl+C latches a cooperative request instead of injecting `KeyboardInterrupt` into participant or
+publication transactions. At the next completed-hour barrier, checkpoint-enabled runs publish the
+same off-cadence suspension recovery; checkpoint-disabled runs enter ordinary abort cleanup without
+creating recovery state. A second Ctrl+C forces immediate process exit, leaving any previously
+published recovery authoritative.
+
+New objects and heads are written and synced before the manifest is written last. Atomic rename and
+directory sync publish the recovery, after which old unreferenced content may be collected. Restore
+validates ownership, containment, hashes, schemas, and fingerprints, hydrates semantic owners in
+dependency order, attaches immutable records, and rebuilds locks, workers, routes, and caches. A
+corrupt newest recovery falls back to the previous valid point. Successful bundle publication
+removes the hidden workspace and records no resume history in the final manifest. See
+[Generation Checkpoints and Resume](reference/GENERATION_CHECKPOINTS.md) for the user contract.
+
+Resume compatibility is modeled on orthogonal axes. Immutable run identity covers authoritative
+resolved input, seed, formats, output target, and OOB settings; explicit conflicts are rejected.
+State loadability is established only after every required participant and supported schema
+hydrates. Python/compiler/implementation, dependency, OS, architecture, cache-tag, and byte-order
+differences are portable restore attempts rather than static failures. They always remove the
+byte-equivalence guarantee.
+
+The packaged `config/generation_behavior.yaml` supplies a monotonic, gap-free revision history for
+output-affecting changes, including stable IDs, impact, and affected domains/formats. CI hashes the
+generation behavior surface and requires a manifest revision whenever that surface changes;
+checkpoint-control-only blocks are explicitly excluded. Behavior risk and runtime drift are stored
+with the accepted policy and confirmation state in same-cursor migration checkpoints and final
+manifest provenance. Read-only verification uses a scratch-disposal lifecycle that stops workers
+and closes database handles without terminal evidence, source sorting/merging, footer output, or
+checkpoint publication.
 
 ### Format Definition System
 
-Log formats are defined declaratively in YAML files (`src/evidenceforge/formats/definitions/`), not in code:
+Log formats are defined declaratively in YAML files (`src/evidenceforge/config/formats/`), not in code:
 
 ```yaml
 # Example: zeek_conn.yaml
@@ -657,9 +975,15 @@ fields:
 ```
 
 Each format YAML defines fields (name, type, constraints), event variants (for multi-event formats like Windows Security), and Jinja2 output templates. Adding a new log format requires:
-1. A new YAML definition in `formats/definitions/`
+1. A new YAML definition in `config/formats/`
 2. An emitter class in `generation/emitters/`
 3. A parser class in `evaluation/parsers/` (for eval support)
+
+Record contracts use Pydantic schemas and a bounded evaluator, with cached field plans per
+format/variant. Dotted source field names are literal keys. Findings carry structured categories;
+schema/correctness failures gate every record at 100%, while context-dependent realism rules stay
+diagnostic. JSON Logic and the separate co-occurrence interpreter have been removed. See
+[record validation](reference/RECORD_VALIDATION.md) for the developer contract.
 
 ### Evaluation Engine
 
@@ -677,7 +1001,7 @@ EvaluationEngine
 ├── Pillars (4 scoring modules — currently still 5 legacy scorers during transition)
 │   ├── Parseability    (30%) — spec conformance, format constraints
 │   ├── Plausibility    (25%) — OS/value correctness, co-occurrence, distributions,
-│   │                           user diversity, benign anomaly rate
+│   │                           user diversity, anomaly rate, zero-weight IDS integrity gate
 │   ├── Causality       (25%) — causal ordering, event presence, indicator accuracy,
 │   │                           pivot linkability, storyline temporal integrity
 │   └── Timing          (20%) — attack-chain timing, burstiness, diurnal patterns,
@@ -690,6 +1014,8 @@ EvaluationEngine
 └── QualityReport
     ├── overall_score: 0-100
     ├── pillars: list[PillarScore]
+    ├── categories: source schema, canonical invariants, scenario completeness,
+    │               distribution realism, optional expert comparison
     ├── acceptance_criteria: pass/fail (hard gates only)
     ├── aspirational_met / aspirational_total
     ├── flags: list[str]
@@ -697,6 +1023,22 @@ EvaluationEngine
 ```
 
 Causal ordering rules are defined in `evaluation/rules/causal_pairs.yaml`. Rules support several evaluation features:
+
+Snort finalization incrementally builds a bounded `ids_evaluation` contract in
+canonical ground truth. Evaluation preserves each parsed record's host/sensor
+source instance and exactly compares the contract's sensor-local counts and
+ordered normalized digests with rendered alerts. The check is a 100% hard gate
+but has zero score weight. Older datasets skip it explicitly unless their
+scenario authors IDS attachments. Storyline pivot linkability is inferred from
+typed stable indicators; it connects consecutive events per indicator rather
+than scoring unrelated globally consecutive steps.
+
+Required acceptance measures are non-vacuous: missing or unmeasurable hard gates fail rather than
+disappearing from the verdict, while explicitly inapplicable scenario-free checks render as `N/A`.
+The zero-weight intent-reconciliation gate independently rebuilds authored intent from the scenario
+and compares IDs and authored metadata with canonical ground truth. Observation-profile exclusions
+remain valid only when the matching manifest records dropped, filtered, delayed, or out-of-window
+source evidence.
 
 - **Grace period:** Events within the scenario's `logon_grace_period` (default 30m) from scenario start are exempt from causal ordering checks, since data collection begins mid-session with pre-existing user sessions.
 - **Per-rule tolerance:** Rules can specify a `tolerance` fraction (e.g., 0.03 for DNS→TCP) allowing a percentage of failures without penalty. Used for intentional direct-IP baseline connections.
@@ -763,7 +1105,7 @@ ActivityGenerator.generate_connection()
     │             compute timing offset → call generate_*()
     │             (recursion guard: _expanding flag prevents re-expansion)
     │
-    └──▶ Build SecurityEvent → dispatch
+    └──▶ Build OccurrenceBuilder → validate/seal → dispatch CanonicalOccurrence
 ```
 
 **Key components:**
@@ -812,7 +1154,7 @@ The baseline generation engine includes several layers of realism beyond simple 
 
 **Network-level red herrings:** Three suspicious-but-benign network patterns supplement the existing host-level red herrings: high-entropy DNS queries to CDNs/DoH providers, unusual outbound connections to dev tools/cloud regions/backup sync, and scheduled vulnerability scan bursts.
 
-**Data-driven identity pools:** Realism-sensitive fallback identities are owned by overlay-aware YAML files under `config/activity/`: baseline email domains/local-parts, public mail replacement domains, omitted storyline external IP pools, suspicious-benign DNS/connection targets, and command URL/host placeholder pools. Scenario-authored IPs/domains remain authoritative; config pools are used only for deterministic fallback and background generation.
+**Data-driven identity pools:** `public_identity_profiles.yaml` is the scenario-scoped canonical registry for generated Internet identities. Immutable bindings join semantic role, provider, IP, forward/PTR names, TLS profile, and persona/User-Agent traits once using stable semantic keys. Default scanner, authentication, C2, human, crawler, API-client, ordinary-responder, CDN, DNS, NTP, and mail pools are disjoint unless provider infrastructure is explicitly shared. Scenario-authored IPs/domains remain authoritative and contradictory cross-role reuse is diagnostic. Other overlay-aware YAML files continue to own baseline email local parts/domains, suspicious-benign targets, and command placeholders.
 
 **Entity lifecycle validation:** StateManager tracks per-system boot times and validates that process injection events (Sysmon 8/10) target existing PIDs. Warnings are logged for impossible sequences without blocking generation.
 
@@ -838,7 +1180,27 @@ The baseline generation engine includes several layers of realism beyond simple 
 
 **Windows maintenance cadence:** Baseline Windows scheduled/background utility launches are data-driven through `system_processes.yaml`. Scheduled-task entries can declare optional selection weights, host-type eligibility, per-host window caps, and cooldowns, while the generator applies executable-specific lifetime profiles for common maintenance tools such as `CompatTelRunner.exe`, `usoclient.exe`, `MpCmdRun.exe`, and `cleanmgr.exe`. Remote/admin command parents are resolved by execution family above generic process-tree selection, preferring concrete owners such as live `PSEXESVC.exe`, `WmiPrvSE.exe`, Task Scheduler, service/SCM context, or PowerShell/WinRM when the command shape indicates them.
 
-**PID allocation diversity:** PIDs use a lognormal distribution for gap sizes (Windows: `lognormvariate(1.2, 0.8)` in multiples of 4; Linux: `lognormvariate(0.5, 0.6)`), producing a heavy-tailed gap distribution with no fixed-set fingerprint. Wraparound at 65536 skips PIDs still held by running processes.
+**Duration-stable PID allocation:** `StateManager` advances Linux through an unbounded logical
+position and renders that position into the exclusive `pid_max` ring `500..4,194,303`. A
+high-to-low rendered transition is therefore an explicit wrap, not a chronology failure. Windows
+keeps its multiples-of-four distribution and renders through the modeled `4,000..65,532` ring.
+Both policies probe live reservations on every candidate, so neither can overwrite a running
+process. A rendered PID is reusable only after natural wrap and after the prior canonical or
+transient lifetime has ended; fixed boot processes remain reserved for the host lifetime.
+
+The engine advances a PID-allocation watermark after each generated hour. Because baseline and
+session planners can visit canonical process starts out of traversal order, a fixed 24-hour
+scheduling horizon remains open. Detailed temporal allocations, same-timestamp ordinals, and
+transient reservation intervals exist only in that horizon. Sealed history collapses to one
+greatest logical position per host, and allocation behind the watermark is an internal ordering
+error. The fixed weekly hidden-churn table, per-host policy state, active-process map, and open
+window are the only allocator-retained structures; none grows with elapsed scenario duration.
+
+Process helper state follows the same instance boundary. Source create/terminate timestamps,
+connection holds, foreground finalizers, module deduplication, and termination deduplication use
+`(host, PID, process start)` or object identity and are pruned at the allocation watermark. The
+separate 48-hour ended-identity snapshot remains bounded and exists only for legitimate late
+source references.
 
 **Per-user bash history:** Baseline SSH sessions to Linux servers generate organic admin commands for realistic admin users, creating per-user `<username>.bash_history` files on all Linux hosts. Storyline process events inject 0-3 organic noise commands (pwd, ls, id, w, df -h, etc.) around each attack command via `generate_bash_command_with_noise()`.
 

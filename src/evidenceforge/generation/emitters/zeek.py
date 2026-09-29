@@ -24,11 +24,14 @@
 
 from typing import Any
 
-from evidenceforge.events.base import SecurityEvent
-from evidenceforge.generation.activity.timing_profiles import get_timing_window
-from evidenceforge.generation.emitters.zeek_base import SensorMultiplexEmitter
-from evidenceforge.generation.source_timing import SourceTimingPlanner
-from evidenceforge.utils.rng import _stable_seed
+from evidenceforge.events.base import CanonicalOccurrence
+from evidenceforge.events.network import normalize_zeek_history
+from evidenceforge.generation.emitters.zeek_base import (
+    SensorMultiplexEmitter,
+    direct_zeek_source_duration,
+    direct_zeek_source_time,
+)
+from evidenceforge.generation.network_observation import network_source_timing_key
 
 _ZEEK_SERVICE_ALIASES: dict[str, str] = {
     "kerberos": "krb",
@@ -38,22 +41,21 @@ _ZEEK_SERVICE_ALIASES: dict[str, str] = {
     "ms-sql": "tds",
     "rpc": "dce_rpc",
 }
-_SOURCE_TIMING = SourceTimingPlanner()
 
 
-def _tls_completed_duration_floor(event: SecurityEvent, min_ms: int, max_ms: int) -> float:
-    """Return a deterministic TLS analyzer duration floor with source-native texture."""
-    net = event.network
-    if net is None:
-        return min_ms / 1000
-    span_ms = max(1, max_ms - min_ms)
-    seed = _stable_seed(
-        "zeek_tls_duration_floor:"
-        f"{net.zeek_uid}:{net.src_ip}:{net.src_port}:{net.dst_ip}:{net.dst_port}:"
-        f"{event.timestamp.isoformat()}"
+def _tls_completed_duration_floor(
+    event: CanonicalOccurrence,
+    min_ms: int,
+    max_ms: int,
+) -> float:
+    """Compatibility view of the planner-owned direct TLS duration."""
+
+    del min_ms, max_ms
+    duration = direct_zeek_source_duration(
+        event,
+        network_source_timing_key("zeek_conn"),
     )
-    extra_ms = 1 + (seed % span_ms)
-    return (min_ms + extra_ms) / 1000
+    return float(duration or 0.0)
 
 
 class ZeekEmitter(SensorMultiplexEmitter):
@@ -66,8 +68,9 @@ class ZeekEmitter(SensorMultiplexEmitter):
     _log_filename = "conn.json"
     _flat_filename = "zeek_conn.json"
     _supported_types: set[str] = {"connection", "dhcp_lease"}
+    supports_exact_projection_publication = True
 
-    def can_handle(self, event: SecurityEvent) -> bool:
+    def can_handle(self, event: CanonicalOccurrence) -> bool:
         """Zeek conn emitter handles canonical network transport events."""
         return (
             event.event_type in self._supported_types
@@ -78,11 +81,7 @@ class ZeekEmitter(SensorMultiplexEmitter):
     @staticmethod
     def _normalize_history_for_state(conn_state: str, history: str) -> str:
         """Keep generated Zeek history direction consistent with conn_state semantics."""
-        if conn_state == "RSTR" and history:
-            return history[:-1] + "r" if history.endswith("R") else history
-        if conn_state == "RSTO" and history:
-            return history[:-1] + "R" if history.endswith("r") else history
-        return history
+        return normalize_zeek_history(conn_state, history)
 
     @staticmethod
     def _render_service_name(service: str | None) -> str | None:
@@ -92,8 +91,8 @@ class ZeekEmitter(SensorMultiplexEmitter):
         normalized = service.strip().lower()
         return _ZEEK_SERVICE_ALIASES.get(normalized, normalized)
 
-    def emit(self, event: SecurityEvent) -> None:
-        """Render SecurityEvent to Zeek conn.log format."""
+    def emit(self, event: CanonicalOccurrence) -> None:
+        """Render CanonicalOccurrence to Zeek conn.log format."""
         net = event.network
         duration = net.duration
         src_ip = net.src_ip
@@ -116,47 +115,17 @@ class ZeekEmitter(SensorMultiplexEmitter):
             if "DISCOVER" in msg_types:
                 src_ip = "0.0.0.0"
                 dst_ip = "255.255.255.255"
-        if (
-            net.protocol == "tcp"
-            and net.dst_port == 443
-            and net.conn_state == "SF"
-            and (event.ssl is not None or self._render_service_name(net.service) == "ssl")
-        ):
-            tls_min_window = get_timing_window(
-                "network.tls_completed_min_duration",
-                default_min_ms=800,
-                default_max_ms=2500,
-                default_position="after",
-                default_class="same_observation",
-            )
-            min_duration = tls_min_window.min_ms / 1000
-            if (
-                duration is None
-                or duration < min_duration
-                or abs(duration - min_duration) < 0.000001
-                or (
-                    self._render_service_name(net.service) == "ssl"
-                    and abs(float(duration) - 1.2) < 0.000001
-                )
-            ):
-                duration = _tls_completed_duration_floor(
-                    event,
-                    tls_min_window.min_ms,
-                    tls_min_window.max_ms,
-                )
-        event_ts = _SOURCE_TIMING.source_time(
-            event,
-            "source.zeek_conn_start",
-            seed_parts=(
-                net.zeek_uid,
-                net.src_ip,
-                net.src_port,
-                net.dst_ip,
-                net.dst_port,
-                event.timestamp,
-            ),
-            not_before=event.timestamp,
-        )
+        timing_key = network_source_timing_key("zeek_conn")
+        if event.network_observations_planned:
+            event_ts = net.started_at
+            planned_duration = net.duration
+        else:
+            event_ts = direct_zeek_source_time(event, timing_key)
+            planned_duration = direct_zeek_source_duration(event, timing_key)
+        if planned_duration is not None:
+            duration = planned_duration
+        if net.protocol == "icmp" and (net.orig_pkts or 0) + (net.resp_pkts or 0) <= 1:
+            duration = None
         event_data = {
             "ts": event_ts,
             "uid": net.zeek_uid,
@@ -165,13 +134,13 @@ class ZeekEmitter(SensorMultiplexEmitter):
             "id.resp_h": dst_ip,
             "id.resp_p": dst_port,
             "proto": net.protocol,
-            "service": self._render_service_name(net.service),
+            "service": (None if net.protocol == "icmp" else self._render_service_name(net.service)),
             "duration": duration,
             "_min_duration": event.dns.rtt if event.dns is not None else None,
             "_lock_duration": event.dns is not None
-            or event.file_transfer is not None
-            or event.x509 is not None
-            or bool(event.x509_chain),
+            or event.protocol.primary_file_transfer is not None
+            or event.protocol.leaf_certificate is not None
+            or bool(event.protocol.x509_chain),
             "orig_bytes": net.orig_bytes,
             "resp_bytes": net.resp_bytes,
             "conn_state": conn_state,
@@ -185,24 +154,23 @@ class ZeekEmitter(SensorMultiplexEmitter):
             "resp_ip_bytes": net.resp_ip_bytes,
             "ip_proto": net.ip_proto,
             "_http_request_body_len": (
-                event.http.flow_request_body_len
-                if event.http and event.http.flow_request_body_len is not None
-                else event.http.request_body_len
-                if event.http
+                event.protocol.http.flow_request_body_len
+                if event.protocol.http and event.protocol.http.flow_request_body_len is not None
+                else event.protocol.http.request_body_len
+                if event.protocol.http
                 else None
             ),
             "_http_response_body_len": (
-                event.http.flow_response_body_len
-                if event.http and event.http.flow_response_body_len is not None
-                else event.http.response_body_len
-                if event.http
+                event.protocol.http.flow_response_body_len
+                if event.protocol.http and event.protocol.http.flow_response_body_len is not None
+                else event.protocol.http.response_body_len
+                if event.protocol.http
                 else None
             ),
-            "_allow_sensor_observation_variance": True,
-            "_sensor_hostnames": event._sensor_hostnames_by_format.get(self.format_def.name, []),
+            "_source_timing_key": timing_key,
+            "_source_duration_key": timing_key if duration is not None else None,
+            **self._sensor_metadata(event, self.format_def.name),
         }
-        if event._nat_swaps_by_sensor:
-            event_data["_nat_swaps_by_sensor"] = event._nat_swaps_by_sensor
         self.emit_event(event_data)
 
     def _render_event(self, event_data: dict[str, Any]) -> str:

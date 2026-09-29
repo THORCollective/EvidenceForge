@@ -26,7 +26,34 @@ import json
 from datetime import UTC
 from pathlib import Path
 
+import pytest
+
+from evidenceforge.evaluation.parsers import iter_bounded_text_lines
+from evidenceforge.models.exceptions import EvaluationLimitError
+
 GOOD_FIXTURES = Path(__file__).parent.parent / "fixtures" / "eval" / "good"
+
+
+def test_bounded_text_reader_rejects_oversized_record(tmp_path: Path) -> None:
+    """One attacker-controlled line cannot bypass the per-record parser budget."""
+    path = tmp_path / "ecar.json"
+    path.write_bytes(b"x" * 17 + b"\n")
+
+    with pytest.raises(EvaluationLimitError, match="exceeds 16 bytes"):
+        list(iter_bounded_text_lines(path, max_record_bytes=16))
+
+
+def test_snare_expanded_field_parser_scales_across_many_fields() -> None:
+    """Expanded Snare payloads are parsed with one linear tokenization pass."""
+    from evidenceforge.evaluation.parsers.windows import _parse_expanded_snare_fields
+
+    payload = "Message:  " + "  ".join(f"Field{index}: value{index}" for index in range(10_000))
+
+    fields = _parse_expanded_snare_fields(payload)
+
+    assert len(fields) == 10_000
+    assert fields["Field0"] == "value0"
+    assert fields["Field9999"] == "value9999"
 
 
 class TestWindowsEventParser:
@@ -307,6 +334,35 @@ class TestSyslogParser:
         records = list(parser.parse_file(GOOD_FIXTURES / "syslog.log"))
         assert all(r.timestamp is not None for r in records)
 
+    def test_parses_samba_full_audit_record(self, tmp_path):
+        """Samba VFS audit lines retain routing, program, PID, and native path fields."""
+
+        from evidenceforge.evaluation.parsers.syslog import SyslogParser
+
+        log_dir = tmp_path / "SAMBA-01" / "2024"
+        log_dir.mkdir(parents=True)
+        log = log_dir / "syslog.log"
+        log.write_text(
+            "<86>Jan 15 10:15:00 SAMBA-01 smbd_audit[4242]: "
+            "smbd_audit: linux_user|10.30.0.10|Finance|read|success|"
+            "/srv/samba/data/Departments/Finance/Reports/FY26/linux-plan.xlsx\n",
+            encoding="utf-8",
+        )
+
+        records = list(SyslogParser().parse_file(log))
+
+        assert len(records) == 1
+        assert records[0].parse_errors == []
+        assert records[0].fields["hostname"] == "SAMBA-01"
+        assert records[0].fields["app_name"] == "smbd_audit"
+        assert records[0].fields["pid"] == 4242
+        assert records[0].fields["syslog_protocol"] == "rfc3164"
+        assert (
+            records[0]
+            .fields["message"]
+            .endswith("/srv/samba/data/Departments/Finance/Reports/FY26/linux-plan.xlsx")
+        )
+
     def test_long_rfc5424_version_is_parse_error_not_crash(self, tmp_path):
         from evidenceforge.evaluation.parsers.syslog import SyslogParser
 
@@ -452,6 +508,37 @@ class TestSnortAlertParser:
         assert first.fields["src_port"] == 443
         assert first.fields["dst_ip"] == "10.0.10.50"
         assert first.fields["dst_port"] == 54321
+
+    def test_uses_scenario_year_and_utc(self, tmp_path):
+        from datetime import datetime
+        from types import SimpleNamespace
+
+        from evidenceforge.evaluation.parsers.snort import SnortAlertParser
+
+        path = tmp_path / "snort_alert.log"
+        path.write_text(
+            "02/03-12:34:56.123456 [**] [1:99:1] test [**] "
+            "[Classification: Misc activity] [Priority: 3] {UDP} "
+            "192.0.2.1:53 -> 198.51.100.2:5353\n",
+            encoding="utf-8",
+        )
+        parser = SnortAlertParser()
+        parser.scenario = SimpleNamespace(
+            time_window=SimpleNamespace(start=datetime(2031, 2, 1, tzinfo=UTC))
+        )
+
+        record = next(parser.parse_file(path))
+
+        assert record.timestamp == datetime(2031, 2, 3, 12, 34, 56, 123456, tzinfo=UTC)
+
+    def test_parses_bracketed_and_portless_ipv6(self):
+        from evidenceforge.evaluation.parsers.snort import SnortAlertParser
+
+        parser = SnortAlertParser()
+
+        assert parser._parse_endpoint("[2001:db8::1]:49152") == ("2001:db8::1", 49152)
+        assert parser._parse_endpoint("[2001:db8::2]") == ("2001:db8::2", None)
+        assert parser._parse_endpoint("2001:db8::3") == ("2001:db8::3", None)
 
 
 class TestWebAccessParser:
@@ -675,4 +762,4 @@ class TestParserDiscovery:
 
         # Original parsers + Sysmon + 13 Zeek parsers + cisco_asa + proxy_access
         # + email artifacts + eslogger
-        assert len(_PARSER_CLASSES) == 25
+        assert len(_PARSER_CLASSES) == 27

@@ -66,7 +66,7 @@ LAUNCHAGENT_PLIST = "/Users/riley.chen/Library/LaunchAgents/com.apple.cloudsyncd
 
 def _generate(tmp_path: Path, name: str = "output") -> Path:
     out = tmp_path / name
-    result = runner.invoke(app, ["generate", str(SCENARIO), "--output", str(out), "--force"])
+    result = runner.invoke(app, ["generate", str(SCENARIO), "--output", str(out), "--overwrite"])
     assert result.exit_code == EXIT_SUCCESS, result.stdout
     return out
 

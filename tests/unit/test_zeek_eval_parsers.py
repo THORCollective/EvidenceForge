@@ -40,7 +40,7 @@ SAMPLE_DATA_DIR = Path(__file__).parent.parent.parent / "sample_data" / "Zeek-JS
 
 
 class TestParserRegistration:
-    """All 13 Zeek parsers should be registered."""
+    """All Zeek parsers should be registered."""
 
     ZEEK_FORMATS = {
         "zeek_conn",
@@ -56,6 +56,8 @@ class TestParserRegistration:
         "zeek_pe",
         "zeek_packet_filter",
         "zeek_reporter",
+        "zeek_smb_files",
+        "zeek_smb_mapping",
     }
 
     def test_all_zeek_parsers_registered(self):
@@ -66,6 +68,30 @@ class TestParserRegistration:
         for fmt in self.ZEEK_FORMATS:
             parser = get_parser(fmt)
             assert parser.format_name == fmt
+
+    def test_smb_parsers_discover_sensor_outputs(self, tmp_path):
+        sensor_dir = tmp_path / "zeek-core"
+        sensor_dir.mkdir()
+        mapping = sensor_dir / "smb_mapping.json"
+        files = sensor_dir / "smb_files.json"
+        mapping.write_text(
+            '{"ts":1,"uid":"C1","path":"\\\\\\\\SAMBA-01\\\\Finance",'
+            '"service":"Finance","native_file_system":"NTFS"}\n'
+        )
+        files.write_text('{"ts":2,"uid":"C1","action":"SMB::FILE_READ","name":"report.docx"}\n')
+
+        discovered = discover_log_files(tmp_path)
+
+        assert discovered["zeek_smb_mapping"] == [mapping]
+        assert discovered["zeek_smb_files"] == [files]
+        parsed_mapping = list(get_parser("zeek_smb_mapping").parse_file(mapping))[0].fields
+        assert parsed_mapping["uid"] == "C1"
+        assert parsed_mapping["native_file_system"] == "NTFS"
+        assert parsed_mapping["path"] == r"\\SAMBA-01\Finance"
+        assert (
+            list(get_parser("zeek_smb_files").parse_file(files))[0].fields["action"]
+            == "SMB::FILE_READ"
+        )
 
 
 class TestProxyParserRegistration:
@@ -156,7 +182,9 @@ class TestProxyParserRegistration:
             "10.0.0.1 - jsmith [15/Jul/2024:10:00:00 +0000] "
             '"GET https://example.com/download?q=1 HTTP/1.1" 200 1024 '
             '"-" "Mozilla/5.0 (Windows NT 10.0)" '
-            '"cs_bytes=2048 sc_bytes=1024 proxy_action=ssl-inspect ssl_bump=bump"',
+            '"cs_bytes=2048 sc_bytes=1024 proxy_action=tunnel-setup ssl_bump=peek '
+            "byte_scope=connect-control-message tunnel_cs_bytes=8192 "
+            'tunnel_sc_bytes=65536 tunnel_duration_ms=2500"',
             1,
         )
 
@@ -164,8 +192,12 @@ class TestProxyParserRegistration:
         assert record.fields["host"] == "example.com"
         assert record.fields["cs_bytes"] == 2048
         assert record.fields["sc_bytes"] == 1024
-        assert record.fields["proxy_action"] == "ssl-inspect"
-        assert record.fields["ssl_bump_action"] == "bump"
+        assert record.fields["proxy_action"] == "tunnel-setup"
+        assert record.fields["ssl_bump_action"] == "peek"
+        assert record.fields["byte_scope"] == "connect-control-message"
+        assert record.fields["tunnel_cs_bytes"] == 8192
+        assert record.fields["tunnel_sc_bytes"] == 65536
+        assert record.fields["tunnel_duration_ms"] == 2500
 
     def test_proxy_access_combined_columns_pass_format_validation(self):
         parser = get_parser("proxy_access")

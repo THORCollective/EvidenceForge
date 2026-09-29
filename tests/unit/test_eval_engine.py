@@ -8,7 +8,9 @@ from pathlib import Path
 import pytest
 
 from evidenceforge.evaluation.engine import EvaluationEngine
+from evidenceforge.evaluation.limits import EvaluationLimits
 from evidenceforge.evaluation.models import QualityReport
+from evidenceforge.models.exceptions import EvaluationLimitError
 from evidenceforge.models.scenario import Scenario
 from evidenceforge.utils.files import load_yaml
 
@@ -76,6 +78,10 @@ class TestEvaluationEngine:
         hard_criteria = [c for c in report.acceptance_criteria if c.level == "hard"]
         assert len(hard_criteria) > 0
         for c in hard_criteria:
+            if c.applicable is False:
+                assert c.actual is None
+                assert c.passed is None
+                continue
             assert c.actual is not None
             assert c.passed is not None
 
@@ -101,4 +107,73 @@ class TestEvaluationEngine:
         report = engine.run()
 
         assert report.total_records == 0
-        assert report.overall_score is not None  # 100 (no failures)
+        assert report.overall_score is not None
+        assert report.overall_score < 100
+        assert report.acceptance_passed is False
+
+    def test_reports_separate_evaluation_categories(self, retail_scenario):
+        """Concern-oriented category scores must be independent of legacy pillar labels."""
+
+        report = EvaluationEngine(output_dir=GOOD_FIXTURES, scenario=retail_scenario).run()
+
+        assert [category.key for category in report.categories] == [
+            "source_schema",
+            "canonical_invariants",
+            "scenario_completeness",
+            "distribution_realism",
+            "expert_comparison",
+        ]
+        assert report.categories[0].score is not None
+        assert report.categories[-1].score is None
+
+    def test_report_is_repeatable_except_evaluated_at(self, retail_scenario):
+        """Stable discovery and sampling produce identical evaluation content."""
+
+        first = EvaluationEngine(output_dir=GOOD_FIXTURES, scenario=retail_scenario).run()
+        second = EvaluationEngine(output_dir=GOOD_FIXTURES, scenario=retail_scenario).run()
+
+        assert first.model_dump(exclude={"evaluated_at"}) == second.model_dump(
+            exclude={"evaluated_at"}
+        )
+
+    def test_rejects_corpus_byte_budget_before_parsing(self, retail_scenario, tmp_path):
+        """Corpus bytes are bounded before records are retained in memory."""
+        (tmp_path / "ecar.json").write_text("{}\n", encoding="utf-8")
+        engine = EvaluationEngine(
+            output_dir=tmp_path,
+            scenario=retail_scenario,
+            limits=EvaluationLimits(max_corpus_bytes=1),
+        )
+
+        with pytest.raises(EvaluationLimitError, match="corpus bytes"):
+            engine._parse_all_logs()
+
+    def test_rejects_record_budget_during_streaming_parse(self, retail_scenario, tmp_path):
+        """The parser stops as soon as the retained-record budget is exceeded."""
+        (tmp_path / "ecar.json").write_text("{}\n{}\n", encoding="utf-8")
+        engine = EvaluationEngine(
+            output_dir=tmp_path,
+            scenario=retail_scenario,
+            limits=EvaluationLimits(max_records=1),
+        )
+
+        with pytest.raises(EvaluationLimitError, match="record count"):
+            engine._parse_all_logs()
+
+    def test_explicit_evaluation_override_records_capacity_decision(
+        self, retail_scenario, tmp_path
+    ):
+        """A reviewed large corpus can proceed and records that the limits were overridden."""
+        (tmp_path / "ecar.json").write_text("{}\n{}\n", encoding="utf-8")
+        engine = EvaluationEngine(
+            output_dir=tmp_path,
+            scenario=retail_scenario,
+            limits=EvaluationLimits(max_corpus_bytes=1, max_records=1),
+            allow_large_evaluation=True,
+        )
+
+        records, _counts = engine._parse_all_logs()
+
+        assert len(records["ecar"]) == 2
+        assert engine.capacity.parsed_records == 2
+        assert engine.capacity.limits_overridden is True

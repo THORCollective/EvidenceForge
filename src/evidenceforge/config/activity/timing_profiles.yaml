@@ -10,7 +10,44 @@
 # Values are intentionally conservative. Scenario-specific projects can override
 # them with .eforge/config/activity/timing_profiles.yaml.
 
+# SSH authentication work begins only after the required transport/eCAR FLOW
+# visibility floor. Profiles mix fast, ordinary, and slow-tail outcomes, then
+# add deterministic route, receiver-load, credential-backend cache, and key-type
+# costs. This prevents the source-observation floor from collapsing every
+# public-key session into one narrow timing band.
+ssh_authentication:
+  profiles:
+    publickey:
+      fast_probability: 0.22
+      fast_ms: {min: 25, max: 180}
+      typical_ms: {min: 180, max: 1250}
+      tail_probability: 0.12
+      tail_ms: {min: 1250, max: 4800}
+      cache_miss_probability: 0.18
+      cache_miss_ms: {min: 120, max: 1500}
+    password:
+      fast_probability: 0.08
+      fast_ms: {min: 180, max: 550}
+      typical_ms: {min: 550, max: 3600}
+      tail_probability: 0.18
+      tail_ms: {min: 3600, max: 9000}
+      cache_miss_probability: 0.32
+      cache_miss_ms: {min: 250, max: 2800}
+  route_rtt_ms:
+    private: {min: 2, max: 55}
+    public: {min: 25, max: 320}
+  receiver_load_ms: {min: 0, max: 650}
+  public_key_penalty_ms:
+    ED25519: {min: 0, max: 35}
+    ECDSA: {min: 5, max: 75}
+    RSA: {min: 20, max: 240}
+
 relationships:
+  linux.pipeline_stage_start:
+    class: burst_fanout
+    position: after
+    min_ms: 6
+    max_ms: 115
   network.dns_before_tcp:
     class: causal_prerequisite
     position: before
@@ -88,11 +125,26 @@ relationships:
     position: after
     min_ms: 3
     max_ms: 35
+  windows.kerberos_after_wfp:
+    class: source_latency
+    position: after
+    min_ms: 1
+    max_ms: 45
   windows.network_logon_after_transport:
     class: source_latency
     position: after
     min_ms: 8
     max_ms: 140
+  windows.machine_logon_after_service_ticket:
+    class: source_latency
+    position: after
+    min_ms: 3
+    max_ms: 135
+  source.session_dependent_after_login:
+    class: source_latency
+    position: after
+    min_ms: 8
+    max_ms: 75
   windows.special_privilege_after_logon:
     class: source_latency
     position: after
@@ -116,8 +168,8 @@ relationships:
   source.windows_security_process_create:
     class: source_latency
     position: after
-    min_ms: 35
-    max_ms: 900
+    min_ms: 4
+    max_ms: 24
   source.windows_explicit_credentials_after_process_create:
     class: source_latency
     position: after
@@ -136,8 +188,13 @@ relationships:
   source.sysmon_process_create:
     class: source_latency
     position: after
-    min_ms: 18
-    max_ms: 1100
+    min_ms: 3
+    max_ms: 22
+  source.sysmon_module_after_process_create:
+    class: source_latency
+    position: after
+    min_ms: 5
+    max_ms: 180
   source.sysmon_process_terminate:
     class: source_latency
     position: after
@@ -183,11 +240,31 @@ relationships:
     position: after
     min_ms: 1800
     max_ms: 2800
+  source.windows_security_session_logout:
+    class: teardown
+    position: after
+    min_ms: 125
+    max_ms: 750
+  source.syslog_session_logout:
+    class: teardown
+    position: after
+    min_ms: 120
+    max_ms: 2500
   source.ecar_ssh_session_after_accept:
     class: source_latency
     position: after
     min_ms: 275
     max_ms: 650
+  source.ecar_smb_session_after_accept:
+    class: source_latency
+    position: after
+    min_ms: 8
+    max_ms: 140
+  smb.cross_server_delete_after_destination:
+    class: causal_prerequisite
+    position: after
+    min_ms: 250
+    max_ms: 1200
   source.ecar_remote_thread:
     class: source_latency
     position: after
@@ -218,11 +295,6 @@ relationships:
     position: after
     min_ms: 1
     max_ms: 95
-  network.proxy_upstream_after_client:
-    class: causal_prerequisite
-    position: after
-    min_ms: 950
-    max_ms: 1800
   source.zeek_ssl_analyzer:
     class: same_observation
     position: after
@@ -355,24 +427,89 @@ endpoint_clock:
 network_sensor_observation:
   # Default assumes distributed security infrastructure where core, DMZ, and
   # packet-broker taps observe the same flow through different capture paths.
-  # Sensor clocks remain controlled, but buffering and path differences should
-  # not make dual-sensor rows look mechanically cloned.
+  # Sensor clocks remain controlled. The event_jitter envelope is interpreted
+  # as slow clock wander shared by nearby observations, never independent
+  # per-flow timestamp noise.
   default_profile: distributed_taps
   profiles:
     distributed_taps:
-      clock_skew_us:
-        min: -18000
-        max: 22000
-      path_delay_us:
-        min: 1200
-        max: 58000
+      clock_offset_us:
+        min: -250000
+        max: 250000
+      clock_drift_ppm:
+        min: -1
+        max: 1
+      route_delay_us:
+        min: 200
+        max: 3500
+      event_jitter_us:
+        min: -1500
+        max: 1500
+      capture_loss:
+        probability: 0.12
+        min_fraction: 0.0005
+        max_fraction: 0.012
+        max_missed_bytes: 32768
     well_synced:
-      clock_skew_us:
+      clock_offset_us:
         min: -4000
         max: 4000
-      path_delay_us:
+      clock_drift_ppm:
+        min: -1
+        max: 1
+      route_delay_us:
         min: 250
         max: 8000
+      event_jitter_us:
+        min: -250
+        max: 250
+      capture_loss:
+        probability: 0.0
+        min_fraction: 0.0
+        max_fraction: 0.0
+        max_missed_bytes: 0
+    lossy_span:
+      clock_offset_us:
+        min: -24000
+        max: 28000
+      clock_drift_ppm:
+        min: -4
+        max: 4
+      route_delay_us:
+        min: 1800
+        max: 24000
+      event_jitter_us:
+        min: -1200
+        max: 1200
+      capture_loss:
+        probability: 0.12
+        min_fraction: 0.001
+        max_fraction: 0.035
+        max_missed_bytes: 65536
+
+firewall_observation:
+  # ASA connection-table timers are device policy, not per-flow randomness.
+  # Sensor-specific overrides may select another named policy without moving
+  # timeout synthesis back into the emitter.
+  default_policy: asa_default
+  sensor_policies: {}
+  policies:
+    asa_default:
+      tcp_embryonic_timeout_seconds: 30
+      tcp_idle_timeout_seconds: 3600
+
+windows_startup_modules:
+  # Source-visible loader telemetry commonly arrives in a tight burst, but
+  # dependency work and collector batching produce a heavy tail rather than
+  # one fixed per-process cadence.
+  initial_delay_us:
+    min: 1500
+    max: 85000
+  inter_load_gap_us:
+    median: 11000
+    sigma: 1.15
+    min: 800
+    max: 900000
 
 windows_event_time:
   collision_spacing:
@@ -384,3 +521,29 @@ windows_event_time:
     # unfold across seconds/minutes, not microseconds.
     large_gap_min_ms: 1000
     large_gap_max_ms: 4000
+
+sysmon_event_envelope:
+  # Sysmon EventData UtcTime is the semantic event time. The Windows event
+  # envelope is written later by the provider/ETW path and therefore has its
+  # own small, right-skewed latency distribution.
+  default:
+    median_us: 850
+    sigma: 0.8
+    min_us: 80
+    max_us: 18000
+    tail_probability: 0.012
+    tail_min_us: 12000
+    tail_max_us: 85000
+  event_ids:
+    "3":
+      median_us: 2100
+      sigma: 0.9
+      max_us: 35000
+    "5":
+      median_us: 1400
+      sigma: 0.85
+      max_us: 28000
+    "22":
+      median_us: 1750
+      sigma: 0.9
+      max_us: 32000

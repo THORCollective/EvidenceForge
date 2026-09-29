@@ -23,7 +23,7 @@
 """Unit tests for utility modules."""
 
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -34,21 +34,30 @@ from evidenceforge.models import (
     Timezone,
     User,
 )
-from evidenceforge.models.exceptions import ScenarioIncludeError
+from evidenceforge.models.exceptions import (
+    ConfigurationError,
+    GenerationError,
+    ScenarioIncludeError,
+)
 from evidenceforge.utils import (
+    ScenarioIncludeBudget,
+    ScenarioIncludeBudgetState,
     convert_to_output_timezone,
     ensure_directory,
     get_system_timezone,
+    load_scenario_source_graph,
     load_scenario_yaml,
     load_yaml,
     parse_duration,
     parse_iso8601,
     redact_secrets,
+    resolve_safe_child_path,
     resolve_time_window,
     validate_output_path,
     write_yaml,
 )
-from evidenceforge.utils.rng import stable_uuid
+from evidenceforge.utils.rng import generation_seed_scope, stable_hex_digest, stable_uuid
+from evidenceforge.utils.time import ensure_utc
 
 
 class TestStableUuid:
@@ -70,6 +79,36 @@ class TestStableUuid:
         second = stable_uuid("ecar-process", "WS-01", 1235, "cmd.exe")
 
         assert first != second
+
+
+class TestStableHexDigest:
+    """Tests for deterministic full-width hexadecimal identifier helpers."""
+
+    def test_stable_hex_digest_is_repeatable_and_full_width(self):
+        """Requested token width should contain digest entropy, not zero padding."""
+        first = stable_hex_digest("proxy-tunnel", "PROXY-01", "client.example", length=16)
+        second = stable_hex_digest("proxy-tunnel", "PROXY-01", "client.example", length=16)
+
+        assert first == second
+        assert len(first) == 16
+        assert int(first[:8], 16) != 0
+
+    def test_stable_hex_digest_separates_namespaces_parts_and_public_seed(self):
+        """Distinct semantic identities and public seeds should produce distinct tokens."""
+        baseline = stable_hex_digest("proxy-tunnel", "PROXY-01", "example.com")
+        assert baseline != stable_hex_digest("storage-file", "PROXY-01", "example.com")
+        assert baseline != stable_hex_digest("proxy-tunnel", "PROXY-02", "example.com")
+
+        with generation_seed_scope(7):
+            seeded = stable_hex_digest("proxy-tunnel", "PROXY-01", "example.com")
+
+        assert seeded != baseline
+
+    @pytest.mark.parametrize("namespace,length", [("", 16), ("valid", 0), ("valid", 65)])
+    def test_stable_hex_digest_rejects_invalid_shape(self, namespace: str, length: int):
+        """Invalid namespaces and digest widths should fail at the helper boundary."""
+        with pytest.raises(ValueError):
+            stable_hex_digest(namespace, "part", length=length)
 
 
 class TestRedactSecrets:
@@ -98,6 +137,25 @@ class TestRedactSecrets:
 
 class TestTimeUtils:
     """Tests for time parsing utilities."""
+
+    def test_ensure_utc_returns_exact_utc_datetime_unchanged(self):
+        """Exact UTC values should bypass timezone conversion by identity."""
+        value = datetime(2026, 8, 31, 12, 34, 56, 789, tzinfo=UTC)
+
+        assert ensure_utc(value) is value
+
+    def test_ensure_utc_preserves_naive_and_non_utc_conversion_contracts(self):
+        """Naive and offset-aware values should retain their existing semantics."""
+        naive = datetime(2026, 8, 31, 12, 0)
+        offset = datetime(2026, 8, 31, 8, 0, tzinfo=timezone(timedelta(hours=-4)))
+
+        normalized_naive = ensure_utc(naive)
+        normalized_offset = ensure_utc(offset)
+
+        assert normalized_naive == datetime(2026, 8, 31, 12, 0, tzinfo=UTC)
+        assert normalized_naive is not naive
+        assert normalized_offset == datetime(2026, 8, 31, 12, 0, tzinfo=UTC)
+        assert normalized_offset is not offset
 
     def test_parse_duration_hours(self):
         """Test parsing hours duration."""
@@ -271,6 +329,21 @@ nested:
         )
 
         assert load_scenario_yaml(yaml_file) == load_yaml(yaml_file)
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "name: first\nname: second\n",
+            "environment:\n  description: first\n  description: second\n",
+        ],
+    )
+    def test_yaml_loader_rejects_duplicate_mapping_keys(self, tmp_path, content):
+        """Duplicate YAML keys must fail instead of silently changing scenario intent."""
+        yaml_file = tmp_path / "duplicate.yaml"
+        yaml_file.write_text(content, encoding="utf-8")
+
+        with pytest.raises(ConfigurationError, match="duplicate key"):
+            load_yaml(yaml_file)
 
     def test_load_scenario_yaml_accepts_single_include_alias(self, tmp_path):
         """The singular include alias should accept one path."""
@@ -678,6 +751,101 @@ includes:
 
         with pytest.raises(ScenarioIncludeError, match="not both"):
             load_scenario_yaml(scenario_file)
+
+    def test_load_scenario_yaml_enforces_include_depth_budget(self, tmp_path):
+        """Deep acyclic include chains should fail before unbounded recursion."""
+        (tmp_path / "leaf.yaml").write_text("description: leaf\n")
+        (tmp_path / "middle.yaml").write_text("includes: leaf.yaml\n")
+        scenario_file = tmp_path / "scenario.yaml"
+        scenario_file.write_text("includes: middle.yaml\nname: bounded\n")
+
+        with pytest.raises(ScenarioIncludeError, match="depth exceeds limit 2"):
+            load_scenario_yaml(
+                scenario_file,
+                include_budget=ScenarioIncludeBudget(max_depth=2),
+            )
+
+    def test_load_scenario_yaml_enforces_include_file_budget(self, tmp_path):
+        """Wide include graphs should fail at the shared file counter."""
+        (tmp_path / "partial.yaml").write_text("description: partial\n")
+        scenario_file = tmp_path / "scenario.yaml"
+        scenario_file.write_text("includes: partial.yaml\nname: bounded\n")
+
+        with pytest.raises(ScenarioIncludeError, match="file count exceeds limit 1"):
+            load_scenario_yaml(
+                scenario_file,
+                include_budget=ScenarioIncludeBudget(max_files=1),
+            )
+
+    def test_load_scenario_yaml_enforces_include_byte_budget(self, tmp_path):
+        """Cumulative bytes should be bounded before YAML parsing and merging."""
+        scenario_file = tmp_path / "scenario.yaml"
+        scenario_file.write_text("name: larger-than-budget\n")
+
+        with pytest.raises(ScenarioIncludeError, match="bytes exceed limit 8"):
+            load_scenario_yaml(
+                scenario_file,
+                include_budget=ScenarioIncludeBudget(max_bytes=8),
+            )
+
+    def test_load_scenario_yaml_enforces_expanded_node_budget(self, tmp_path):
+        """Small YAML inputs cannot expand beyond the configured logical node budget."""
+        scenario_file = tmp_path / "scenario.yaml"
+        scenario_file.write_text("values: [one, two, three]\n", encoding="utf-8")
+
+        with pytest.raises(ScenarioIncludeError, match="expanded node count exceeds limit 4"):
+            load_scenario_yaml(
+                scenario_file,
+                include_budget=ScenarioIncludeBudget(max_nodes=4),
+            )
+
+    def test_source_graphs_can_share_one_cumulative_include_budget(self, tmp_path):
+        """Related YAML roots cannot each reset the same composition budget."""
+
+        first = tmp_path / "first.yaml"
+        second = tmp_path / "second.yaml"
+        third = tmp_path / "third.yaml"
+        first.write_text("first: true\n", encoding="utf-8")
+        second.write_text("second: true\n", encoding="utf-8")
+        third.write_text("DO_NOT_PARSE: [invalid\n", encoding="utf-8")
+        state = ScenarioIncludeBudgetState(ScenarioIncludeBudget(max_files=2))
+
+        load_scenario_source_graph(first, include_budget_state=state)
+        load_scenario_source_graph(second, include_budget_state=state)
+        with pytest.raises(ScenarioIncludeError, match="file count exceeds limit 2") as exc_info:
+            load_scenario_source_graph(third, include_budget_state=state)
+
+        assert "DO_NOT_PARSE" not in str(exc_info.value)
+
+    def test_resolve_safe_child_path_accepts_one_filename(self, tmp_path):
+        """Safe generated filenames should resolve beneath the declared root."""
+        root = tmp_path / "artifacts"
+        root.mkdir()
+
+        assert resolve_safe_child_path(root, "message-001.eml") == root / "message-001.eml"
+
+    @pytest.mark.parametrize(
+        "filename",
+        ["../outside.eml", "nested/message.eml", "/tmp/outside.eml", ""],
+    )
+    def test_resolve_safe_child_path_rejects_unsafe_components(self, tmp_path, filename):
+        """Generated filenames must not traverse or introduce subdirectories."""
+        root = tmp_path / "artifacts"
+        root.mkdir()
+
+        with pytest.raises(GenerationError, match="Unsafe output filename"):
+            resolve_safe_child_path(root, filename)
+
+    def test_resolve_safe_child_path_rejects_existing_symlink_escape(self, tmp_path):
+        """An existing child symlink must not redirect a generated write outside its root."""
+        root = tmp_path / "artifacts"
+        root.mkdir()
+        outside = tmp_path / "outside.eml"
+        outside.write_text("preserve")
+        (root / "message.eml").symlink_to(outside)
+
+        with pytest.raises(GenerationError, match="path escapes output root"):
+            resolve_safe_child_path(root, "message.eml")
 
     def test_load_yaml_not_found(self):
         """Test loading non-existent file raises error."""

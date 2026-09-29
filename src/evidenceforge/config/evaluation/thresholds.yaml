@@ -18,15 +18,15 @@ pillars:
     weight: 0.30
     sub_scores:
       spec_conformance:
-        minimum: 95
-        aspirational: 99
+        minimum: 100
+        aspirational: 100
         hard_gate: true
-        # Real SIEMs tolerate ~5% parse failures; 98 was aspirational, not achievable.
+        # Every observed record must satisfy the source schema.
       format_constraints:
-        minimum: 90
-        aspirational: 98
-        hard_gate: false
-        # Constraint violations are authoring errors; more forgiving floor.
+        minimum: 100
+        aspirational: 100
+        hard_gate: true
+        # Correctness violations cannot be averaged away.
 
   # Pillar 2 — Plausibility
   # Goal: no impossible or highly-improbable field values, combinations, or
@@ -43,7 +43,7 @@ pillars:
         minimum: 85
         aspirational: 95
         hard_gate: false
-        # Rules are incomplete; tighten as co_occurrence.yaml coverage grows.
+        # Context-dependent record realism is diagnostic, not a correctness gate.
       distribution_fit:
         minimum: 70
         aspirational: 85
@@ -52,7 +52,7 @@ pillars:
       field_agreement:
         minimum: 85
         aspirational: 97
-        hard_gate: false
+        hard_gate: true
         # Conservative floor for the new pivot-key join implementation.
       user_diversity:
         minimum: 60
@@ -64,6 +64,11 @@ pillars:
         aspirational: 95
         hard_gate: false
         # 1–5 % goldilocks band; validate bands against calibration data.
+      ids_integrity:
+        minimum: 100
+        aspirational: 100
+        hard_gate: true
+        # Exact rendered-output contract; any contradiction is a generator defect.
 
   # Pillar 3 — Causality
   # Goal: before/after relationships are correct in background noise and
@@ -81,22 +86,32 @@ pillars:
         aspirational: 95
         hard_gate: true
         # Lowered from 90 to accommodate visibility-gap scenarios.
+      intent_reconciliation:
+        minimum: 100
+        aspirational: 100
+        hard_gate: true
+        # Every authored typed event must remain accounted for independently of generation.
+      effect_reconciliation:
+        minimum: 100
+        aspirational: 100
+        hard_gate: true
+        # Generated bundles must report zero missing, duplicate, or cardinality-invalid effects.
       indicator_accuracy:
         minimum: 85
         aspirational: 95
-        hard_gate: false
+        hard_gate: true
       pivot_linkability:
         minimum: 80
         aspirational: 95
-        hard_gate: false
+        hard_gate: true
       temporal_integrity:
         minimum: 85
         aspirational: 95
-        hard_gate: false
+        hard_gate: true
       storyline_trace_coverage:
         minimum: 80
         aspirational: 95
-        hard_gate: false
+        hard_gate: true
 
   # Pillar 4 — Timing
   # Goal: both per-actor inter-event cadence and macro time-of-day / day-of-week

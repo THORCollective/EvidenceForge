@@ -11,6 +11,9 @@ import math
 import random
 from collections import Counter
 
+from evidenceforge.generation.actions.network_transaction_planner import (
+    _normalize_udp_syslog_flow,
+)
 from evidenceforge.generation.activity.generator import (
     _NTP_STRATUM_TIMING,
     _SSL_FAILURE_RATE,
@@ -28,8 +31,10 @@ from evidenceforge.generation.activity.generator import (
     _choose_ssl_history,
 )
 from evidenceforge.generation.activity.network_params import (
+    activity_dns_resolver_ips,
     external_scanner_port_profile_for_source,
     external_scanner_port_profiles,
+    public_dns_resolver_ips,
 )
 from evidenceforge.generation.activity.proxy_user_agents import load_proxy_user_agents
 
@@ -39,6 +44,21 @@ def _proxy_ua_pool(*path: str) -> list[str]:
     for key in path:
         value = value[key]
     return value
+
+
+def test_udp_syslog_flow_has_no_responder_packets_or_false_success_state() -> None:
+    """UDP/514 preserves sender payload while normalizing one-way Zeek semantics."""
+
+    normalized = _normalize_udp_syslog_flow(
+        proto="udp",
+        dst_port=514,
+        conn_state="SF",
+        history="Dd",
+        duration=1.25,
+        resp_bytes=4096,
+    )
+
+    assert normalized == ("S0", "D", None, 0)
 
 
 class TestProtocolOverhead:
@@ -139,6 +159,36 @@ class TestExternalScannerProfiles:
         assert profiles[0]["name"] == "good_ports"
 
 
+class TestPublicResolverProfiles:
+    """Public recursive resolver policy should be stable and operator-coherent per client."""
+
+    def test_public_resolver_pool_is_stable_per_client_operator(self):
+        configured_operators = {
+            "1.1.1.1": "cloudflare",
+            "1.0.0.1": "cloudflare",
+            "8.8.8.8": "google",
+            "8.8.4.4": "google",
+            "9.9.9.9": "quad9",
+            "208.67.222.222": "opendns",
+        }
+
+        first = public_dns_resolver_ips("10.10.10.25")
+
+        assert first == public_dns_resolver_ips("10.10.10.25")
+        assert first
+        assert len({configured_operators[ip] for ip in first}) == 1
+
+    def test_public_resolver_assignment_varies_across_clients(self):
+        pools = {tuple(public_dns_resolver_ips(f"10.10.10.{index}")) for index in range(1, 65)}
+
+        assert len(pools) >= 3
+
+    def test_resolver_adapter_accepts_legacy_attribute_only_generator(self):
+        generator = type("LegacyGenerator", (), {"_dns_server_ips": ["10.0.0.53"]})()
+
+        assert activity_dns_resolver_ips(generator, "10.0.0.8") == ["10.0.0.53"]
+
+
 class TestNtpTiming:
     """Bug #2: NTP timing varies by stratum."""
 
@@ -197,6 +247,51 @@ class TestSslRealism:
         ]
         unique = set(samples)
         assert len(unique) >= 4  # at least 4 of 5 patterns should appear
+
+    def test_ssl_history_matches_resumption_contract(self):
+        """Resumption must not advertise full certificate/key-exchange messages."""
+        tls12_resumed = {
+            _choose_ssl_history(
+                random.Random(seed),
+                tls_version="TLSv12",
+                established=True,
+                resumed=True,
+            )
+            for seed in range(100)
+        }
+        tls12_full = {
+            _choose_ssl_history(
+                random.Random(seed),
+                tls_version="TLSv12",
+                established=True,
+                resumed=False,
+            )
+            for seed in range(100)
+        }
+        tls13_resumed = {
+            _choose_ssl_history(
+                random.Random(seed),
+                tls_version="TLSv13",
+                established=True,
+                resumed=True,
+            )
+            for seed in range(100)
+        }
+        tls13_full = {
+            _choose_ssl_history(
+                random.Random(seed),
+                tls_version="TLSv13",
+                established=True,
+                resumed=False,
+            )
+            for seed in range(100)
+        }
+
+        assert tls12_resumed == {"CSIFIFD"}
+        assert all("X" in history for history in tls12_full)
+        assert tls13_resumed == {"CSD"}
+        assert tls13_full == {"CSD", "CSDD", "CSDDD"}
+        assert all(not set(history) & {"O", "X", "Y", "F", "T"} for history in tls13_full)
 
     def test_tls12_cipher_aes128_dominates(self):
         rng = random.Random(42)

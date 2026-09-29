@@ -24,31 +24,40 @@
 
 from typing import Any
 
-from evidenceforge.events.base import SecurityEvent
+from evidenceforge.events.base import CanonicalOccurrence
 from evidenceforge.generation.emitters.zeek_base import SensorMultiplexEmitter
+from evidenceforge.generation.source_timing import SourceTimingPlanner
+
+_SOURCE_TIMING = SourceTimingPlanner()
 
 
 class ZeekDhcpEmitter(SensorMultiplexEmitter):
     """Emitter for Zeek dhcp.log format (NDJSON).
 
-    Renders DHCP transaction logs from DhcpContext on SecurityEvent.
+    Renders DHCP transaction logs from DhcpContext on CanonicalOccurrence.
     """
 
     _log_filename = "dhcp.json"
     _flat_filename = "zeek_dhcp.json"
     _supported_types: set[str] = {"dhcp_lease"}
 
-    def can_handle(self, event: SecurityEvent) -> bool:
+    def can_handle(self, event: CanonicalOccurrence) -> bool:
         """DHCP emitter handles dhcp_lease events with DHCP context."""
         return event.event_type in self._supported_types and event.dhcp is not None
 
-    def emit(self, event: SecurityEvent) -> None:
+    def emit(self, event: CanonicalOccurrence) -> None:
         """Render dhcp.log entry from DhcpContext."""
         if event.dhcp is None:
             return
         dhcp = event.dhcp
         event_data = {
-            "ts": event.timestamp,
+            "ts": _SOURCE_TIMING.packet_child_time(
+                event,
+                "source.zeek_dhcp_transaction",
+                seed_parts=(dhcp.uids, dhcp.client_addr, dhcp.assigned_addr, event.timestamp),
+                preferred_time=event.timestamp,
+                not_before=event.timestamp,
+            ),
             "uids": dhcp.uids,
             "client_addr": dhcp.client_addr,
             "server_addr": dhcp.server_addr,
@@ -59,10 +68,8 @@ class ZeekDhcpEmitter(SensorMultiplexEmitter):
             "lease_time": dhcp.lease_time,
             "msg_types": dhcp.msg_types,
             "duration": dhcp.duration,
-            "_sensor_hostnames": event._sensor_hostnames_by_format.get(self.format_def.name, []),
+            **self._sensor_metadata(event, self.format_def.name),
         }
-        if event._nat_swaps_by_sensor:
-            event_data["_nat_swaps_by_sensor"] = event._nat_swaps_by_sensor
         self.emit_event(event_data)
 
     def _render_event(self, event_data: dict[str, Any]) -> str:

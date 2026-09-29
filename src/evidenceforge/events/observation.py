@@ -14,39 +14,17 @@ from evidenceforge.config.observation_profiles import (
     get_observation_profile,
     observation_profile_exists,
 )
-from evidenceforge.events.base import RawLogEntry, SecurityEvent
+from evidenceforge.events.base import CanonicalOccurrence, RawProjectionRequest
+from evidenceforge.events.source_catalog import (
+    DEFAULT_SOURCE_CATALOG,
+    source_family_for_format,
+)
 from evidenceforge.utils.rng import _stable_seed
+from evidenceforge.utils.time import ensure_utc
 
 ObservationStatus = Literal["visible", "delayed", "dropped", "filtered", "out_of_window"]
 
-SOURCE_FAMILIES: frozenset[str] = frozenset(
-    {
-        "windows_security",
-        "sysmon",
-        "ecar",
-        "eslogger",
-        "syslog",
-        "bash_history",
-        "zeek",
-        "proxy",
-        "web",
-        "asa",
-        "ids",
-    }
-)
-
-_FORMAT_TO_SOURCE: dict[str, str] = {
-    "windows_event_security": "windows_security",
-    "windows_event_sysmon": "sysmon",
-    "ecar": "ecar",
-    "eslogger": "eslogger",
-    "syslog": "syslog",
-    "bash_history": "bash_history",
-    "proxy_access": "proxy",
-    "web_access": "web",
-    "cisco_asa": "asa",
-    "snort_alert": "ids",
-}
+SOURCE_FAMILIES: frozenset[str] = frozenset(DEFAULT_SOURCE_CATALOG.family_names)
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,13 +64,6 @@ class ObservationSummary:
         }
 
 
-def source_family_for_format(format_name: str) -> str:
-    """Return the observation source family for an emitter format name."""
-    if format_name.startswith("zeek_"):
-        return "zeek"
-    return _FORMAT_TO_SOURCE.get(format_name, format_name)
-
-
 class ObservationPolicy:
     """Applies a named observation profile to rendered source evidence."""
 
@@ -109,7 +80,7 @@ class ObservationPolicy:
         """Return True when the profile preserves perfect source coverage."""
         return self.profile_name == "complete"
 
-    def decide(self, format_name: str, event: SecurityEvent) -> ObservationDecision:
+    def decide(self, format_name: str, event: CanonicalOccurrence) -> ObservationDecision:
         """Return the source-observation decision for an event/emitter pair."""
         source = source_family_for_format(format_name)
         settings = self._settings_for_source(source)
@@ -132,21 +103,90 @@ class ObservationPolicy:
             return ObservationDecision(status="delayed", delay=delay)
         return ObservationDecision(status="visible")
 
-    def decide_raw(self, entry: RawLogEntry) -> ObservationDecision:
+    def decide_projection(
+        self,
+        format_name: str,
+        event: CanonicalOccurrence,
+        *,
+        source_instance: str,
+        source_hostname: str,
+        missingness: float,
+        format_specific: bool = False,
+    ) -> ObservationDecision:
+        """Return one exact-source decision from a compiled collection policy.
+
+        ``missingness`` is already normalized through the catalog/profile/pack/
+        scenario precedence layers. The named profile still owns coherent delay
+        texture and host multipliers, while the exact source ID keeps two sensors
+        from accidentally sharing a loss sample.
+        """
+
+        source = source_family_for_format(format_name)
+        settings = self._settings_for_source(source)
+        probability = self._projection_missingness(
+            source,
+            event,
+            source_hostname,
+            float(missingness),
+            settings,
+        )
+        event_identity = self._event_identity(
+            source,
+            format_name,
+            event,
+            force_format_specific=format_specific,
+        )
+        exact_identity = f"{source_instance}|{event_identity}"
+        drop_rng = random.Random(
+            _stable_seed(f"observation.drop|{self.profile_name}|{exact_identity}")
+        )
+        if probability > 0 and drop_rng.random() < probability:
+            return ObservationDecision(status="dropped")
+
+        delay = self._sample_delay(source, event, settings, exact_identity)
+        if delay > timedelta(0):
+            return ObservationDecision(status="delayed", delay=delay)
+        return ObservationDecision(status="visible")
+
+    def decide_raw(self, entry: RawProjectionRequest) -> ObservationDecision:
         """Return the source-observation decision for a direct raw entry."""
-        source = source_family_for_format(entry.target_emitter)
+        source = source_family_for_format(entry.target_format)
         settings = self._settings_for_source(source)
         missingness = self._effective_missingness_for_host(
             source,
             "",
             settings,
-            format_name=entry.target_emitter,
+            format_name=entry.target_format,
         )
         identity = self._raw_identity(source, entry)
         drop_rng = random.Random(_stable_seed(f"observation.drop|{self.profile_name}|{identity}"))
         if missingness > 0 and drop_rng.random() < missingness:
             return ObservationDecision(status="dropped")
         return ObservationDecision(status="visible")
+
+    def delay_bounds(self, source: str) -> tuple[timedelta, timedelta]:
+        """Return configured observation-delay bounds for one source family."""
+
+        settings = self._settings_for_source(source)
+        delay = settings.get("delay_ms", {})
+        if not isinstance(delay, dict):
+            return timedelta(0), timedelta(0)
+        min_ms = _safe_int(delay.get("min_ms", 0), 0, minimum=0, maximum=3_600_000)
+        max_ms = _safe_int(delay.get("max_ms", 0), 0, minimum=0, maximum=3_600_000)
+        if max_ms < min_ms:
+            return timedelta(0), timedelta(0)
+        return timedelta(milliseconds=min_ms), timedelta(milliseconds=max_ms)
+
+    def maximum_delay_difference(
+        self,
+        earlier_source: str,
+        later_source: str,
+    ) -> timedelta:
+        """Return the extra causal gap needed across two delayed source families."""
+
+        _earlier_min, earlier_max = self.delay_bounds(earlier_source)
+        later_min, _later_max = self.delay_bounds(later_source)
+        return max(timedelta(0), earlier_max - later_min)
 
     def _settings_for_source(self, source: str) -> dict[str, Any]:
         settings = self.sources.get(source, {})
@@ -159,7 +199,7 @@ class ObservationPolicy:
         return merged
 
     def _effective_missingness(
-        self, source: str, format_name: str, event: SecurityEvent, settings: dict[str, Any]
+        self, source: str, format_name: str, event: CanonicalOccurrence, settings: dict[str, Any]
     ) -> float:
         if self._preserve_ssh_session_lifecycle(source, event):
             return 0.0
@@ -169,6 +209,48 @@ class ObservationPolicy:
             return 0.0
         host = self._host_key_for_event(event)
         return self._effective_missingness_for_host(source, host, settings, format_name=format_name)
+
+    def _projection_missingness(
+        self,
+        source: str,
+        event: CanonicalOccurrence,
+        host: str,
+        base: float,
+        settings: dict[str, Any],
+    ) -> float:
+        """Apply lifecycle preservation and host texture to compiled missingness."""
+
+        if self._preserve_ssh_session_lifecycle(source, event):
+            return 0.0
+        if self._preserve_logind_session_lifecycle(source, event):
+            return 0.0
+        if self._preserve_ecar_cron_process_lifecycle(source, event):
+            return 0.0
+        multiplier_range = settings.get("host_missingness_multiplier", {})
+        if not isinstance(multiplier_range, dict):
+            multiplier_range = {}
+        min_mult = _safe_float(
+            multiplier_range.get("min", 1.0),
+            1.0,
+            minimum=0.0,
+            maximum=10.0,
+        )
+        max_mult = _safe_float(
+            multiplier_range.get("max", 1.0),
+            1.0,
+            minimum=0.0,
+            maximum=10.0,
+        )
+        if max_mult < min_mult:
+            min_mult, max_mult = 1.0, 1.0
+        if min_mult == max_mult:
+            multiplier = min_mult
+        else:
+            seed = _stable_seed(
+                f"observation.host-mult|{self.profile_name}|{source}|{host.casefold()}"
+            )
+            multiplier = random.Random(seed).uniform(min_mult, max_mult)
+        return max(0.0, min(base * multiplier, 1.0))
 
     def _effective_missingness_for_host(
         self,
@@ -211,12 +293,10 @@ class ObservationPolicy:
     def _sample_delay(
         self,
         source: str,
-        event: SecurityEvent,
+        event: CanonicalOccurrence,
         settings: dict[str, Any],
         identity: str,
     ) -> timedelta:
-        if event.raw is not None:
-            return timedelta(0)
         delay = settings.get("delay_ms", {})
         if not isinstance(delay, dict):
             return timedelta(0)
@@ -224,21 +304,63 @@ class ObservationPolicy:
         max_ms = _safe_int(delay.get("max_ms", 0), 0, minimum=0, maximum=3_600_000)
         if max_ms <= 0 or max_ms < min_ms:
             return timedelta(0)
+        if (
+            source == "ecar"
+            and event.process is not None
+            and event.process.start_time is not None
+            and not event.process.concurrency_group_id
+        ):
+            return self._coherent_process_delay(event, source, min_ms, max_ms)
         seed = _stable_seed(f"observation.delay|{self.profile_name}|{source}|{identity}")
         delay_ms = random.Random(seed).randint(min_ms, max_ms)
         return timedelta(milliseconds=delay_ms)
+
+    @staticmethod
+    def _coherent_process_delay(
+        event: CanonicalOccurrence,
+        source: str,
+        min_ms: int,
+        max_ms: int,
+    ) -> timedelta:
+        """Return a process-coherent host delay that cannot reorder starts."""
+
+        host = event.src_host or event.dst_host
+        hostname = str(getattr(host, "hostname", "") or "unknown-host")
+        span_us = (max_ms - min_ms) * 1_000
+        if span_us <= 0:
+            return timedelta(milliseconds=min_ms)
+
+        seed = _stable_seed(f"coherent-observation-delay:{source}:{hostname}")
+        period_seconds = 2_700 + (seed % 2_701)
+        period_us = period_seconds * 1_000_000
+        half_period_us = period_us // 2
+        phase_us = (seed >> 16) % period_us
+        start_us = round(ensure_utc(event.process.start_time).timestamp() * 1_000_000)
+        position_us = (start_us + phase_us) % period_us
+        distance_us = min(position_us, period_us - position_us)
+        delay_us = (min_ms * 1_000) + (span_us * distance_us) // half_period_us
+        return timedelta(microseconds=delay_us)
 
     def _event_identity(
         self,
         source: str,
         format_name: str,
-        event: SecurityEvent,
+        event: CanonicalOccurrence,
         *,
         force_format_specific: bool = False,
     ) -> str:
         group = self._coherent_group_key(source, event)
         host = self._host_key_for_event(event)
         timestamp = int(event.timestamp.timestamp() * 1_000_000)
+        zeek_uid = event.network.zeek_uid if event.network is not None else ""
+        coherent_http_transaction = (
+            force_format_specific
+            and source == "zeek"
+            and format_name == "zeek_http"
+            and bool(zeek_uid)
+        )
+        if coherent_http_transaction:
+            return "|".join([source, format_name, format_name, host, f"uid:{zeek_uid}", ""])
         coherent = self._uses_coherent_source_identity(source, group) and not force_format_specific
         return "|".join(
             [
@@ -251,22 +373,31 @@ class ObservationPolicy:
             ]
         )
 
-    def _raw_identity(self, source: str, entry: RawLogEntry) -> str:
+    def _raw_identity(self, source: str, entry: RawProjectionRequest) -> str:
         timestamp = int(entry.timestamp.timestamp() * 1_000_000)
         return "|".join(
             [
                 source,
-                entry.target_emitter,
+                entry.target_format,
                 str(timestamp),
                 str(sorted(entry.data.items()))[:500],
             ]
         )
 
-    def _coherent_group_key(self, source: str, event: SecurityEvent) -> str:
+    def _coherent_group_key(self, source: str, event: CanonicalOccurrence) -> str:
+        if source == "ecar" and event.process and event.process.concurrency_group_id:
+            return f"process-group:{event.process.concurrency_group_id}"
         if source == "ecar":
             remote_session_group = self._ecar_remote_session_group_key(event)
             if remote_session_group:
+                # The network contract gives the transport its own lifecycle group,
+                # while SSH/RDP authentication is a distinct canonical occurrence.
+                # Tuple coherence must therefore take precedence over the generic
+                # per-occurrence lifecycle key or observation missingness can orphan
+                # a visible endpoint login from its required inbound FLOW.
                 return remote_session_group
+        if event.lifecycle is not None:
+            return f"action-lifecycle:{event.lifecycle.group_id}"
         if (
             source == "ecar"
             and event.storyline_cluster_id
@@ -279,8 +410,6 @@ class ObservationPolicy:
                 f"{event.storyline_cluster_id}:{event.process.username}:"
                 f"{event.process.pid}:{image}"
             )
-        if source == "ecar" and event.process and event.process.concurrency_group_id:
-            return f"process-group:{event.process.concurrency_group_id}"
         if source == "syslog":
             ssh_session_group = self._syslog_ssh_session_group_key(event)
             if ssh_session_group:
@@ -307,12 +436,15 @@ class ObservationPolicy:
             return f"registry:{event.registry.key}:{event.registry.value}"
         if event.file:
             return f"file:{event.file.path}:{event.file.action}"
-        if event.ids:
-            return f"ids:{event.ids.sid}:{event.ids.message}"
+        ids_alerts = event.ids_alerts
+        if ids_alerts:
+            return "ids:" + ",".join(
+                f"{alert.gid}:{alert.sid}:{alert.message}" for alert in ids_alerts
+            )
         return "event"
 
     @staticmethod
-    def _ecar_remote_session_group_key(event: SecurityEvent) -> str:
+    def _ecar_remote_session_group_key(event: CanonicalOccurrence) -> str:
         """Return tuple-scoped eCAR grouping for remote session transport and login."""
         host = event.dst_host
         if host is None:
@@ -345,6 +477,8 @@ class ObservationPolicy:
     @staticmethod
     def _uses_coherent_source_identity(source: str, group: str) -> bool:
         """Return whether observation delay/drop should be shared within a source group."""
+        if group.startswith("action-lifecycle:") and source in SOURCE_FAMILIES:
+            return True
         if source == "ecar" and group.startswith("remote-session:"):
             return True
         if group.startswith("process:") and source in {"windows_security", "sysmon", "ecar"}:
@@ -374,7 +508,7 @@ class ObservationPolicy:
         return False
 
     @staticmethod
-    def _syslog_ssh_session_group_key(event: SecurityEvent) -> str:
+    def _syslog_ssh_session_group_key(event: CanonicalOccurrence) -> str:
         """Return a shared syslog observation key for one SSH session lifecycle."""
         if event.syslog is None or event.auth is None:
             return ""
@@ -399,7 +533,7 @@ class ObservationPolicy:
         )
 
     @staticmethod
-    def _preserve_ssh_session_lifecycle(source: str, event: SecurityEvent) -> bool:
+    def _preserve_ssh_session_lifecycle(source: str, event: CanonicalOccurrence) -> bool:
         """Preserve SSH auth lifecycle rows that correlate with endpoint session rows."""
         if source != "syslog" or event.syslog is None:
             return False
@@ -416,7 +550,7 @@ class ObservationPolicy:
         )
 
     @staticmethod
-    def _preserve_logind_session_lifecycle(source: str, event: SecurityEvent) -> bool:
+    def _preserve_logind_session_lifecycle(source: str, event: CanonicalOccurrence) -> bool:
         """Preserve logind session rows that correlate with endpoint session rows."""
         if source != "syslog" or event.syslog is None:
             return False
@@ -426,13 +560,13 @@ class ObservationPolicy:
         return message.startswith("New session ") or message.startswith("Removed session ")
 
     @staticmethod
-    def _preserve_ecar_cron_process_lifecycle(source: str, event: SecurityEvent) -> bool:
+    def _preserve_ecar_cron_process_lifecycle(source: str, event: CanonicalOccurrence) -> bool:
         """Preserve eCAR cron process rows that are correlated with visible CRON syslog."""
         if source != "ecar" or event.process is None:
             return False
         return event.process.concurrency_group_id.startswith("cron:")
 
-    def _host_key_for_event(self, event: SecurityEvent) -> str:
+    def _host_key_for_event(self, event: CanonicalOccurrence) -> str:
         host = event.dst_host or event.src_host
         if host:
             return host.hostname or host.ip

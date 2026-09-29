@@ -23,15 +23,25 @@
 """Unit tests for Cisco ASA firewall emitter."""
 
 import re
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 
-from evidenceforge.events.base import SecurityEvent
-from evidenceforge.events.contexts import FirewallContext, NatContext, NetworkContext
+from evidenceforge.events.base import OccurrenceBuilder
+from evidenceforge.events.contexts import FirewallContext, NatContext
+from evidenceforge.events.network import (
+    DirectionalTrafficLedger,
+    NatSensorObservation,
+    NetworkSensorObservation,
+    NetworkTrafficLedger,
+    NetworkTuple,
+)
 from evidenceforge.formats import load_format
+from evidenceforge.generation.emitters.base import ExactPublicationAuthority
 from evidenceforge.generation.emitters.cisco_asa import CiscoAsaEmitter
+from tests.network_factories import network_plan
 
 
 @pytest.fixture
@@ -63,6 +73,15 @@ def asa_emitter(tmp_path):
 T0 = datetime(2024, 6, 15, 14, 23, 5, tzinfo=UTC)
 
 
+def test_asa_route_writer_inherits_incremental_checkpoint_mode(asa_emitter) -> None:
+    asa_emitter.enable_incremental_checkpointing()
+
+    writer = asa_emitter._get_writer("fw01")
+
+    assert writer._sorted_writer is not None
+    assert writer._sorted_writer._checkpoint_mode is True
+
+
 def _make_connection_event(
     src_ip="10.0.10.50",
     src_port=54321,
@@ -76,12 +95,13 @@ def _make_connection_event(
     firewall=None,
     nat=None,
     timestamp=None,
+    conn_id="",
 ):
-    """Create a connection SecurityEvent for testing."""
-    event = SecurityEvent(
+    """Create a connection OccurrenceBuilder for testing."""
+    event = OccurrenceBuilder(
         timestamp=timestamp or T0,
         event_type="connection",
-        network=NetworkContext(
+        network=network_plan(
             src_ip=src_ip,
             src_port=src_port,
             dst_ip=dst_ip,
@@ -91,6 +111,7 @@ def _make_connection_event(
             orig_bytes=orig_bytes,
             resp_bytes=resp_bytes,
             conn_state=conn_state,
+            conn_id=conn_id,
         ),
         firewall=firewall,
         nat=nat,
@@ -100,16 +121,19 @@ def _make_connection_event(
 
 
 class TestCanHandle:
+    def test_exact_projection_capability_is_class_owned(self):
+        assert CiscoAsaEmitter.__dict__.get("supports_exact_projection_publication") is True
+
     def test_handles_connection_with_network(self, asa_emitter):
         event = _make_connection_event()
         assert asa_emitter.can_handle(event) is True
 
     def test_rejects_non_connection(self, asa_emitter):
-        event = SecurityEvent(timestamp=T0, event_type="process")
+        event = OccurrenceBuilder(timestamp=T0, event_type="process")
         assert asa_emitter.can_handle(event) is False
 
     def test_rejects_connection_without_network(self, asa_emitter):
-        event = SecurityEvent(timestamp=T0, event_type="connection")
+        event = OccurrenceBuilder(timestamp=T0, event_type="connection")
         assert asa_emitter.can_handle(event) is False
 
 
@@ -130,108 +154,102 @@ class TestInterfaceResolution:
         assert asa_emitter._resolve_interface("203.0.113.50", "unknown") == "outside"
 
 
-class TestConnectionIdCounter:
-    def test_monotonically_increasing(self, asa_emitter):
-        from datetime import datetime
+class TestConnectionIdFinalization:
+    def test_same_transport_and_sensor_are_retry_invariant(self, asa_emitter):
+        event = _make_connection_event()
 
-        ts1 = datetime(2024, 3, 18, 12, 0, 0, tzinfo=UTC)
-        ts2 = datetime(2024, 3, 18, 12, 0, 1, tzinfo=UTC)
-        id1 = asa_emitter._next_conn_id("fw01", ts1)
-        id2 = asa_emitter._next_conn_id("fw01", ts2)
-        assert id2 > id1
+        first = asa_emitter._connection_id(event, "fw01")
+        second = asa_emitter._connection_id(event, "fw01")
 
-    def test_per_sensor_counters(self, asa_emitter):
-        from datetime import datetime
+        assert first == second
+        assert 1_000_000 <= first < 1_000_000_000
 
-        ts = datetime(2024, 3, 18, 12, 0, 0, tzinfo=UTC)
-        id_fw01 = asa_emitter._next_conn_id("fw01", ts)
-        id_fw02 = asa_emitter._next_conn_id("fw02", ts)
-        # Different sensors get different sequence bits
-        assert id_fw01 != id_fw02
+    def test_same_transport_has_source_local_sensor_identity(self, asa_emitter):
+        event = _make_connection_event()
 
-    def test_no_duplicates_for_same_timestamp_burst(self, asa_emitter):
-        from datetime import datetime
+        assert asa_emitter._connection_id(event, "fw01") != asa_emitter._connection_id(
+            event,
+            "fw02",
+        )
 
-        ts = datetime(2024, 3, 18, 12, 0, 0, tzinfo=UTC)
-        ids = [asa_emitter._next_conn_id("fw01", ts) for _ in range(5000)]
+    def test_distinct_canonical_transports_have_distinct_final_ids(self, asa_emitter):
+        events = [
+            _make_connection_event(
+                src_port=10_000 + index,
+                timestamp=T0,
+                conn_id=f"conn-{index}",
+            )
+            for index in range(5_000)
+        ]
+        ids = [asa_emitter._connection_id(event, "fw01") for event in events]
+
         assert len(ids) == len(set(ids))
 
-    def test_no_duplicates_across_adjacent_second_bursts(self, asa_emitter):
-        ts = datetime(2024, 3, 18, 12, 0, 0, tzinfo=UTC)
-        first_second_ids = [asa_emitter._next_conn_id("fw01", ts) for _ in range(20)]
-        next_second_ids = [
-            asa_emitter._next_conn_id("fw01", ts + timedelta(seconds=1)) for _ in range(20)
-        ]
-
-        assert set(first_second_ids).isdisjoint(next_second_ids)
-
-    def test_connection_ids_are_not_epoch_shaped(self, asa_emitter):
-        conn_id = asa_emitter._next_conn_id("fw01", T0)
-        assert conn_id < 1_000_000_000
-        assert not str(conn_id).endswith("000")
-
-    def test_connection_id_terminal_digits_vary(self, asa_emitter):
+    def test_final_id_terminal_digits_vary_without_timestamp_shape(self, asa_emitter):
         ids = [
-            asa_emitter._next_conn_id("fw01", T0 + timedelta(seconds=offset))
+            asa_emitter._connection_id(
+                _make_connection_event(
+                    src_port=40_000 + offset,
+                    timestamp=T0 + timedelta(seconds=offset),
+                ),
+                "fw01",
+            )
             for offset in range(60)
         ]
-        terminal_digits = {conn_id % 10 for conn_id in ids}
-        assert len(terminal_digits) >= 8
 
-    def test_visible_connection_id_mapping_includes_hidden_volume_gaps(self):
-        """Final visible ASA IDs should not expose a tiny bounded increment pattern."""
-        lines = []
-        for index in range(80):
-            ts = T0 + timedelta(seconds=index * 17)
-            temp_id = 1_000_000 + index
-            line = (
-                f"<166>{ts:%b} {ts.day:2d} {ts:%H:%M:%S} fw01 "
-                f"%ASA-6-302013: Built outbound TCP connection {temp_id} for "
-                f"inside:10.0.10.50/{50000 + index} "
-                f"(10.0.10.50/{50000 + index}) to outside:203.0.113.50/443 "
-                "(203.0.113.50/443)"
-            )
-            lines.append((2024, line))
+        assert len({conn_id % 10 for conn_id in ids}) >= 8
+        assert all(not str(conn_id).endswith("000") for conn_id in ids)
 
-        mapping = CiscoAsaEmitter._build_connection_id_mapping(lines, "fw01")
-        visible_ids = [mapping[str(1_000_000 + index)] for index in range(80)]
-        gaps = [
-            current - previous
-            for previous, current in zip(visible_ids, visible_ids[1:], strict=False)
-        ]
+    def test_exact_publication_freezes_matching_built_and_teardown_ids(
+        self,
+        asa_emitter: CiscoAsaEmitter,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failed first render cannot pair a retained Built row with a new teardown ID."""
 
-        assert visible_ids == sorted(visible_ids)
-        assert any(gap > 5 for gap in gaps)
-        assert len(set(gaps)) >= 20
+        batch = ExactPublicationAuthority(capacity=1).issue_batch()
+        event = _make_connection_event()
+        original_built = asa_emitter._emit_built
+        original_teardown = asa_emitter._emit_teardown
+        fail_before = True
+        attempted_ids: list[int] = []
 
-    def test_connection_id_mapping_preserves_same_second_file_order(self, tmp_path):
-        """Same-second rows should keep the order already present in the final log file."""
-        path = tmp_path / "cisco_asa.log"
-        lines = [
-            (
-                "<166>Jun 15 14:23:05 fw01 %ASA-6-302013: Built outbound TCP "
-                "connection 1000010 for inside:10.0.10.50/50010 "
-                "(10.0.10.50/50010) to outside:203.0.113.50/443 "
-                "(203.0.113.50/443)"
-            ),
-            (
-                "<166>Jun 15 14:23:05 fw01 %ASA-6-302013: Built outbound TCP "
-                "connection 1000001 for inside:10.0.10.51/50001 "
-                "(10.0.10.51/50001) to outside:203.0.113.51/443 "
-                "(203.0.113.51/443)"
-            ),
-        ]
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        def capture_built(*args, **kwargs):
+            attempted_ids.append(args[3])
+            return original_built(*args, **kwargs)
 
-        mapping = CiscoAsaEmitter._connection_id_mapping(
-            [("fw01|2024", SimpleNamespace(output_path=path))],
-            "fw01",
-        )
-        visible_ids = [mapping["1000010"], mapping["1000001"]]
+        def fail_first_teardown(*args, **kwargs):
+            nonlocal fail_before
+            if fail_before:
+                fail_before = False
+                raise RuntimeError("teardown failed before publication")
+            return original_teardown(*args, **kwargs)
 
-        assert visible_ids == sorted(visible_ids)
+        monkeypatch.setattr(asa_emitter, "_emit_built", capture_built)
+        monkeypatch.setattr(asa_emitter, "_emit_teardown", fail_first_teardown)
+        with pytest.raises(RuntimeError, match="teardown failed"):
+            batch.publish(lambda: asa_emitter.emit(event))
+        assert len(asa_emitter._writers) == 1
+        writer = next(iter(asa_emitter._writers.values()))
+        assert writer.event_count == 0
 
-    def test_sorted_output_preserves_stateful_connection_ids(self, asa_emitter, tmp_path):
+        batch.publish(lambda: asa_emitter.emit(event))
+        batch.release_no_fail()
+        assert writer._sorted_writer is not None
+        assert writer._sorted_writer.event_count == 2
+        asa_emitter.close()
+        lines = writer.output_path.read_text(encoding="utf-8").splitlines()
+        built_line = next(line for line in lines if "Built" in line)
+        teardown_line = next(line for line in lines if "Teardown" in line)
+        built_id = re.search(r"Built .* connection (\d+)", built_line)
+        teardown_id = re.search(r"Teardown .* connection (\d+)", teardown_line)
+        assert built_id is not None
+        assert teardown_id is not None
+        assert built_id.group(1) == teardown_id.group(1)
+        assert len(attempted_ids) == 2
+        assert attempted_ids[0] == attempted_ids[1]
+
+    def test_sorted_output_preserves_final_connection_ids(self, asa_emitter, tmp_path):
         late_event = _make_connection_event(
             timestamp=T0 + timedelta(seconds=30),
             src_port=50001,
@@ -245,7 +263,7 @@ class TestConnectionIdCounter:
 
         asa_emitter.emit(late_event)
         asa_emitter.emit(early_event)
-        asa_emitter.flush()
+        asa_emitter.close()
 
         output = (tmp_path / "fw01" / "2024" / "cisco_asa.log").read_text()
         built_lines = [
@@ -259,41 +277,126 @@ class TestConnectionIdCounter:
 
         assert built_lines == sorted(built_lines)
         assert len(built_ids) == len(set(built_ids))
-        assert abs(built_ids[0] - built_ids[1]) < 2000
+        assert built_ids == list(range(built_ids[0], built_ids[0] + len(built_ids)))
 
-    def test_barrier_flush_does_not_normalize_existing_file(self, asa_emitter, monkeypatch):
-        calls: list[str] = []
+    def test_equal_second_output_is_independent_of_spill_topology(self, tmp_path) -> None:
+        """ASA tie ordering and finalized IDs do not depend on run boundaries."""
 
-        def record_normalization() -> None:
-            calls.append("normalized")
+        def configured_emitter(root: Path, buffer_size: int) -> CiscoAsaEmitter:
+            emitter = CiscoAsaEmitter(
+                load_format("cisco_asa"),
+                root,
+                buffer_size=buffer_size,
+                sensor_hostnames=["fw01"],
+            )
+            emitter.configure_output_target("sof-elk")
+            emitter._segment_config = [
+                {"name": "workstations", "cidr": "10.0.10.0/24"},
+            ]
+            emitter._sensor_interfaces = {"fw01": {"workstations": "inside", "_default": "outside"}}
+            return emitter
 
-        monkeypatch.setattr(
-            asa_emitter,
-            "_normalize_visible_connection_ids",
-            record_normalization,
-        )
+        early_spills = configured_emitter(tmp_path / "early-spills", 1)
+        one_spill = configured_emitter(tmp_path / "one-spill", 100)
+        ascending = [
+            _make_connection_event(
+                src_port=50_000 + ordinal,
+                timestamp=T0,
+                duration=1.0,
+                conn_id=f"conn-{ordinal}",
+            )
+            for ordinal in range(3)
+        ]
+        descending = [
+            _make_connection_event(
+                src_port=50_000 + ordinal,
+                timestamp=T0,
+                duration=1.0,
+                conn_id=f"conn-{ordinal}",
+            )
+            for ordinal in reversed(range(3))
+        ]
 
-        asa_emitter.emit(_make_connection_event())
-        asa_emitter.flush()
+        for event in descending:
+            early_spills.emit(event)
+        for event in ascending:
+            one_spill.emit(event)
+        early_spills.close()
+        one_spill.close()
 
-        assert calls == []
+        relative = Path("fw01") / "2024" / "cisco_asa.log"
+        assert (tmp_path / "early-spills" / relative).read_bytes() == (
+            tmp_path / "one-spill" / relative
+        ).read_bytes()
 
-    def test_close_normalizes_connection_ids_once(self, asa_emitter, monkeypatch):
-        calls: list[str] = []
-
-        def record_normalization() -> None:
-            calls.append("normalized")
-
-        monkeypatch.setattr(
-            asa_emitter,
-            "_normalize_visible_connection_ids",
-            record_normalization,
-        )
-
+    def test_repeated_close_is_byte_idempotent(self, asa_emitter, tmp_path):
         asa_emitter.emit(_make_connection_event())
         asa_emitter.close()
+        output = tmp_path / "fw01" / "2024" / "cisco_asa.log"
+        first = output.read_bytes()
 
-        assert calls == ["normalized"]
+        asa_emitter.close()
+
+        assert output.read_bytes() == first
+
+    @pytest.mark.parametrize("failure_mode", ("fail-before", "lost-return"))
+    def test_atomic_final_close_recovers_byte_identically(
+        self,
+        failure_mode: str,
+        asa_emitter: CiscoAsaEmitter,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The inherited atomic writer recovers finalization with no rewrite phase."""
+
+        event = _make_connection_event()
+        batch = ExactPublicationAuthority(capacity=1).issue_batch()
+        batch.publish(lambda: asa_emitter.emit(event))
+        batch.release_no_fail()
+        writer = next(iter(asa_emitter._writers.values()))
+        assert writer._sorted_writer is not None
+        original_publish = writer._sorted_writer._publish_runs_unlocked
+        attempts = 0
+
+        def inject_finalization() -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                if failure_mode == "lost-return":
+                    original_publish()
+                raise OSError(f"injected ASA finalization {failure_mode}")
+            original_publish()
+
+        monkeypatch.setattr(
+            writer._sorted_writer,
+            "_publish_runs_unlocked",
+            inject_finalization,
+        )
+        with pytest.raises(OSError, match=f"ASA finalization {failure_mode}"):
+            asa_emitter.close()
+        asa_emitter.close()
+        actual = writer.output_path.read_bytes()
+
+        control_root = tmp_path / "control"
+        control = CiscoAsaEmitter(
+            load_format("cisco_asa"),
+            control_root,
+            sensor_hostnames=["fw01"],
+        )
+        control.configure_output_target("sof-elk")
+        control._segment_config = asa_emitter._segment_config
+        control._sensor_interfaces = asa_emitter._sensor_interfaces
+        control_batch = ExactPublicationAuthority(capacity=1).issue_batch()
+        control_batch.publish(lambda: control.emit(event))
+        control_batch.release_no_fail()
+        control.close()
+        control_path = control_root / "fw01" / "2024" / "cisco_asa.log"
+
+        assert attempts == 2
+        assert actual == control_path.read_bytes()
+        assert actual.count(b"Built outbound TCP connection") == 1
+        assert actual.count(b"Teardown TCP connection") == 1
+        assert not tuple(tmp_path.rglob("*.merging"))
 
 
 class TestPermitRecords:
@@ -319,8 +422,48 @@ class TestPermitRecords:
         assert "duration 0:01:23" in lines[1]
         byte_match = re.search(r"bytes (\d+)", lines[1])
         assert byte_match is not None
-        assert int(byte_match.group(1)) > 5120
+        assert int(byte_match.group(1)) == 5120
         assert "SYN Timeout" not in lines[1]
+
+    def test_unobserved_boundary_teardown_keeps_only_built(self, asa_emitter, tmp_path):
+        """A post-cutoff ASA close is absent rather than shifted into the window."""
+
+        event = _make_connection_event(protocol="tcp")
+        event.network_observations = (
+            NetworkSensorObservation(
+                sensor_identity="fw01",
+                path_role="perimeter",
+                capture_profile="default",
+                tuple_view=NetworkTuple(
+                    src_ip="10.0.10.50",
+                    src_port=54321,
+                    dst_ip="203.0.113.50",
+                    dst_port=443,
+                    protocol="tcp",
+                ),
+                connection_uid="CBoundary1",
+                connection_ids=(),
+                file_ids=(),
+                local_orig=True,
+                local_resp=False,
+                observed_start_time=T0,
+                observed_close_time=T0 + timedelta(minutes=10),
+                traffic=NetworkTrafficLedger(),
+                visible_formats=frozenset({"cisco_asa"}),
+                firewall_teardown_reason="TCP FINs",
+                firewall_teardown_time=T0 + timedelta(minutes=10),
+                firewall_teardown_observed=False,
+            ),
+        )
+        event.network_observations_planned = True
+
+        asa_emitter.emit(event)
+        asa_emitter.flush()
+
+        output = (tmp_path / "fw01" / "2024" / "cisco_asa.log").read_text()
+        lines = [line for line in output.strip().split("\n") if line]
+        assert len(lines) == 1
+        assert "Built outbound TCP connection" in lines[0]
 
     def test_connection_crossing_year_boundary_keeps_id_pairing(self, asa_emitter, tmp_path):
         """Built and teardown rows split by year should keep the same connection ID."""
@@ -340,8 +483,8 @@ class TestPermitRecords:
         assert teardown_id is not None
         assert built_id.group(1) == teardown_id.group(1)
 
-    def test_teardown_after_collection_end_is_suppressed(self, asa_emitter, tmp_path):
-        """A slice ending before connection close should show a dangling Built record."""
+    def test_output_admission_is_not_owned_by_emitter(self, asa_emitter, tmp_path):
+        """Direct emission renders the full lifecycle; dispatcher owns window admission."""
         asa_emitter._output_end_time = T0 + timedelta(seconds=10)
         event = _make_connection_event(protocol="tcp", duration=83.5)
 
@@ -350,12 +493,12 @@ class TestPermitRecords:
 
         output = (tmp_path / "fw01" / "2024" / "cisco_asa.log").read_text()
         lines = [line for line in output.strip().split("\n") if line]
-        assert len(lines) == 1
+        assert len(lines) == 2
         assert "%ASA-6-302013:" in lines[0]
-        assert "%ASA-6-302014:" not in output
+        assert "%ASA-6-302014:" in output
 
-    def test_nat_teardown_after_collection_end_is_suppressed(self, asa_emitter, tmp_path):
-        """Dynamic NAT should not remain perfectly paired when connection close is out of slice."""
+    def test_nat_output_admission_is_not_owned_by_emitter(self, asa_emitter, tmp_path):
+        """Direct NAT emission leaves lifecycle admission to the dispatcher."""
         asa_emitter._output_end_time = T0 + timedelta(seconds=10)
         event = _make_connection_event(
             protocol="tcp",
@@ -375,11 +518,11 @@ class TestPermitRecords:
         output = (tmp_path / "fw01" / "2024" / "cisco_asa.log").read_text()
         assert "%ASA-6-302013:" in output
         assert "%ASA-6-305011:" in output
-        assert "%ASA-6-302014:" not in output
-        assert "%ASA-6-305012:" not in output
+        assert "%ASA-6-302014:" in output
+        assert "%ASA-6-305012:" in output
 
-    def test_teardown_byte_count_is_not_exact_zeek_payload_sum(self, asa_emitter, tmp_path):
-        """ASA teardown accounting should not exactly mirror Zeek payload bytes."""
+    def test_teardown_byte_count_uses_canonical_transfer_total(self, asa_emitter, tmp_path):
+        """ASA renders canonical transfer accounting without emitter-local variance."""
         event = _make_connection_event(protocol="tcp", orig_bytes=1024, resp_bytes=4096)
 
         asa_emitter.emit(event)
@@ -389,7 +532,60 @@ class TestPermitRecords:
         teardown = next(line for line in output.splitlines() if "%ASA-6-302014:" in line)
         byte_match = re.search(r"bytes (\d+)", teardown)
         assert byte_match is not None
-        assert int(byte_match.group(1)) != 5120
+        assert int(byte_match.group(1)) == 5120
+
+    def test_sensor_accounting_is_projected_without_rebuilding_canonical_plan(
+        self,
+        asa_emitter,
+        tmp_path,
+    ):
+        """ASA source-local byte views do not re-enter canonical transaction validation."""
+
+        event = _make_connection_event(protocol="tcp", orig_bytes=1000, resp_bytes=1000)
+        event.network_observations = (
+            NetworkSensorObservation(
+                sensor_identity="fw01",
+                path_role="source_side",
+                capture_profile="well_synced",
+                tuple_view=NetworkTuple(
+                    src_ip=event.network.src_ip,
+                    src_port=event.network.src_port,
+                    dst_ip=event.network.dst_ip,
+                    dst_port=event.network.dst_port,
+                    protocol=event.network.protocol,
+                ),
+                connection_uid="CAsaProjection1",
+                connection_ids=(),
+                file_ids=(),
+                local_orig=True,
+                local_resp=False,
+                observed_start_time=T0,
+                observed_close_time=T0 + timedelta(seconds=1),
+                traffic=NetworkTrafficLedger(
+                    orig=DirectionalTrafficLedger(
+                        payload_bytes=1000,
+                        packets=1,
+                        ip_bytes=2000,
+                    ),
+                    resp=DirectionalTrafficLedger(
+                        payload_bytes=1000,
+                        packets=1,
+                        ip_bytes=2000,
+                    ),
+                ),
+                visible_formats=frozenset({"cisco_asa"}),
+                firewall_teardown_reason="TCP FINs",
+                firewall_teardown_time=T0 + timedelta(seconds=1),
+            ),
+        )
+        event.network_observations_planned = True
+
+        asa_emitter.emit(event)
+        asa_emitter.flush()
+
+        output = (tmp_path / "fw01" / "2024" / "cisco_asa.log").read_text()
+        teardown = next(line for line in output.splitlines() if "%ASA-6-302014:" in line)
+        assert "duration 0:00:01 bytes 4000 TCP FINs" in teardown
 
     def test_successful_tcp_teardown_uses_fin_reason(self, asa_emitter, tmp_path):
         """ASA teardown reason should agree with a normal Zeek SF/FIN close."""
@@ -447,7 +643,7 @@ class TestPermitRecords:
             orig_bytes=0,
             resp_bytes=0,
         )
-        event.network.conn_state = "S0"
+        event.network = replace(event.network, conn_state="S0")
         asa_emitter.emit(event)
         asa_emitter.flush()
 
@@ -528,6 +724,30 @@ class TestPermitRecords:
 
         output = (tmp_path / "fw01" / "2024" / "cisco_asa.log").read_text()
         assert "Built inbound TCP connection" in output
+
+    @pytest.mark.parametrize(
+        ("protocol", "src_ip", "dst_ip", "expected"),
+        [
+            ("tcp", "172.16.0.5", "10.0.20.10", "inbound"),
+            ("udp", "10.0.20.10", "172.16.0.5", "outbound"),
+            ("icmp", "172.16.0.5", "10.0.20.10", "inbound"),
+        ],
+    )
+    def test_direction_uses_interface_security_relationship(
+        self, asa_emitter, tmp_path, protocol, src_ip, dst_ip, expected
+    ):
+        """DMZ/inside direction follows security levels for every protocol family."""
+        event = _make_connection_event(
+            protocol=protocol,
+            src_ip=src_ip,
+            dst_ip=dst_ip,
+            dst_port=8 if protocol == "icmp" else 443,
+        )
+        asa_emitter.emit(event)
+        asa_emitter.flush()
+
+        output = (tmp_path / "fw01" / "2024" / "cisco_asa.log").read_text()
+        assert f"Built {expected} {protocol.upper()} connection" in output
 
     def test_permit_uses_firewall_context_connection_id_and_interfaces(self, asa_emitter, tmp_path):
         """Context-owned ASA fields override emitter-derived fallback fields."""
@@ -984,6 +1204,33 @@ class TestNatRecords:
             in nat_built_lines[0]
         )
 
+    @pytest.mark.parametrize(
+        ("protocol", "connection_msg_id"),
+        [("tcp", "302013"), ("udp", "302015")],
+    )
+    def test_dynamic_translation_wraps_connection_lifecycle(
+        self,
+        asa_emitter,
+        tmp_path,
+        protocol,
+        connection_msg_id,
+    ):
+        """Dynamic xlate allocation must precede connection state and outlive it."""
+        event = self._make_nat_event(protocol=protocol)
+        asa_emitter.emit(event)
+        asa_emitter.flush()
+
+        lines = self._get_output_lines(tmp_path)
+        message_ids = [
+            line.split("%ASA-6-", maxsplit=1)[1].split(":", maxsplit=1)[0] for line in lines
+        ]
+        assert message_ids == [
+            "305011",
+            connection_msg_id,
+            str(int(connection_msg_id) + 1),
+            "305012",
+        ]
+
     def test_305012_emitted_for_nat_teardown(self, asa_emitter, tmp_path):
         """A permitted connection with NatContext should emit a 305012 Teardown translation record."""
         event = self._make_nat_event()
@@ -1120,6 +1367,141 @@ class TestNatRecords:
         assert "dmz:172.16.0.5/443 (203.0.113.5/443)" in built_line
         assert "dmz:172.16.0.5/443 (172.16.0.5/443)" not in built_line
 
+    def test_planned_inbound_icmp_renders_distinct_global_and_local_addresses(
+        self,
+        asa_emitter,
+        tmp_path,
+    ):
+        """ASA ICMP projection consumes the observation-owned NAT address roles."""
+
+        event = _make_connection_event(
+            src_ip="198.51.100.25",
+            src_port=0,
+            dst_ip="203.0.113.5",
+            dst_port=8,
+            protocol="icmp",
+            duration=1.0,
+            firewall=FirewallContext(
+                action="permit",
+                msg_id=302020,
+                connection_id=100,
+                src_interface="outside",
+                dst_interface="inside",
+            ),
+            nat=NatContext(
+                nat_type="static",
+                mapped_src_ip="198.51.100.25",
+                mapped_src_port=0,
+                mapped_dst_ip="10.0.20.5",
+                mapped_dst_port=8,
+            ),
+        )
+        event.network_observations = (
+            NetworkSensorObservation(
+                sensor_identity="fw01",
+                path_role="destination_side",
+                capture_profile="well_synced",
+                tuple_view=NetworkTuple(
+                    src_ip="198.51.100.25",
+                    src_port=0,
+                    dst_ip="203.0.113.5",
+                    dst_port=8,
+                    protocol="icmp",
+                ),
+                connection_uid="CInboundIcmp1",
+                connection_ids=(),
+                file_ids=(),
+                local_orig=False,
+                local_resp=True,
+                observed_start_time=T0,
+                observed_close_time=T0 + timedelta(seconds=1),
+                traffic=NetworkTrafficLedger(),
+                visible_formats=frozenset({"cisco_asa"}),
+                firewall_teardown_time=T0 + timedelta(seconds=1),
+                nat=NatSensorObservation(
+                    nat_type="static",
+                    direction="destination",
+                    local_ip="10.0.20.5",
+                    local_port=8,
+                    global_ip="203.0.113.5",
+                    global_port=8,
+                    built_time=T0,
+                    teardown_time=None,
+                ),
+            ),
+        )
+        event.network_observations_planned = True
+
+        asa_emitter.emit(event)
+        asa_emitter.flush()
+
+        lines = self._get_output_lines(tmp_path)
+        lifecycle = [line for line in lines if "302020" in line or "302021" in line]
+        assert len(lifecycle) == 2
+        assert all("gaddr 203.0.113.5/0 laddr 10.0.20.5/0" in line for line in lifecycle)
+
+    def test_planned_dynamic_pat_tears_down_with_syn_timeout(
+        self,
+        asa_emitter,
+        tmp_path,
+    ):
+        """ASA connection and PAT records consume the same planned close time."""
+
+        event = self._make_nat_event()
+        event.network = replace(
+            event.network,
+            duration=None,
+            closed_at=None,
+            phase_times=(("transport_start", event.network.started_at),),
+            conn_state="S0",
+            traffic=NetworkTrafficLedger(),
+        )
+        event.network_observations = (
+            NetworkSensorObservation(
+                sensor_identity="fw01",
+                path_role="source_side",
+                capture_profile="well_synced",
+                tuple_view=NetworkTuple(
+                    src_ip="10.0.10.50",
+                    src_port=54321,
+                    dst_ip="203.0.113.50",
+                    dst_port=443,
+                    protocol="tcp",
+                ),
+                connection_uid="CNatTimeout1",
+                connection_ids=(),
+                file_ids=(),
+                local_orig=True,
+                local_resp=False,
+                observed_start_time=T0,
+                observed_close_time=None,
+                traffic=NetworkTrafficLedger(),
+                visible_formats=frozenset({"cisco_asa"}),
+                firewall_teardown_reason="SYN Timeout",
+                firewall_teardown_time=T0 + timedelta(seconds=30),
+                nat=NatSensorObservation(
+                    nat_type="dynamic_pat",
+                    direction="source",
+                    local_ip="10.0.10.50",
+                    local_port=54321,
+                    global_ip="198.51.100.1",
+                    global_port=12345,
+                    built_time=T0,
+                    teardown_time=T0 + timedelta(seconds=30),
+                ),
+            ),
+        )
+        event.network_observations_planned = True
+
+        asa_emitter.emit(event)
+        asa_emitter.flush()
+
+        lines = self._get_output_lines(tmp_path)
+        connection_teardown = next(line for line in lines if "302014" in line)
+        nat_teardown = next(line for line in lines if "305012" in line)
+        assert "duration 0:00:30" in connection_teardown
+        assert "duration 0:00:30" in nat_teardown
+
     def test_syn_timeout_teardown_duration_is_realistic(self, asa_emitter, tmp_path):
         """SYN Timeout teardown rows should not all render as zero-second waits."""
         event = _make_connection_event(
@@ -1148,4 +1530,39 @@ class TestNatRecords:
         teardown_ts = datetime.strptime(teardown[5:20], "%b %d %H:%M:%S").replace(year=2024)
         match = re.search(r"duration 0:00:(\d{2})", teardown)
         assert match is not None
+        assert int(match.group(1)) == 30
         assert int((teardown_ts - built_ts).total_seconds()) == int(match.group(1))
+
+    def test_syn_timeout_releases_dynamic_translation_after_connection(
+        self,
+        asa_emitter,
+        tmp_path,
+    ):
+        """A zero-duration S0 flow must retain its xlate until the SYN timeout."""
+        event = self._make_nat_event()
+        event = replace(
+            event,
+            network=replace(
+                event.network,
+                conn_state="S0",
+                duration=0.0,
+                closed_at=event.network.started_at,
+                traffic=NetworkTrafficLedger(
+                    orig=DirectionalTrafficLedger(0, 0, 0),
+                    resp=DirectionalTrafficLedger(0, 0, 0),
+                ),
+            ),
+        )
+        asa_emitter.emit(event)
+        asa_emitter.flush()
+
+        lines = self._get_output_lines(tmp_path)
+        message_ids = [
+            line.split("%ASA-6-", maxsplit=1)[1].split(":", maxsplit=1)[0] for line in lines
+        ]
+        assert message_ids == ["305011", "302013", "302014", "305012"]
+        teardown = next(line for line in lines if "302014" in line)
+        release = next(line for line in lines if "305012" in line)
+        assert teardown[5:20] == release[5:20]
+        assert "duration 0:00:30" in teardown
+        assert "duration 0:00:30" in release

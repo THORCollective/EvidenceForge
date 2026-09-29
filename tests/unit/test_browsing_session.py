@@ -239,7 +239,7 @@ class TestBrowserSessionActionBundle:
                 src_ip="10.0.10.50",
                 dst_ip="142.250.80.46",
                 time=base_time,
-                latest_request_time=base_time + timedelta(milliseconds=550),
+                latest_request_time=base_time + timedelta(milliseconds=100),
                 hostname="www.google.com",
                 dst_port=443,
                 service="ssl",
@@ -527,7 +527,10 @@ class TestResponseSizes:
         js_reqs = [r for r in requests if r.content_type == "application/javascript"]
         if js_reqs:
             for r in js_reqs:
-                assert 10_000 <= r.response_body_len <= 200_000
+                if r.status_code == 304:
+                    assert r.response_body_len == 0
+                else:
+                    assert 10_000 <= r.response_body_len <= 200_000
 
     def test_favicon_is_small(self):
         rng = random.Random(42)

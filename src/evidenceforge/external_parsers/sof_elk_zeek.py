@@ -49,7 +49,7 @@ from evidenceforge.external_parsers.tag_policy import (
 )
 
 SOF_ELK_REPO_URL = "https://github.com/philhagen/sof-elk.git"
-SOF_ELK_COMMIT = "517af9445574cc084cd5f4b80539fc244dab82b0"
+SOF_ELK_COMMIT = "d9f9bdd113a606c7b3fa1b2eafaa2d4400a16668"
 FILEBEAT_IMAGE = "docker.elastic.co/beats/filebeat-oss:9.4.1"
 LOGSTASH_IMAGE = "docker.elastic.co/logstash/logstash-oss:9.4.1"
 HARNESS_CONTAINER_LABEL = "evidenceforge.external_parser=sof-elk-zeek"
@@ -165,6 +165,18 @@ ZEEK_LOG_SPECS: tuple[ZeekLogSpec, ...] = (
         ),
         sof_elk_dedicated_filter=True,
         sof_elk_filebeat_input=True,
+    ),
+    ZeekLogSpec(
+        log_type="zeek_smb_mapping",
+        staged_name="smb_mapping.log",
+        source_names=("smb_mapping.json", "zeek_smb_mapping.json"),
+        required_paths=GENERIC_JSON_REQUIRED_PATHS,
+    ),
+    ZeekLogSpec(
+        log_type="zeek_smb_files",
+        staged_name="smb_files.log",
+        source_names=("smb_files.json", "zeek_smb_files.json"),
+        required_paths=GENERIC_JSON_REQUIRED_PATHS,
     ),
     ZeekLogSpec(
         log_type="zeek_ssl",

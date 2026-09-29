@@ -156,6 +156,7 @@ fields:
   - name: process.team_id
     type: string
     required: false
+    nullable: true
     description: "Acting process Apple Developer Team ID (null for platform and ad-hoc code)"
 
   - name: process.executable.path
@@ -281,6 +282,7 @@ fields:
   - name: event.exec.target.team_id
     type: string
     required: false
+    nullable: true
     description: "Exec target (new image) Apple Developer Team ID (null for platform and ad-hoc code)"
 
   - name: event.exec.target.executable.path
@@ -630,3 +632,276 @@ output:
   # Template not used — ESLoggerEmitter builds NDJSON directly in Python.
   # Kept as an empty placeholder for format loader compatibility.
   template: "{}"
+
+# Typed record contracts; evaluated after scalar validation. event_type values
+# are Apple es_event_type_t codes (see ESLoggerEmitter._ES_EVENT_TYPE_CODES).
+validators:
+- id: eslogger.record-1
+  message: All eslogger records have envelope fields
+  severity: warning
+  when: []
+  checks:
+  - op: presence
+    field: schema_version
+    present: true
+  - op: presence
+    field: time
+    present: true
+  - op: presence
+    field: mach_time
+    present: true
+  - op: presence
+    field: seq_num
+    present: true
+  - op: presence
+    field: global_seq_num
+    present: true
+  - op: presence
+    field: event_type
+    present: true
+  - op: presence
+    field: version
+    present: true
+  - op: presence
+    field: thread.thread_id
+    present: true
+  - op: presence
+    field: process.audit_token.pid
+    present: true
+- id: eslogger.record-2
+  message: exec has argv
+  severity: warning
+  when:
+  - op: compare
+    field: event_type
+    relation: eq
+    value: 9
+  checks:
+  - op: presence
+    field: event.exec.args
+    present: true
+- id: eslogger.record-3
+  message: exec target has code-signing identity
+  severity: warning
+  when:
+  - op: compare
+    field: event_type
+    relation: eq
+    value: 9
+  checks:
+  - op: presence
+    field: event.exec.target.signing_id
+    present: true
+  - op: presence
+    field: event.exec.target.cdhash
+    present: true
+  - op: presence
+    field: event.exec.target.is_platform_binary
+    present: true
+  - op: presence
+    field: event.exec.target.audit_token.pid
+    present: true
+- id: eslogger.record-4
+  message: fork has child process identity
+  severity: warning
+  when:
+  - op: compare
+    field: event_type
+    relation: eq
+    value: 11
+  checks:
+  - op: presence
+    field: event.fork.child.audit_token.pid
+    present: true
+  - op: presence
+    field: event.fork.child.audit_token.pidversion
+    present: true
+- id: eslogger.record-5
+  message: exit has pid/pidversion
+  severity: warning
+  when:
+  - op: compare
+    field: event_type
+    relation: eq
+    value: 15
+  checks:
+  - op: presence
+    field: process.audit_token.pid
+    present: true
+  - op: presence
+    field: process.audit_token.pidversion
+    present: true
+- id: eslogger.record-6
+  message: file create has destination path
+  severity: warning
+  when:
+  - op: compare
+    field: event_type
+    relation: eq
+    value: 13
+  checks:
+  - op: presence
+    field: event.create.destination.existing_file.path
+    present: true
+- id: eslogger.record-7
+  message: file open has file path
+  severity: warning
+  when:
+  - op: compare
+    field: event_type
+    relation: eq
+    value: 10
+  checks:
+  - op: presence
+    field: event.open.file.path
+    present: true
+- id: eslogger.record-8
+  message: file write has target path
+  severity: warning
+  when:
+  - op: compare
+    field: event_type
+    relation: eq
+    value: 33
+  checks:
+  - op: presence
+    field: event.write.target.path
+    present: true
+- id: eslogger.record-9
+  message: file rename has source path
+  severity: warning
+  when:
+  - op: compare
+    field: event_type
+    relation: eq
+    value: 25
+  checks:
+  - op: presence
+    field: event.rename.source.path
+    present: true
+- id: eslogger.record-10
+  message: file unlink has target path
+  severity: warning
+  when:
+  - op: compare
+    field: event_type
+    relation: eq
+    value: 32
+  checks:
+  - op: presence
+    field: event.unlink.target.path
+    present: true
+- id: eslogger.record-11
+  message: btm_launch_item_add has launch item identity
+  severity: warning
+  when:
+  - op: compare
+    field: event_type
+    relation: eq
+    value: 124
+  checks:
+  - op: presence
+    field: event.btm_launch_item_add.item.item_url
+    present: true
+  - op: presence
+    field: event.btm_launch_item_add.item.item_type
+    present: true
+  - op: presence
+    field: event.btm_launch_item_add.executable_path
+    present: true
+- id: eslogger.record-12
+  message: openssh_login has username and source address
+  severity: warning
+  when:
+  - op: compare
+    field: event_type
+    relation: eq
+    value: 120
+  checks:
+  - op: presence
+    field: event.openssh_login.username
+    present: true
+  - op: presence
+    field: event.openssh_login.source_address
+    present: true
+- id: eslogger.record-13
+  message: openssh_logout has username and source address
+  severity: warning
+  when:
+  - op: compare
+    field: event_type
+    relation: eq
+    value: 121
+  checks:
+  - op: presence
+    field: event.openssh_logout.username
+    present: true
+  - op: presence
+    field: event.openssh_logout.source_address
+    present: true
+- id: eslogger.record-14
+  message: lw_session_lock has username and graphical session id
+  severity: warning
+  when:
+  - op: compare
+    field: event_type
+    relation: eq
+    value: 116
+  checks:
+  - op: presence
+    field: event.lw_session_lock.username
+    present: true
+  - op: presence
+    field: event.lw_session_lock.graphical_session_id
+    present: true
+- id: eslogger.record-15
+  message: lw_session_unlock has username and graphical session id
+  severity: warning
+  when:
+  - op: compare
+    field: event_type
+    relation: eq
+    value: 117
+  checks:
+  - op: presence
+    field: event.lw_session_unlock.username
+    present: true
+  - op: presence
+    field: event.lw_session_unlock.graphical_session_id
+    present: true
+- id: eslogger.record-16
+  message: sudo has elevation subject/target
+  severity: warning
+  when:
+  - op: compare
+    field: event_type
+    relation: eq
+    value: 131
+  checks:
+  - op: presence
+    field: event.sudo.from_username
+    present: true
+  - op: presence
+    field: event.sudo.to_username
+    present: true
+  - op: presence
+    field: event.sudo.success
+    present: true
+- id: eslogger.record-17
+  message: su has elevation subject/target
+  severity: warning
+  when:
+  - op: compare
+    field: event_type
+    relation: eq
+    value: 128
+  checks:
+  - op: presence
+    field: event.su.from_username
+    present: true
+  - op: presence
+    field: event.su.to_username
+    present: true
+  - op: presence
+    field: event.su.success
+    present: true

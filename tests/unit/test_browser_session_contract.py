@@ -26,12 +26,13 @@ import random
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-from evidenceforge.events.base import SecurityEvent
+from evidenceforge.events.base import CanonicalOccurrence
 from evidenceforge.events.contexts import HttpContext
 from evidenceforge.events.dispatcher import EventDispatcher
 from evidenceforge.generation.actions.browser_session import (
     BrowserSessionActionBundle,
     BrowserSessionRequest,
+    _plan_http_request_groups,
 )
 from evidenceforge.generation.activity import ActivityGenerator
 from evidenceforge.generation.activity.browsing_session import BrowsingRequest
@@ -42,16 +43,16 @@ from evidenceforge.models import System
 class _CollectorEmitter:
     """Minimal emitter that records events matching a predicate."""
 
-    def __init__(self, predicate: Callable[[SecurityEvent], bool]) -> None:
+    def __init__(self, predicate: Callable[[CanonicalOccurrence], bool]) -> None:
         self._predicate = predicate
-        self.events: list[SecurityEvent] = []
+        self.events: list[CanonicalOccurrence] = []
 
-    def can_handle(self, event: SecurityEvent) -> bool:
+    def can_handle(self, event: CanonicalOccurrence) -> bool:
         """Return whether this collector should record the event."""
 
         return self._predicate(event)
 
-    def emit(self, event: SecurityEvent) -> None:
+    def emit(self, event: CanonicalOccurrence) -> None:
         """Record one event."""
 
         self.events.append(event)
@@ -73,10 +74,12 @@ def _activity_generator_with_collectors() -> tuple[
         )
     )
     http_emitter = _CollectorEmitter(
-        lambda event: event.event_type == "connection" and event.http is not None
+        lambda event: event.event_type == "connection" and event.protocol.http is not None
     )
     files_emitter = _CollectorEmitter(
-        lambda event: event.event_type == "connection" and event.file_transfer is not None
+        lambda event: (
+            event.event_type == "connection" and event.protocol.primary_file_transfer is not None
+        )
     )
     emitters = {
         "zeek_conn": conn_emitter,
@@ -169,7 +172,40 @@ def test_browser_session_reuses_parent_http_uid_for_same_host_subresources(monke
     assert first_http.network.zeek_uid == second_http.network.zeek_uid
     assert second_http.network.src_port == first_http.network.src_port
     assert second_http.network.application_layer_only is True
-    assert [event.http.trans_depth for event in http_emitter.events] == [1, 2]
+    assert [event.protocol.http.trans_depth for event in http_emitter.events] == [1, 2]
+    request_gap = (second_http.timestamp - first_http.timestamp).total_seconds()
+    assert request_gap != 0.6
+
+
+def test_http_request_group_spacing_has_no_fixed_six_hundred_ms_atom() -> None:
+    """Persistent child requests use lifecycle-scoped response-aware spacing."""
+
+    requests = [
+        BrowsingRequest(
+            time_offset_ms=0,
+            hostname="portal.example.com",
+            path=f"/assets/{index}.js",
+            method="GET",
+            content_type="application/javascript",
+            referrer="http://portal.example.com/",
+            trans_depth=index + 1,
+            is_page_load=index == 0,
+            response_body_len=1_000 * (index + 1),
+            request_body_len=0,
+            status_code=200,
+        )
+        for index in range(8)
+    ]
+
+    plan, _groups = _plan_http_request_groups(
+        requests,
+        stable_id="browser-session-spacing-test",
+    )
+    offsets = [plan[index][3] for index in range(len(requests))]
+    gaps = [later - earlier for earlier, later in zip(offsets, offsets[1:], strict=False)]
+    assert all(gap > 120_000 for gap in gaps)
+    assert 600_000 not in gaps
+    assert len(set(gaps)) == len(gaps)
 
 
 def test_caller_http_large_download_attaches_zeek_file_transfer():
@@ -210,12 +246,77 @@ def test_caller_http_large_download_attaches_zeek_file_transfer():
     assert len(http_emitter.events) == 1
     assert len(files_emitter.events) == 1
     event = http_emitter.events[0]
-    assert event is files_emitter.events[0]
-    assert event.file_transfer is not None
-    assert event.file_transfer.source == "HTTP"
-    assert event.file_transfer.mime_type == "application/x-msdownload"
-    assert event.file_transfer.analyzers == ["SHA1"]
-    assert event.file_transfer.sha1
-    assert event.file_transfer.seen_bytes == response_body_len
-    assert event.http.resp_fuids == [event.file_transfer.fuid]
-    assert event.http.resp_mime_types == [event.file_transfer.mime_type]
+    assert event.occurrence_id == files_emitter.events[0].occurrence_id
+    assert event.protocol == files_emitter.events[0].protocol
+    assert event.protocol.primary_file_transfer is not None
+    assert event.protocol.primary_file_transfer.source == "HTTP"
+    assert event.protocol.primary_file_transfer.mime_type == "application/x-msdownload"
+    assert event.protocol.primary_file_transfer.analyzers == ("SHA1",)
+    assert event.protocol.primary_file_transfer.sha1
+    assert event.protocol.primary_file_transfer.seen_bytes == response_body_len
+    assert event.protocol.http.resp_fuids == (event.protocol.primary_file_transfer.fuid,)
+    assert event.protocol.http.resp_mime_types == (event.protocol.primary_file_transfer.mime_type,)
+
+
+def test_background_browser_post_attaches_anonymous_originator_file(monkeypatch):
+    """Generated browser form bodies receive files.log analysis without local-file metadata."""
+
+    def fake_browsing_session(**_kwargs) -> list[BrowsingRequest]:
+        return [
+            BrowsingRequest(
+                time_offset_ms=0,
+                hostname="portal.example.com",
+                path="/session/preferences",
+                method="POST",
+                content_type="application/json",
+                referrer="http://portal.example.com/",
+                trans_depth=1,
+                is_page_load=True,
+                response_body_len=512,
+                request_body_len=287,
+                status_code=204,
+            )
+        ]
+
+    monkeypatch.setattr(
+        "evidenceforge.generation.actions.browser_session."
+        "browsing_session.generate_browsing_session",
+        fake_browsing_session,
+    )
+    generator, state_manager, _conn_emitter, http_emitter, files_emitter = (
+        _activity_generator_with_collectors()
+    )
+    timestamp = datetime(2026, 2, 22, 12, 32, 37, tzinfo=UTC)
+    source = System(
+        hostname="WS-01",
+        ip="10.0.0.5",
+        os="Windows 11",
+        type="workstation",
+    )
+    state_manager.set_current_time(timestamp)
+
+    BrowserSessionActionBundle(
+        request=BrowserSessionRequest(
+            src_ip=source.ip,
+            dst_ip="93.184.216.34",
+            time=timestamp,
+            hostname="portal.example.com",
+            dst_port=80,
+            service="http",
+            source_system=source,
+            user_agent="Mozilla/5.0",
+            emit_dns_on_page_load=False,
+        ),
+        executor=generator,
+        rng=random.Random(9),
+    ).execute()
+
+    http = http_emitter.events[0].protocol.http
+    request_file = next(
+        ft for event in files_emitter.events for ft in event.protocol.file_transfers if ft.is_orig
+    )
+    assert http.request_body_len == 287
+    assert http.orig_fuids == (request_file.fuid,)
+    assert request_file.total_bytes == 287
+    assert request_file.mime_type == "application/x-www-form-urlencoded"
+    assert request_file.filename == ""
