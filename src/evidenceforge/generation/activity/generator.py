@@ -400,7 +400,13 @@ from evidenceforge.utils.paths import write_exclusive_child_stream
 from evidenceforge.utils.rng import _stable_seed, stable_hex_digest, stable_uuid
 from evidenceforge.utils.time import ensure_utc
 
-from .helpers import _get_os_category, _get_rng, _parameterize_command
+from .helpers import (
+    _get_os_category,
+    _get_rng,
+    _parameterize_command,
+    ssh_receiver_command_line,
+    ssh_receiver_parent_role,
+)
 from .network import (
     _AD_SRV_QUERIES,
     _IPV6_MAP,
@@ -2625,8 +2631,18 @@ def _dns_cache_window(value: object) -> tuple[float, float]:
     return 0.0, 0.0
 
 
-def _dns_nxdomain_companion_queries(hostname: str | None, ad_domain: str) -> list[str]:
-    """Return realistic low-volume resolver miss probes for DNS companion noise."""
+def _dns_nxdomain_companion_queries(
+    hostname: str | None, ad_domain: str, os_category: str = ""
+) -> list[str]:
+    """Return realistic low-volume resolver miss probes for DNS companion noise.
+
+    The WPAD/ISATAP probes and primary-suffix devolution of qualified names are
+    Windows resolver behavior. macOS only appends search domains to single-label
+    names, has no ISATAP, leaves WPAD off by default, and resolves ``.local`` over
+    mDNS rather than unicast DNS, so a Mac only misses on stale internal names.
+    """
+    if os_category == "macos":
+        return [f"oldserver.{ad_domain}", f"printer01.{ad_domain}"]
     suffix_queries: list[str] = []
     if (
         hostname
@@ -7534,7 +7550,9 @@ class ActivityGenerator:
             # GVFS, smbclient, and kernel CIFS transports below.
             return 4 if os_category == "windows" else -1
         elif service_name == "ssh" or dst_port == 22:
-            if os_category == "linux":
+            # An outbound SSH client is a user process (ssh/scp), never the
+            # destination-side sshd; POSIX hosts resolve it as a client owner.
+            if os_category in ("linux", "macos"):
                 return -1
             candidates = ["sshd"]
         elif "forward_proxy" in roles and service_name in ("http", "ssl"):
@@ -15673,10 +15691,30 @@ class ActivityGenerator:
                 default=None,
             )
             if child_close_frontier is not None:
-                terminate_at = max(
-                    ensure_utc(terminate_at),
-                    ensure_utc(child_close_frontier) + timedelta(microseconds=1),
-                )
+                after_child = ensure_utc(child_close_frontier) + timedelta(microseconds=1)
+                if os_category == "macos":
+                    # A parent reaps its child and exits a fraction of a
+                    # millisecond to a few ms later, not in the same microsecond.
+                    reap_at = ensure_utc(child_close_frontier) + timedelta(
+                        microseconds=150
+                        + _stable_seed(
+                            f"macos_parent_reap_gap:{session.system}:{identity.pid}:"
+                            f"{identity.started_at.isoformat()}"
+                        )
+                        % 2850
+                    )
+                    latest_allowed = min(
+                        (
+                            bound
+                            for bound in (authoritative_latest_allowed, ssh_clamp_latest_allowed)
+                            if bound is not None
+                        ),
+                        default=None,
+                    )
+                    if latest_allowed is not None and reap_at > latest_allowed:
+                        reap_at = max(after_child, latest_allowed)
+                    after_child = reap_at
+                terminate_at = max(ensure_utc(terminate_at), after_child)
 
             visible_create_delta: _FrozenActivityTimingDelta | None = None
             if os_category == "windows" and not authoritative:
@@ -17834,7 +17872,8 @@ class ActivityGenerator:
 
         if kind == "ssh":
             sys_pids = getattr(self, "_system_pids", {}).get(target_system.hostname, {})
-            global_sshd = int(sys_pids.get("sshd", 0) or 0)
+            target_os = _get_os_category(target_system.os)
+            global_sshd = int(sys_pids.get(ssh_receiver_parent_role(target_os), 0) or 0)
             parent_pid = (
                 global_sshd
                 if global_sshd > 0
@@ -17852,10 +17891,10 @@ class ActivityGenerator:
                 system=target_system.hostname,
                 parent_pid=parent_pid,
                 image="/usr/sbin/sshd",
-                command_line=f"sshd: {process_user} [priv]",
+                command_line=ssh_receiver_command_line(target_os, process_user),
                 username="root",
                 integrity_level="System",
-                os_category="linux",
+                os_category="macos" if target_os == "macos" else "linux",
                 logon_id="0x3e7",
                 lifecycle_group_id=stable_uuid(
                     "network-ssh-responder-process",
@@ -18131,7 +18170,8 @@ class ActivityGenerator:
                 return remembered
 
         sys_pids = getattr(self, "_system_pids", {}).get(target_system.hostname, {})
-        global_sshd = sys_pids.get("sshd")
+        target_os = _get_os_category(target_system.os)
+        global_sshd = sys_pids.get(ssh_receiver_parent_role(target_os))
         parent_pid = (
             global_sshd
             if global_sshd
@@ -18148,7 +18188,7 @@ class ActivityGenerator:
             system=target_system,
             time=time + timedelta(milliseconds=8 + (sshd_seed % 72)),
             process_name="/usr/sbin/sshd",
-            command_line=f"sshd: {process_user} [priv]",
+            command_line=ssh_receiver_command_line(target_os, process_user),
             parent_pid=parent_pid,
             username="root",
             emit_linux_syslog=False,
@@ -24592,7 +24632,8 @@ class ActivityGenerator:
                     )
 
         sys_pids = getattr(self, "_system_pids", {}).get(target_system.hostname, {})
-        global_sshd = sys_pids.get("sshd")
+        target_os = _get_os_category(target_system.os)
+        global_sshd = sys_pids.get(ssh_receiver_parent_role(target_os))
         if (
             not global_sshd
             or self.state_manager.get_process(target_system.hostname, global_sshd) is None
@@ -24642,7 +24683,7 @@ class ActivityGenerator:
                 system=target_system,
                 time=sshd_time,
                 process_name="/usr/sbin/sshd",
-                command_line=f"sshd: {user.username} [priv]",
+                command_line=ssh_receiver_command_line(target_os, user.username),
                 parent_pid=global_sshd,
                 username="root",
                 emit_linux_syslog=False,
@@ -27076,7 +27117,11 @@ class ActivityGenerator:
         # Occasional resolver search-suffix mistakes/background discovery probes.
         # Keep this low-volume and avoid doubling an already-qualified internal name.
         if rng.random() < 0.05:
-            nxdomain_queries = _dns_nxdomain_companion_queries(hostname, ad_domain)
+            nxdomain_queries = _dns_nxdomain_companion_queries(
+                hostname,
+                ad_domain,
+                _get_os_category(src_system.os) if src_system is not None else "",
+            )
             nx_query = rng.choice(nxdomain_queries)
             nx_lead_ms = self._sample_dns_timing_milliseconds(
                 relationship_key="activity.dns.nxdomain_before_query",

@@ -74,7 +74,12 @@ from evidenceforge.generation.actions.network_connection import (
     DeferredSshTimingIntent,
     NetworkConnectionIdentityCapture,
 )
-from evidenceforge.generation.activity.helpers import _get_os_category, _get_rng
+from evidenceforge.generation.activity.helpers import (
+    _get_os_category,
+    _get_rng,
+    ssh_receiver_command_line,
+    ssh_receiver_parent_role,
+)
 from evidenceforge.generation.activity.timing_profiles import (
     SshAuthenticationTimingPlan,
     get_timing_window,
@@ -3231,11 +3236,17 @@ class SshSessionActionBundle:
         return runtime
 
     def _deferred_receiver_parent(self, receiver_start: datetime) -> tuple[int, str]:
-        """Resolve the live canonical global sshd parent, when one exists."""
+        """Resolve the live canonical parent of the per-connection sshd, when one exists.
+
+        Linux forks connections from the global ``sshd -D`` listener; macOS launchd
+        socket-activates ``sshd -i`` per connection.
+        """
 
         hostname = self.request.target_system.hostname
+        role = ssh_receiver_parent_role(_get_os_category(self.request.target_system.os))
+        expected_image = "/sbin/launchd" if role == "launchd" else "/usr/sbin/sshd"
         sys_pids = getattr(self.executor, "_system_pids", {}).get(hostname, {})
-        parent_pid = sys_pids.get("sshd")
+        parent_pid = sys_pids.get(role)
         if type(parent_pid) is not int or parent_pid <= 0:
             return 0, ""
         running = self.executor.state_manager.get_process(hostname, parent_pid)
@@ -3246,7 +3257,7 @@ class SshSessionActionBundle:
             or identity.object_id != running.ecar_object_id
             or identity.started_at != ensure_utc(running.start_time)
             or identity.started_at > ensure_utc(receiver_start)
-            or identity.image != "/usr/sbin/sshd"
+            or identity.image != expected_image
             or identity.principal.casefold() != "root"
         ):
             return 0, ""
@@ -3766,15 +3777,16 @@ class SshSessionActionBundle:
             rng=logind_rng,
             event_time=logind_time,
         )
+        target_os = _get_os_category(request.target_system.os)
         receiver_parent_pid, receiver_parent_group = self._deferred_receiver_parent(receiver_start)
         receiver_plan = batch_builder.plan_process(
             system=request.target_system.hostname,
             parent_pid=receiver_parent_pid,
             image="/usr/sbin/sshd",
-            command_line=f"sshd: {request.user.username} [priv]",
+            command_line=ssh_receiver_command_line(target_os, request.user.username),
             username="root",
             integrity_level="System",
-            os_category="linux",
+            os_category="macos" if target_os == "macos" else "linux",
             logon_id=session_plan.identity.logon_id,
             lifecycle_group_id=stable_uuid(
                 "ssh-deferred-receiver-lifecycle",

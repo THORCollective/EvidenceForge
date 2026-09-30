@@ -28,7 +28,7 @@ field values, types, and envelope fields.
 """
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -95,6 +95,10 @@ def _rows(emitter, event):
     finally:
         emitter.emit_event = original
     return [json.loads(emitter._render_event(ed)) for ed in captured]
+
+
+def _event_name(row: dict) -> str:
+    return next(iter(row["event"]))
 
 
 class TestCanHandle:
@@ -371,7 +375,7 @@ class TestSshSessions:
             dst_host=mac_host,
             auth=AuthContext(username="alice", source_ip="10.0.0.10", session_id=132500),
         )
-        emitter._openssh_login_sessions.add(("MAC-01", 132500))
+        emitter._openssh_login_sessions[("MAC-01", 132500)] = {}
         rows = _rows(emitter, event)
         assert rows[0]["event_type"] == 121
         logout = rows[0]["event"]["openssh_logout"]
@@ -501,14 +505,37 @@ class TestEnvelope:
         )
         assert ESLoggerEmitter._message_version(host) == version
 
-    def test_seq_numbers_increment(self, emitter, mac_host, ts):
-        proc = ProcessContext(1500, 1, "/usr/bin/osascript", "osascript", "alice", start_time=ts)
-        event = OccurrenceBuilder(
-            timestamp=ts, event_type="process_create", src_host=mac_host, process=proc
+    def test_seq_numbers_are_assigned_per_client_in_time_order(
+        self, emitter, mac_host, ts, tmp_path
+    ):
+        # Dispatched out of time order; the published file is time-ordered with a
+        # contiguous global_seq_num and a per-event-type seq_num.
+        later = ProcessContext(
+            1600,
+            1,
+            "/usr/bin/osascript",
+            "osascript",
+            "alice",
+            start_time=ts + timedelta(seconds=5),
         )
-        rows = _rows(emitter, event)
-        assert [r["seq_num"] for r in rows] == [1, 2]
-        assert [r["global_seq_num"] for r in rows] == [1, 2]
+        earlier = ProcessContext(1500, 1, "/usr/bin/osascript", "osascript", "alice", start_time=ts)
+        for proc in (later, earlier):
+            emitter.emit(
+                OccurrenceBuilder(
+                    timestamp=proc.start_time,
+                    event_type="process_create",
+                    src_host=mac_host,
+                    process=proc,
+                )
+            )
+        emitter.close()
+        path = tmp_path / "MAC-01.corp.local" / "eslogger.ndjson"
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+        assert [r["time"] for r in rows] == sorted(r["time"] for r in rows)
+        assert [_event_name(r) for r in rows] == ["fork", "exec", "fork", "exec"]
+        assert [r["global_seq_num"] for r in rows] == [1, 2, 3, 4]
+        assert [r["seq_num"] for r in rows] == [1, 1, 2, 2]
 
     def test_mach_time_reflects_boot(self, emitter, mac_host, ts):
         proc = ProcessContext(1500, 1, "/usr/bin/osascript", "osascript", "alice", start_time=ts)

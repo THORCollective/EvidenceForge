@@ -31,7 +31,7 @@ per-host-FQDN writer pipeline, not hand-constructed dicts) to prove the parser
 """
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from evidenceforge.evaluation.parsers import ParsedRecord, discover_log_files
@@ -126,7 +126,8 @@ class TestParsesRealEmitterOutput:
 
         # Envelope fields (top-level, no nesting).
         assert exec_record.fields["schema_version"] is not None
-        assert exec_record.fields["seq_num"] == 2
+        # First exec record for this client, delivered after its fork.
+        assert exec_record.fields["seq_num"] == 1
         assert exec_record.fields["global_seq_num"] == 2
 
         # Nested "process.*"/"process.audit_token.*" flattened to dotted keys.
@@ -143,7 +144,10 @@ class TestParsesRealEmitterOutput:
         path = _write_real_eslogger_output(tmp_path)
         parser = ESLoggerParser()
         records = list(parser.parse_file(path))
-        assert all(r.timestamp == T0 for r in records)
+        fork_record, exec_record = records
+        # es_process_t.start_time is the fork; the exec message follows it.
+        assert fork_record.timestamp == T0
+        assert T0 < exec_record.timestamp < T0 + timedelta(milliseconds=1)
 
     def test_file_event_nested_path_flattened(self, tmp_path):
         fd = load_format("eslogger")

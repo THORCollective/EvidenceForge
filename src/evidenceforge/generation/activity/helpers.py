@@ -59,6 +59,27 @@ def _get_os_category(os_string: str) -> str:
         return "unknown"
 
 
+def ssh_receiver_parent_role(os_category: str) -> str:
+    """Return the system-process role that spawns a per-connection sshd.
+
+    Linux runs a persistent ``sshd -D`` listener that forks each connection.
+    macOS Remote Login is a launchd socket (``com.openssh.sshd``, inetd style):
+    launchd starts ``/usr/sbin/sshd -i`` per connection and no listener runs.
+    """
+    return "launchd" if os_category == "macos" else "sshd"
+
+
+def ssh_receiver_command_line(os_category: str, username: str) -> str:
+    """Return the per-connection sshd command line for a target OS.
+
+    On Linux the forked listener child is observed by its proctitle. On macOS the
+    connection's sshd is exec'd by launchd, so exec telemetry carries its argv.
+    """
+    if os_category == "macos":
+        return "/usr/sbin/sshd -i"
+    return f"sshd: {username} [priv]"
+
+
 # General parameterization pools for command-line diversification.
 # Used across all process template categories, not just queries.
 _GENERAL_PARAMS = {

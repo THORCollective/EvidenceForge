@@ -73,7 +73,16 @@ class ExternalSortedLineWriter:
         exact_journal_byte_capacity: int = 4 * 1024 * 1024 * 1024,
         checkpoint_mode: bool = False,
         defer_publication: bool = False,
+        publish_line_transform: Callable[[], Callable[[str], str]] | None = None,
     ) -> None:
+        """Create a writer.
+
+        ``publish_line_transform`` is a factory for a fresh, stateful per-line
+        rewrite applied in final sorted order each time the destination is
+        published (e.g. assigning contiguous sequence numbers). The published file
+        is re-merged on later publishes, so ``sort_key`` must not depend on the
+        fields the transform rewrites, and the transform must overwrite them.
+        """
         if buffer_size <= 0:
             raise ValueError("buffer_size must be positive")
         if buffer_bytes <= 0:
@@ -91,6 +100,7 @@ class ExternalSortedLineWriter:
         self.merge_fan_in = merge_fan_in
         self.event_count = 0
         self._sort_key = sort_key
+        self._publish_line_transform = publish_line_transform
         self._buffer: list[str] = []
         self._buffer_bytes = 0
         self._run_paths: list[Path] = []
@@ -469,7 +479,12 @@ class ExternalSortedLineWriter:
         os.close(descriptor)
         merge_path = Path(raw_merge_path)
         try:
-            self._merge_runs_unlocked(self._run_paths, merge_path)
+            if self._publish_line_transform is None:
+                self._merge_runs_unlocked(self._run_paths, merge_path)
+            else:
+                self._merge_runs_unlocked(
+                    self._run_paths, merge_path, transform=self._publish_line_transform()
+                )
             # Windows FlushFileBuffers requires a writable handle. Keep the
             # existing read-only POSIX flush path unchanged.
             with merge_path.open("r+b" if os.name == "nt" else "rb") as stream:
@@ -679,10 +694,16 @@ class ExternalSortedLineWriter:
             for stream in streams:
                 stream.close()
 
-    def _merge_runs_unlocked(self, paths: Sequence[Path], destination: Path) -> None:
+    def _merge_runs_unlocked(
+        self,
+        paths: Sequence[Path],
+        destination: Path,
+        *,
+        transform: Callable[[str], str] | None = None,
+    ) -> None:
         with destination.open("w", encoding="utf-8", newline="\n") as stream:
             for line in self._iter_merged_lines(paths):
-                stream.write(line)
+                stream.write(transform(line) if transform is not None else line)
                 stream.write("\n")
 
     def _cleanup_spool_unlocked(self) -> None:

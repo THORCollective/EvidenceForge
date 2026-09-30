@@ -47,6 +47,7 @@ from evidenceforge.generation.timing import (
     WeightedDistribution,
 )
 from evidenceforge.models.scenario import Persona, System, User
+from evidenceforge.utils.rng import _stable_seed
 
 from .suspicious_benign_config import pick_suspicious_dns_host, pick_unusual_connection
 
@@ -98,8 +99,13 @@ def _sample_hourly_placement_seconds(
     current_hour: datetime,
     timing_runtime: _SuspiciousBenignTimingRuntime | None,
     timing_ordinal: int,
-) -> int:
-    """Return one owner-audited, order-independent offset inside the current hour."""
+    sub_second: bool = False,
+) -> float:
+    """Return one owner-audited, order-independent offset inside the current hour.
+
+    ``sub_second`` adds a stable fractional second so macOS noise does not land
+    on whole-second timestamps (upstream Windows/Linux placement is unchanged).
+    """
 
     maximum = _HOURLY_PLACEMENT_MAX_SECONDS[pattern]
     runtime = timing_runtime or TimingRuntime.compatibility_default()
@@ -115,7 +121,17 @@ def _sample_hourly_placement_seconds(
         ),
         sample_key="offset_seconds",
     )
-    return int(sampled + 0.5)
+    whole = int(sampled + 0.5)
+    if not sub_second:
+        return whole
+    fraction = (
+        _stable_seed(
+            f"suspicious_benign_subsecond:{pattern}:{hostname}:{current_hour.isoformat()}:"
+            f"{timing_ordinal}"
+        )
+        % 1_000_000
+    )
+    return min(float(maximum), whole + fraction / 1_000_000)
 
 
 def _domain_to_dn(domain: str) -> str:
@@ -286,6 +302,7 @@ def generate_after_hours_admin(
         seconds=_sample_hourly_placement_seconds(
             pattern="after_hours_admin",
             hostname=system.hostname,
+            sub_second=_get_os_category(system) == "macos",
             current_hour=current_hour,
             timing_runtime=timing_runtime,
             timing_ordinal=timing_ordinal,
@@ -332,6 +349,7 @@ def generate_suspicious_cli(
         seconds=_sample_hourly_placement_seconds(
             pattern="suspicious_cli",
             hostname=system.hostname,
+            sub_second=_get_os_category(system) == "macos",
             current_hour=current_hour,
             timing_runtime=timing_runtime,
             timing_ordinal=timing_ordinal,
@@ -383,6 +401,7 @@ def generate_failed_logon_burst(
         seconds=_sample_hourly_placement_seconds(
             pattern="failed_logon_burst",
             hostname=system.hostname,
+            sub_second=_get_os_category(system) == "macos",
             current_hour=current_hour,
             timing_runtime=timing_runtime,
             timing_ordinal=timing_ordinal,
@@ -425,6 +444,7 @@ def generate_service_account_anomaly(
         seconds=_sample_hourly_placement_seconds(
             pattern="service_account_anomaly",
             hostname=system.hostname,
+            sub_second=_get_os_category(system) == "macos",
             current_hour=current_hour,
             timing_runtime=timing_runtime,
             timing_ordinal=timing_ordinal,
@@ -460,6 +480,7 @@ def generate_suspicious_dns(
         seconds=_sample_hourly_placement_seconds(
             pattern="suspicious_dns",
             hostname=system.hostname,
+            sub_second=_get_os_category(system) == "macos",
             current_hour=current_hour,
             timing_runtime=timing_runtime,
             timing_ordinal=timing_ordinal,
@@ -497,6 +518,7 @@ def generate_unusual_outbound(
         seconds=_sample_hourly_placement_seconds(
             pattern="unusual_outbound",
             hostname=system.hostname,
+            sub_second=_get_os_category(system) == "macos",
             current_hour=current_hour,
             timing_runtime=timing_runtime,
             timing_ordinal=timing_ordinal,
@@ -577,6 +599,7 @@ def generate_temp_dir_execution(
         seconds=_sample_hourly_placement_seconds(
             pattern="temp_dir_execution",
             hostname=system.hostname,
+            sub_second=_get_os_category(system) == "macos",
             current_hour=current_hour,
             timing_runtime=timing_runtime,
             timing_ordinal=timing_ordinal,
@@ -656,6 +679,7 @@ def generate_unusual_powershell(
         seconds=_sample_hourly_placement_seconds(
             pattern="unusual_powershell",
             hostname=system.hostname,
+            sub_second=_get_os_category(system) == "macos",
             current_hour=current_hour,
             timing_runtime=timing_runtime,
             timing_ordinal=timing_ordinal,

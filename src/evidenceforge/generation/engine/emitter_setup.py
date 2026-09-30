@@ -1228,9 +1228,9 @@ class EmitterSetupMixin:
             f"{metadata_support}mdworker_shared -s mdworker",
             "_spotlight",
         )
-        # Remote Login (sshd), matching WorldModel's macOS SSH support.
-        add("sshd", "launchd", "/usr/sbin/sshd", "/usr/sbin/sshd -i", "root")
-        add("zsh", "sshd", "/bin/zsh", "-zsh", "root")
+        # No sshd here: Remote Login is a launchd socket, so launchd starts
+        # `sshd -i` per connection (see ssh_receiver_parent_role) and no
+        # listener or root login shell runs between connections.
         return _BootHostSpec(
             hostname=hostname,
             os_category="macos",

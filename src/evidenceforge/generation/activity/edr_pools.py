@@ -1114,6 +1114,11 @@ def select_file_side_effect(
         if exe not in exact and not any(marker in exe for marker in contains):
             if not any(marker in command_lower for marker in command_contains):
                 continue
+        excluded_prefixes = [
+            str(item).lower() for item in profile.get("exclude_command_prefixes", [])
+        ]
+        if any(command_lower.lstrip().startswith(prefix) for prefix in excluded_prefixes):
+            continue
 
         probability = float(profile.get("probability", 1.0))
         if probability <= 0 or rng.random() > probability:

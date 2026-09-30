@@ -45,8 +45,10 @@ macOS network egress is correlated via the host's existing Zeek conn/dns logs
 
 import json
 import logging
+import re
 import shlex
-from datetime import UTC, datetime
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import quote
 
@@ -163,6 +165,48 @@ _LW_SESSION_EVENT_NAMES: dict[str, str] = {
 _SESSION_EVENT_TYPES = {"ssh_session", "logoff", "workstation_locked", "workstation_unlocked"}
 
 
+# Shells that own a controlling terminal when started by login(1) or sshd.
+_TTY_SHELLS = {"zsh", "bash", "sh"}
+
+# Order-dependent envelope fields, rewritten after the per-host time sort.
+_SEQ_FIELDS_RE = re.compile(r'"seq_num":\d+,"global_seq_num":\d+')
+_EVENT_TYPE_RE = re.compile(r'"event_type":(\d+)')
+_TIME_RE = re.compile(r'"time":"([^"]+)"')
+
+
+def _eslogger_sort_key(line: str) -> tuple[str, str]:
+    """Order one host's records by message time.
+
+    Ties break on the record with its sequence fields removed, so the key never
+    depends on the numbers the publish transform assigns.
+    """
+    match = _TIME_RE.search(line)
+    return (match.group(1) if match else "", _SEQ_FIELDS_RE.sub("", line, count=1))
+
+
+def _es_client_sequence_numbering() -> Callable[[str], str]:
+    """Return a fresh numbering pass for one ES client's time-ordered records.
+
+    A Mac's eslogger client numbers messages in delivery order: ``global_seq_num``
+    is contiguous across every event type, and ``seq_num`` is contiguous per
+    ``event_type`` (ESMessage.h). Gaps would signal dropped messages.
+    """
+    per_type: dict[str, int] = {}
+    total = 0
+
+    def number(line: str) -> str:
+        nonlocal total
+        match = _EVENT_TYPE_RE.search(line)
+        event_type = match.group(1) if match else ""
+        per_type[event_type] = per_type.get(event_type, 0) + 1
+        total += 1
+        return _SEQ_FIELDS_RE.sub(
+            f'"seq_num":{per_type[event_type]},"global_seq_num":{total}', line, count=1
+        )
+
+    return number
+
+
 def _nest_dotted_fields(fields: dict[str, Any]) -> dict[str, Any]:
     """Rebuild a nested ES record from dotted field names (``a.b.c`` -> ``{a: {b: {c}}}``)."""
     record: dict[str, Any] = {}
@@ -190,6 +234,12 @@ class ESLoggerEmitter(HostMultiplexEmitter):
     """
 
     _log_filename = "eslogger.ndjson"
+    # eslogger writes messages in delivery order, so each host's file is sorted
+    # by message time and numbered after the sort (see _es_client_sequence_numbering).
+    _sort_flat_file = True
+    _sort_key = staticmethod(_eslogger_sort_key)
+    _defer_sorted_flush_until_close = True
+    _external_sorting = True
 
     _supported_types: set[str] = {
         "process_create",
@@ -209,18 +259,17 @@ class ESLoggerEmitter(HostMultiplexEmitter):
     }
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        """Initialize per-host and global record sequence counters."""
+        """Initialize the rendered-SSH-login registry."""
         super().__init__(*args, **kwargs)
-        # Format-native ordering counters (not shared StateManager truth): a
-        # per-host seq_num and a run-global global_seq_num, incremented once per
-        # emitted record in the single writer/consumer thread.  Determinism
-        # follows from the single-producer/single-consumer FIFO dispatch path.
-        self._seq_by_host: dict[str, int] = {}
-        self._global_seq: int = 0
-        # (hostname, audit_session_id) of every SSH session for which this
-        # emitter rendered an `openssh_login`. An `openssh_logout` is only
-        # rendered for a session in this set — see can_handle() for why.
-        self._openssh_login_sessions: set[tuple[str, int]] = set()
+        # (hostname, audit_session_id) -> the connection's sshd process object,
+        # for every SSH session whose `openssh_login` this emitter rendered. An
+        # `openssh_logout` renders only for a session in this map (see
+        # can_handle()) and is reported by the same sshd.
+        self._openssh_login_sessions: dict[tuple[str, int], dict[str, Any]] = {}
+
+    def _publish_line_transform_factory(self) -> Callable[[], Callable[[str], str]] | None:
+        """Assign ES client sequence numbers in each host file's final time order."""
+        return _es_client_sequence_numbering
 
     # ------------------------------------------------------------------
     # Dispatch / selection
@@ -293,23 +342,27 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         self.emit_event({"_host_fqdn": self._host_fqdn(host), "_record": record})
 
     def _render_event(self, event_data: dict[str, Any]) -> str:
-        """Assign sequence numbers and serialize the record to one NDJSON line.
+        """Serialize one record to an NDJSON line.
 
-        Called once per record in the single writer/consumer thread, so the
-        counter increments are ordering-stable and deterministic.
+        Sequence numbers are placeholders here; the writer assigns them after
+        sorting the host's records by time (_es_client_sequence_numbering).
         """
         if "_record" in event_data:
-            record = event_data["_record"]
-            host_fqdn = event_data.get("_host_fqdn", "")
-        else:
-            # Raw/native escape hatch: a flat dotted-field record (the parser's
-            # view) is nested back into the ES message shape.
-            record = _nest_dotted_fields(event_data)
-            host_fqdn = str(event_data.get("_host_fqdn", ""))
-        self._seq_by_host[host_fqdn] = self._seq_by_host.get(host_fqdn, 0) + 1
-        record["seq_num"] = self._seq_by_host[host_fqdn]
-        self._global_seq += 1
-        record["global_seq_num"] = self._global_seq
+            # _envelope() already places the sequence fields after `thread`.
+            return json.dumps(event_data["_record"], separators=(",", ":"))
+        # Raw/native escape hatch: a flat dotted-field record (the parser's view)
+        # is nested back into the ES message shape, with the sequence fields
+        # adjacent after `thread` as the numbering pass expects.
+        nested = _nest_dotted_fields(event_data)
+        record: dict[str, Any] = {}
+        for key, value in nested.items():
+            if key in ("seq_num", "global_seq_num"):
+                continue
+            record[key] = value
+            if key == "thread":
+                record.update(seq_num=0, global_seq_num=0)
+        if "seq_num" not in record:
+            record = {"seq_num": 0, "global_seq_num": 0, **record}
         return json.dumps(record, separators=(",", ":"))
 
     def _envelope(
@@ -392,12 +445,18 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             ),
         )
         platform = bool(target_obj["is_platform_binary"])
+        # es_process_t.start_time is the fork; the exec message follows it once
+        # the child has set up and called execve (tens to hundreds of µs).
+        exec_gap_us = (
+            40
+            + _stable_seed(f"es_exec_gap:{host.hostname}:{proc.pid}:{start_time.isoformat()}") % 260
+        )
         self._queue_record(
             host,
             self._envelope(
                 host=host,
                 event_name="exec",
-                event_time=start_time,
+                event_time=start_time + timedelta(microseconds=exec_gap_us),
                 process_obj=pre_exec_obj,
                 event_payload={
                     "target": target_obj,
@@ -499,8 +558,8 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         # Record the session so its matching `openssh_logout` is allowed to
         # render (see can_handle()); an SSH close with no rendered login is an
         # orphan and must be dropped.
-        self._openssh_login_sessions.add((host.hostname, auth.session_id))
-        process_obj = self._sshd_process_object(host, auth.session_id)
+        process_obj = self._connection_sshd_process_object(host, auth)
+        self._openssh_login_sessions[(host.hostname, auth.session_id)] = process_obj
         uid = self._macos_ids(auth.username)["uid"]
         success = auth.result != "failure"
         self._queue_record(
@@ -530,7 +589,9 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         auth = event.auth
         if host is None or auth is None:
             return
-        process_obj = self._sshd_process_object(host, auth.session_id)
+        process_obj = self._openssh_login_sessions.get(
+            (host.hostname, auth.session_id)
+        ) or self._connection_sshd_process_object(host, auth)
         uid = self._macos_ids(auth.username)["uid"]
         self._queue_record(
             host,
@@ -736,7 +797,11 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         responsible_audit_token = audit_token if ppid <= 1 else parent_audit_token
 
         signing = get_signing_identity(image)
-        tty = self._tty(hostname, username, logon_id, is_login)
+        tty = (
+            self._tty(hostname, username, logon_id, is_login)
+            if self._has_controlling_terminal(host, image, ppid)
+            else None
+        )
         return {
             "audit_token": audit_token,
             "ppid": ppid,
@@ -874,6 +939,33 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             session_id=session_id,
         )
 
+    def _connection_sshd_process_object(self, host: HostContext, auth: Any) -> dict[str, Any]:
+        """Build the process object for the sshd that served one SSH connection.
+
+        macOS launchd starts ``sshd -i`` per connection, and that process reports
+        the connection's openssh_login/logout. The SSH bundle binds it to the
+        session as the transport process.
+        """
+        sm = getattr(self, "_state_manager", None)
+        session = sm.get_session(auth.logon_id) if sm is not None and auth.logon_id else None
+        transport_pid = getattr(session, "transport_pid", None) if session is not None else None
+        rp = (
+            sm.get_process(host.hostname, transport_pid)
+            if sm is not None and transport_pid
+            else None
+        )
+        if rp is not None and str(rp.image).endswith("sshd"):
+            return self._build_process_object(
+                host,
+                pid=rp.pid,
+                ppid=rp.parent_pid,
+                image=rp.image,
+                username=rp.username,
+                session_id=auth.session_id,
+                start_time=rp.start_time,
+            )
+        return self._sshd_process_object(host, auth.session_id)
+
     def _sshd_process_object(self, host: HostContext, session_id: int) -> dict[str, Any]:
         """Build the process object for the target-side sshd handling a login.
 
@@ -976,6 +1068,30 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             scope = logon_id or username
             return _MACOS_SYSTEM_ASID + 1 + (_stable_seed(f"macos_asid:{hostname}:{scope}") % 90000)
         return _MACOS_SYSTEM_ASID
+
+    def _has_controlling_terminal(self, host: HostContext, image: str, ppid: int) -> bool:
+        """Return whether a process runs under a terminal session.
+
+        A pty is the controlling terminal of login(1) (started by Terminal) or of
+        the shell sshd starts, and of their descendants. launchd jobs and apps --
+        and Terminal and sshd themselves -- have none.
+        """
+        sm = getattr(self, "_state_manager", None)
+        current_image, parent_pid = image, ppid
+        for _depth in range(10):
+            name = current_image.rsplit("/", 1)[-1]
+            if name == "login":
+                return True
+            if name == "sshd" or parent_pid <= 1 or sm is None:
+                return False
+            parent = sm.get_process(host.hostname, parent_pid)
+            if parent is None:
+                return False
+            parent_name = str(parent.image).rsplit("/", 1)[-1]
+            if parent_name == "sshd" and name.lstrip("-") in _TTY_SHELLS:
+                return True
+            current_image, parent_pid = str(parent.image), parent.parent_pid
+        return False
 
     @staticmethod
     def _tty(hostname: str, username: str, logon_id: str, is_login: bool) -> str | None:

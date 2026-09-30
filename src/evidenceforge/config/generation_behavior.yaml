@@ -1,7 +1,7 @@
 schema_version: "1.0"
-current_revision: 155
+current_revision: 156
 history_start_revision: 1
-behavior_surface_sha256: 789a27d80e97cba7d93e4525afedc46b19d65e50af74599c568b161f05b0fbcf
+behavior_surface_sha256: 554ce48f85d6644dd0b7e9f68d1bf0cda73db3d08a8dac682cc40536644a9c05
 changes:
   - revision: 1
     id: initial-generation-behavior-contract
@@ -1570,3 +1570,16 @@ changes:
       - eslogger
       - zeek_conn
     summary: Add macOS hosts with Endpoint Security (eslogger) telemetry, a macOS PID ring, launchd-rooted process trees, macOS SSH sessions, and BTM launch-item persistence evidence.
+  - revision: 156
+    id: macos-eslogger-hunt-realism
+    impact: material
+    domains:
+      - macos-endpoint-telemetry
+      - process-session-lifecycle
+      - ssh-session-lifecycle
+      - dns-baseline-noise
+    formats:
+      - eslogger
+      - zeek_dns
+      - zeek_conn
+    summary: Match real eslogger captures (time-ordered per-client sequence numbers, launchd-activated sshd, terminal-only ttys, exit parents) and keep Windows-only DNS off Macs.

@@ -87,6 +87,9 @@ file_side_effect_profiles:
 
   - name: shell_temp
     executables: ["cmd.exe", "powershell.exe", "pwsh.exe", "bash", "sh", "zsh"]
+    # A non-interactive `sh -c <cmd>` wrapper (npm/make lifecycle scripts) just
+    # waits on its command: no temp files, no history writes.
+    exclude_command_prefixes: ["sh -c ", "bash -c ", "zsh -c ", "/bin/sh -c ", "/bin/bash -c ", "/bin/zsh -c "]
     actions: ["create", "modify"]
     paths_windows:
       - "C:\\Users\\{user}\\AppData\\Local\\Temp\\tmp{rand}.tmp"

@@ -715,6 +715,9 @@ POWERSHELL_COMMANDS = [
 ]
 
 
+_DueStoryTermination = tuple[dict[str, Any], System, User, int, datetime]
+
+
 class StorylineMixin:
     """Mixin providing storyline event scheduling and execution methods."""
 
@@ -2100,6 +2103,18 @@ class StorylineMixin:
                     end_time = self._parse_storyline_time(storyline_event.time)
                     if end_time.tzinfo is None:
                         end_time = end_time.replace(tzinfo=UTC)
+                    logoff_system = systems.get(storyline_event.system)
+                    if (
+                        logoff_system is not None
+                        and _get_os_category(logoff_system.os) == "macos"
+                        and end_time.microsecond == 0
+                    ):
+                        # A person does not close a session on an exact second;
+                        # keep macOS session-close evidence off the authored tick.
+                        end_time += timedelta(
+                            microseconds=1
+                            + _stable_seed(f"storyline_logoff_subsecond:{spec_id}") % 999_999
+                        )
                     logoff_plans[spec_id] = SessionEndPlan(
                         canonical_end=end_time.astimezone(UTC),
                         authority="explicit_storyline",
@@ -3309,6 +3324,7 @@ class StorylineMixin:
         if not pending:
             return
         retained: list[dict[str, Any]] = []
+        due: list[tuple[dict[str, Any], System, User, int, datetime]] = []
         for item in pending:
             required_index = item.get("release_storyline_index")
             if (
@@ -3356,6 +3372,52 @@ class StorylineMixin:
                     termination_time,
                     ensure_utc(release_time) + timedelta(milliseconds=1),
                 )
+            due.append((item, system, actor, proc.parent_pid, termination_time))
+        due, retained = self._macos_hold_parents_of_retained_children(due, retained)
+        self._emit_due_story_terminations(due)
+        self._pending_story_process_terminations = retained
+
+    def _emit_due_story_terminations(self, due: list[_DueStoryTermination]) -> None:
+        """Terminate due storyline processes; a macOS parent exits after the children it awaits.
+
+        Authored process chains (npm -> ``sh -c`` -> node, a dropper -> osascript) are
+        synchronous: the parent waits for its child and exits a few ms after reaping
+        it. A child's close can move later than queued (e.g. held by its connection),
+        so children close first and each parent follows the child's actual close.
+        Other OSes keep their queued order and times.
+        """
+        keys = {(system.hostname, item["pid"]) for item, system, _a, _p, _t in due}
+        children: dict[tuple[str, int], list[tuple[str, int]]] = {}
+        for item, system, _actor, parent_pid, _when in due:
+            if _get_os_category(system.os) == "macos" and (system.hostname, parent_pid) in keys:
+                children.setdefault((system.hostname, parent_pid), []).append(
+                    (system.hostname, item["pid"])
+                )
+
+        def depth(key: tuple[str, int], seen: int = 0) -> int:
+            kids = children.get(key, [])
+            return 0 if not kids or seen > 16 else 1 + max(depth(k, seen + 1) for k in kids)
+
+        ordered = (
+            due
+            if not children
+            else sorted(
+                due, key=lambda entry: (depth((entry[1].hostname, entry[0]["pid"])), entry[4])
+            )
+        )
+        closed_at: dict[tuple[str, int], datetime] = {}
+        registry = getattr(
+            getattr(self.activity_generator, "_lifecycle_authority", None), "registry", None
+        )
+        for item, system, actor, _parent_pid, termination_time in ordered:
+            key = (system.hostname, item["pid"])
+            kid_closes = [closed_at[kid] for kid in children.get(key, []) if kid in closed_at]
+            if kid_closes:
+                reap_gap = timedelta(
+                    microseconds=300 + _stable_seed(f"macos_story_reap:{key[0]}:{key[1]}") % 7700
+                )
+                termination_time = max(termination_time, max(kid_closes) + reap_gap)
+            object_id = self.state_manager.get_process_object_id(system.hostname, item["pid"])
             self.activity_generator.generate_process_termination(
                 user=actor,
                 system=system,
@@ -3365,7 +3427,44 @@ class StorylineMixin:
                 logon_id=item["logon_id"],
                 from_storyline=True,
             )
-        self._pending_story_process_terminations = retained
+            snapshot = (
+                registry.get_process(object_id) if registry is not None and object_id else None
+            )
+            actual = getattr(snapshot, "closed_at", None) if snapshot is not None else None
+            closed_at[key] = ensure_utc(actual) if actual is not None else termination_time
+
+    def _macos_hold_parents_of_retained_children(
+        self,
+        due: list[_DueStoryTermination],
+        retained: list[dict[str, Any]],
+    ) -> tuple[list[_DueStoryTermination], list[dict[str, Any]]]:
+        """Keep a macOS parent pending while an authored child it awaits is still pending."""
+
+        waiting = {
+            (item["system"], running.parent_pid): item
+            for item in retained
+            if (running := self.state_manager.get_process(item["system"], item["pid"])) is not None
+        }
+        still_due: list[_DueStoryTermination] = []
+        changed = True
+        while changed:
+            changed = False
+            still_due = []
+            for entry in due:
+                item, system, _actor, _parent_pid, _when = entry
+                child = waiting.get((system.hostname, item["pid"]))
+                if _get_os_category(system.os) == "macos" and child is not None:
+                    held = dict(item)
+                    held["release_storyline_index"] = child.get("release_storyline_index")
+                    retained.append(held)
+                    running = self.state_manager.get_process(system.hostname, item["pid"])
+                    if running is not None:
+                        waiting[(system.hostname, running.parent_pid)] = held
+                    changed = True
+                else:
+                    still_due.append(entry)
+            due = still_due
+        return due, retained
 
     def _record_storyline_group_completion(
         self,

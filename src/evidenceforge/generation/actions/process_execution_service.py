@@ -1682,7 +1682,7 @@ class ProcessTerminationService:
             ),
             process=ProcessContext(
                 pid=pid,
-                parent_pid=0,
+                parent_pid=running_proc.parent_pid if running_proc is not None else 0,
                 image=process_name,
                 command_line="",
                 username=process_username,

@@ -530,6 +530,29 @@ class ProcessParentResolver:
                 logon_id=logon_id,
             ):
                 return parent_pid
+            if (
+                os_category == "macos"
+                and self.queries._is_valid_process_parent_at(
+                    system=system,
+                    parent_pid=parent_pid,
+                    time=time,
+                )
+                and self.queries._parent_process_matches_logon(
+                    hostname=system.hostname,
+                    parent_pid=parent_pid,
+                    logon_id=logon_id,
+                    os_category=os_category,
+                )
+            ):
+                return parent_pid
+
+        if os_category == "macos":
+            # Never borrow a Linux role (bash/sshd/systemd): a macOS user
+            # process belongs to its session shell, else to launchd.
+            session_shell = self.queries._active_session_shell_pid(system, user, time, logon_id)
+            if session_shell is not None:
+                return session_shell
+            return self._macos_anchor_pid(system, time)
 
         system_pids = policy.system_process_roles(self._system_pids).get(system.hostname, {})
         if os_category == "windows":

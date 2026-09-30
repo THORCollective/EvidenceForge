@@ -77,6 +77,7 @@ class _SingleHostWriter:
         external_sorting: bool = False,
         checkpoint_mode: bool = False,
         defer_publication: bool = False,
+        publish_line_transform: Callable[[], Callable[[str], str]] | None = None,
     ):
         self.output_path = output_path
         self.buffer: list[str] = []
@@ -98,6 +99,7 @@ class _SingleHostWriter:
                 buffer_size=buffer_size,
                 checkpoint_mode=checkpoint_mode,
                 defer_publication=defer_publication,
+                publish_line_transform=publish_line_transform,
             )
             if sort_on_flush and external_sorting
             else None
@@ -417,6 +419,14 @@ class HostMultiplexEmitter(LogEmitter):
         self._buffer_size = buffer_size
         super().__init__(format_def, output_path, buffer_size, threaded)
 
+    def _publish_line_transform_factory(self) -> Callable[[], Callable[[str], str]] | None:
+        """Return a per-publish line rewrite factory for externally sorted writers.
+
+        Formats whose rows carry order-dependent fields (e.g. per-client sequence
+        numbers) override this to assign them in final sorted order.
+        """
+        return None
+
     def _safe_writer_key(self, host_fqdn: str) -> str:
         """Return the writer key for a routed host value."""
         return sanitize_path_component(host_fqdn)
@@ -457,6 +467,7 @@ class HostMultiplexEmitter(LogEmitter):
                 ),
                 checkpoint_mode=self._incremental_checkpointing,
                 defer_publication=self._defer_sorted_publication,
+                publish_line_transform=self._publish_line_transform_factory(),
             )
             header_template = self.format_def.output.header_template
             if header_template:
