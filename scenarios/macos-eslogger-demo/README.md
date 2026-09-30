@@ -115,6 +115,9 @@ ESF SSH lifecycle is observable end-to-end alongside the malicious beats.
   `conn`/`dns` rows for the same host to tie a process to its egress.
 - **BTM without authoring it.** Confirm `btm_launch_item_add` appears even
   though the scenario only declares a file `create`.
+- **In a SIEM.** `splunk/` is a local Splunk kit (compose file, parsing app,
+  one saved search per beat, and `run_hunts.py`) that ingests this output and
+  runs each hunt end to end. See `splunk/README.md`.
 - **Determinism.** Generation is reproducible: the same scenario yields
   byte-identical `eslogger.ndjson` on every run.
 

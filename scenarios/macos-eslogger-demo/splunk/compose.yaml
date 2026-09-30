@@ -1,0 +1,27 @@
+# Local Splunk for verifying the OBTS macOS eslogger demo dataset.
+#
+#   EFORGE_DATA=/abs/path/to/output/data SPLUNK_PASSWORD='...' docker compose up -d
+#
+# EFORGE_DATA is the `data/` directory of an `eforge generate --target splunk` bundle
+# (per-Mac `<fqdn>/eslogger.ndjson` plus `zeek-core/*.json`). Splunk Web: http://127.0.0.1:8000
+services:
+  splunk:
+    image: "splunk/splunk:10.2.3"
+    platform: "linux/amd64" # no arm64 image; runs under Rosetta on Apple Silicon
+    hostname: "obts-splunk"
+    environment:
+      SPLUNK_START_ARGS: "--accept-license"
+      SPLUNK_GENERAL_TERMS: "--accept-sgt-current-at-splunk-com"
+      SPLUNK_PASSWORD: "${SPLUNK_PASSWORD:?set SPLUNK_PASSWORD (8+ chars)}"
+      SPLUNK_LICENSE_URI: "Free"
+    ports:
+      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8089:8089"
+    volumes:
+      - type: bind
+        source: "${EFORGE_DATA:?set EFORGE_DATA to the generated data/ directory}"
+        target: "/eforge-data"
+        read_only: true
+      - type: bind
+        source: "./apps/obts_macos_hunt"
+        target: "/opt/splunk/etc/apps/obts_macos_hunt"

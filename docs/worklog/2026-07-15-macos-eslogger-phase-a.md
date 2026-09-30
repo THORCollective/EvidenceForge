@@ -227,3 +227,61 @@ semantic rather than textual:
   linkability stay at the pre-merge values (40/40/low): ES records carry uids rather than
   usernames, so the evaluator cannot match storyline actors to eslogger rows. Fix in the
   evaluator (uid -> username mapping) before quoting eval scores in the talk.
+
+## SIEM Verification in Splunk (2026-09-29)
+
+Ingested a fresh `eforge generate --target splunk` run of the demo (17/51/50 ES records on
+DESIGN/DEV/IT, 2,887 Zeek rows) into local Splunk 10.2.3 (Docker, amd64 under Rosetta). The kit
+lives in `scenarios/macos-eslogger-demo/splunk/` (compose, `obts_macos_hunt` app, `run_hunts.py`).
+Neither `--target` has an eslogger parser: `eslogger` is target-invariant NDJSON
+(`output_targets.py`), and the external-parser harnesses cover only Zeek/Windows/syslog/etc., so
+the app supplies its own `macos:eslogger` sourcetype. All records parse (`_time` from the ns
+envelope `time`, µs kept), and all 15 saved searches return the expected beat:
+
+- **AMOS**: launchd → ad-hoc/no-Team-ID `CleanMyMacX Helper` → signed `osascript` with the fake
+  dialog in argv → the dropper (not osascript) opens `login.keychain-db` → Zeek TLS to
+  193.42.33.14 (`gateway.macos-analytics.top`, 2.45 MB out) 0.30 s after the keychain open.
+- **BeaverTail**: `node npm install` → `sh -c node scripts/postinstall.js` → `node` (pid/ppid
+  join) → DNS `api.ipcheck-beaver.cc` → TLS 45.128.199.72 3.6 s later.
+- **CloudMensis**: ad-hoc `cloudsyncd` creates `~/Library/LaunchAgents/com.apple.cloudsyncd.plist`,
+  then `btm_launch_item_add` from `backgroundtaskmanagementd` with `instigator` pid = writer pid.
+- **SSH**: `openssh_login`/`openssh_logout` (554 s) matches the Zeek 22/tcp conn from MAC-IT-01
+  (556 s, SF), with login 3 s after the TCP open.
+
+Hunter friction (handled in the app; worth a slide): the ES↔Zeek join needs an asset lookup
+(ES has no IP or hostname; host comes from the directory); on `exec` the `process` is the parent
+image; `event_type` needs an int→name lookup; JSON null extracts as `"null"`; `map` can't be used
+in saved searches; `bitand()` returned nothing on 10.2.3.
+
+### Realism findings (not fixed; generator changes need a proposal first)
+
+1. **ssh client parented by sshd** (MAC-IT-01): `/usr/bin/ssh` is exec'd from a fork of the local
+   `sshd` listener (ppid 327) instead of the `zsh` spawned 2 s earlier in Terminal. A hunter
+   reads that as sshd spawning an outbound ssh, which looks like a lateral-movement relay.
+2. **Windows DNS behavior on Macs**: all three Macs query `isatap`, `wpad`, and suffix-appended
+   `login.microsoftonline.com.clearwater-studio.test` (devolution), sent unicast to public
+   resolvers. ISATAP is Windows-only; `.local` goes over mDNS, not 1.1.1.1.
+3. **No internal resolver**: Macs send internal names (`printer01.clearwater-studio.test`) to
+   1.1.1.1/8.8.8.8 and get NXDOMAIN. That's a scenario topology choice; adding a DNS server
+   system would fix it.
+4. **launchd children carry a tty**: all 16 launchd→exec records (Firefox, VS Code, backupd,
+   cloudd, the AMOS dropper) have `tty` `/dev/ttys00N`; the fork child also inherits a tty
+   launchd doesn't have. Real launchd-spawned processes have `tty: null`.
+5. **Exit `ppid` is 0**: 14 of 22 `exit` records report `ppid: 0` (e.g. the dropper, which had
+   ppid 1 at exec).
+6. **npm exits before its lifecycle script**: `node npm install` (31022) exits at 14:51:21.667,
+   before its `sh` (14:51:28) and the postinstall `node` (14:52:00). Real npm waits.
+   `~/Library/Caches/7D515BC0.tmp` is created by the waiting `sh`, not the postinstall `node`.
+7. **sshd exec argv is a proctitle**: `args: ["sshd:", "riley.chen", "[priv]"]`. That is the
+   setproctitle string `ps` shows; exec argv would be the real `sshd` command line.
+8. **`global_seq_num` order ≠ time order**: 2/5/5 seq→time inversions per host, and file lines are
+   in seq order. Real eslogger delivers in increasing message time.
+9. **Synthetic tells**: an exit cascade 1 µs apart (git, zsh, login, Terminal at
+   14:20:37.035461–464), and three envelope times at `.000000xxx`
+   (`15:44:00.000000352Z` openssh_logout, `15:54:42.000000953Z`).
+10. Volume is still low (≤51 ES records/Mac/2 h), so every hunt query returns exactly the answer.
+    Realistic density would make the stacking query (`OBTS 01`) earn its place.
+
+Nuance for the talk: macOS `/bin/sh` is bash in sh mode, and `sh -c "<single command>"` usually
+execs in place. Real telemetry can show the postinstall `node` on the same pid as the `sh`, which
+breaks a pid/ppid chain join like `BeaverTail 2`.

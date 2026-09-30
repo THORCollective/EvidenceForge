@@ -98,6 +98,7 @@ scenarios/macos-eslogger-demo/*
 !scenarios/macos-eslogger-demo/scenario.yaml
 !scenarios/macos-eslogger-demo/README.md
 !scenarios/macos-eslogger-demo/CFP-ABSTRACT.md
+!scenarios/macos-eslogger-demo/splunk/
 !scenarios/iteration-test/
 scenarios/iteration-test/*
 !scenarios/iteration-test/scenario.yaml
