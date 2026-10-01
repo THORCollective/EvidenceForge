@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -289,3 +290,125 @@ def test_macs_do_not_emit_windows_only_dns(output: Path) -> None:
         if domain and name.endswith(f".{domain}") and name.count(".") > domain.count(".") + 2:
             offenders.append(name)
     assert not offenders, f"Windows-only DNS behavior from Macs: {sorted(set(offenders))}"
+
+
+def _zeek(output: Path, log: str) -> list[dict]:
+    return [
+        json.loads(line)
+        for path in output.rglob(f"{log}.json")
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+
+
+def _resolver_ips() -> set[str]:
+    scenario = yaml.safe_load(SCENARIO.read_text(encoding="utf-8"))
+    return {
+        s["ip"]
+        for s in scenario["environment"]["systems"]
+        if "dns_server" in (s.get("roles") or [])
+    }
+
+
+def test_each_mac_user_has_one_console_session(es_files: dict[str, list[dict]]) -> None:
+    # Every app and Terminal window runs in the user's loginwindow audit
+    # session; baseline activity must not open a session per burst.
+    for host, records in es_files.items():
+        user_asids = {
+            r["event"]["exec"]["target"]["audit_token"]["asid"]
+            for r in _execs(records)
+            if r["event"]["exec"]["target"]["audit_token"]["euid"] >= 500
+            and r["event"]["exec"]["target"]["executable"]["path"] != "/usr/sbin/sshd"
+            and r["event"]["exec"]["target"]["tty"] is None
+        }
+        # One loginwindow session, or two if the baseline logged the user out and
+        # back in -- never a session per activity burst.
+        assert len(user_asids) <= 2, f"{host}: GUI processes span sessions {sorted(user_asids)}"
+
+
+def test_running_app_bundles_are_not_relaunched(es_files: dict[str, list[dict]]) -> None:
+    for host, records in es_files.items():
+        launched: dict[tuple[str, int], int] = defaultdict(int)
+        for r in _execs(records):
+            target = r["event"]["exec"]["target"]
+            path = target["executable"]["path"]
+            if ".app/Contents/MacOS/" in path and target["ppid"] == 1:
+                launched[(path, target["audit_token"]["asid"])] += 1
+        relaunched = {k: v for k, v in launched.items() if v > 1}
+        assert not relaunched, f"{host}: app bundles launched repeatedly {relaunched}"
+
+
+def test_macs_resolve_through_the_internal_resolver(output: Path) -> None:
+    resolvers = _resolver_ips()
+    assert resolvers, "demo scenario should declare an internal dns_server"
+    mac_queries = [q for q in _zeek(output, "dns") if q.get("id.orig_h") in _mac_ips()]
+    assert mac_queries
+    assert {q["id.resp_h"] for q in mac_queries} <= resolvers
+
+
+def test_macs_do_not_contact_windows_or_linux_update_hosts(output: Path) -> None:
+    foreign = ("windowsupdate.com", "settings-win.data.microsoft.com", "packages.microsoft.com")
+    foreign += ("ubuntu.com", "snapcraft.io")
+    names = {
+        str(r.get("server_name") or r.get("query") or "")
+        for log in ("ssl", "dns")
+        for r in _zeek(output, log)
+        if r.get("id.orig_h") in _mac_ips()
+    }
+    assert not {n for n in names if n.endswith(foreign)}
+
+
+def test_btm_executable_path_is_the_launch_item_program(
+    es_files: dict[str, list[dict]],
+) -> None:
+    btm = [
+        r["event"]["btm_launch_item_add"]
+        for records in es_files.values()
+        for r in records
+        if _name(r) == "btm_launch_item_add"
+    ]
+    by_url = {e["item"]["item_url"]: e["executable_path"] for e in btm}
+    brew_url = "file:///Users/jordan.lee/Library/LaunchAgents/homebrew.mxcl.postgresql@16.plist"
+    assert by_url[brew_url] == "/opt/homebrew/opt/postgresql@16/bin/postgres"
+
+
+def test_launch_agent_program_is_started_by_launchd(es_files: dict[str, list[dict]]) -> None:
+    starts = [
+        r
+        for records in es_files.values()
+        for r in _execs(records)
+        if r["event"]["exec"]["target"]["executable"]["path"]
+        == "/opt/homebrew/opt/postgresql@16/bin/postgres"
+    ]
+    assert starts and all(r["process"]["executable"]["path"] == "/sbin/launchd" for r in starts)
+
+
+def test_authored_egress_resolves_after_its_process_starts(
+    output: Path, es_files: dict[str, list[dict]]
+) -> None:
+    # (host, process argv prefix, DNS name the process resolves)
+    owners = [
+        (
+            "MAC-DESIGN-01",
+            ["/Applications/CleanMyMacX Helper.app/Contents/MacOS/CleanMyMacX Helper"],
+            "gateway.macos-analytics.top",
+        ),
+        ("MAC-DEV-01", ["node", "scripts/postinstall.js"], "api.ipcheck-beaver.cc"),
+        (
+            "MAC-DEV-02",
+            ["node", "/usr/local/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js"],
+            "nodejs.org",
+        ),
+    ]
+    dns = _zeek(output, "dns")
+    for host, argv_prefix, name in owners:
+        records = next(v for k, v in es_files.items() if k.startswith(host))
+        exec_time = min(
+            r["time"]
+            for r in _execs(records)
+            if r["event"]["exec"]["args"][: len(argv_prefix)] == argv_prefix
+        )
+        lookups = sorted(q["ts"] for q in dns if q.get("query") == name)
+        assert lookups, f"no DNS lookup for {name}"
+        first = datetime.fromtimestamp(lookups[0], tz=UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")
+        assert first > exec_time[:26], f"{name} resolved at {first} before {host} exec {exec_time}"

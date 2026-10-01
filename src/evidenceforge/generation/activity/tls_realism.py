@@ -611,8 +611,8 @@ def _tls_profile_domains(
     unique_domains: list[str] = []
     for domain in domains:
         domain_tags = set(get_domain_tags(domain))
-        os_tags = domain_tags & {"windows", "linux"}
-        if source_os in {"windows", "linux"} and os_tags and source_os not in os_tags:
+        os_tags = domain_tags & {"windows", "linux", "macos"}
+        if source_os in {"windows", "linux", "macos"} and os_tags and source_os not in os_tags:
             continue
         if not proxy_domain_allows_source_system_type(domain, source_system_type):
             continue

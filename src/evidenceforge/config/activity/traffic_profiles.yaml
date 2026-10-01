@@ -116,6 +116,7 @@ role_traffic:
       - {role: domain_controller, port: 389, proto: tcp, service: ldap, weight: 10, os: windows}
       - {role: file_server, port: 445, proto: tcp, service: smb, weight: 20, os: windows}
       - {role: _external, port: 443, proto: tcp, service: ssl, weight: 10, emit_dns: true, dns_tags: [background, windows], description: "System updates/CRL/telemetry"}
+      - {role: _external, port: 443, proto: tcp, service: ssl, weight: 10, os: macos, emit_dns: true, dns_tags: [background, macos], description: "Apple software update/iCloud/telemetry"}
     # Workstations generally don't receive inbound connections
 
   # Fallback for roles not explicitly listed

@@ -537,6 +537,19 @@ destinations:
             - registry.npmjs.org
             - api.snapcraft.io
             - packages.microsoft.com
+        macos:
+          dns_tags: [background, macos]
+          domains:
+            - swscan.apple.com
+            - gdmf.apple.com
+            - mesu.apple.com
+            - configuration.apple.com
+            - xp.apple.com
+            - gateway.icloud.com
+            - api.apple-cloudkit.com
+            - gsp-ssl.ls.apple.com
+            - dl.google.com
+            - update.googleapis.com
     - name: developer_tools
       weight: 12
       personas: [developer, sysadmin, security_analyst, analyst]

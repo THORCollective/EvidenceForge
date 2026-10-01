@@ -966,6 +966,13 @@ class FileEventSpec(_EventSpecBase):
         None  # Optional explicit actor PID override; default resolves from session/process context
     )
     process_ref: str | None = None  # Optional earlier process_ref that performs this file action
+    launch_program: str | None = Field(
+        default=None,
+        description=(
+            "For a macOS LaunchAgents/LaunchDaemons plist create: the program the plist "
+            "launches (ES btm_launch_item_add executable_path). Defaults to the writer."
+        ),
+    )
 
 
 class ConnectionEventSpec(_IdsAttachableEventSpec):

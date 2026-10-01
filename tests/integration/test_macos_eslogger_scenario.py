@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from evidenceforge.cli.commands import EXIT_SUCCESS, app
@@ -71,6 +72,12 @@ def _generate(tmp_path: Path, name: str = "output") -> Path:
     return out
 
 
+@pytest.fixture(scope="module")
+def generated(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Generate the demo once for the read-only assertions in this module."""
+    return _generate(tmp_path_factory.mktemp("macos-demo"))
+
+
 def _eslogger_records(output_dir: Path, host_fqdn: str) -> list[dict]:
     path = output_dir / "data" / host_fqdn / "eslogger.ndjson"
     assert path.exists(), f"missing eslogger output for {host_fqdn}: {path}"
@@ -93,8 +100,8 @@ def _zeek_records(output_dir: Path, log: str) -> list[dict]:
     return records
 
 
-def test_eslogger_output_exists_for_every_macos_host(tmp_path: Path) -> None:
-    output = _generate(tmp_path)
+def test_eslogger_output_exists_for_every_macos_host(generated: Path) -> None:
+    output = generated
     for host_fqdn in MACOS_HOSTS.values():
         records = _eslogger_records(output, host_fqdn)
         # Modest baseline + a hunt beat per host: each host should carry a
@@ -114,8 +121,8 @@ def _exec_target(record: dict) -> dict:
     return record["event"]["exec"]["target"]
 
 
-def test_hunt1_amos_unsigned_dropper_exec_and_keychain_open(tmp_path: Path) -> None:
-    output = _generate(tmp_path)
+def test_hunt1_amos_unsigned_dropper_exec_and_keychain_open(generated: Path) -> None:
+    output = generated
     records = _eslogger_records(output, MACOS_HOSTS["MAC-DESIGN-01"])
 
     # The AMOS dropper exec must carry the exact ad-hoc binary_path: a
@@ -136,7 +143,10 @@ def test_hunt1_amos_unsigned_dropper_exec_and_keychain_open(tmp_path: Path) -> N
     keychain_opens = [
         r
         for r in records
-        if _event_name(r) == "open" and r["event"]["open"]["file"]["path"] == KEYCHAIN_PATH
+        if _event_name(r) == "open"
+        and r["event"]["open"]["file"]["path"] == KEYCHAIN_PATH
+        # Chrome (a red herring) also reads the keychain; select the dropper's read.
+        and r["process"]["executable"]["path"] == AMOS_DROPPER
     ]
     assert keychain_opens, "no eslogger `open` event for the login keychain"
     actor = keychain_opens[0]["process"]
@@ -155,8 +165,8 @@ def test_hunt1_amos_unsigned_dropper_exec_and_keychain_open(tmp_path: Path) -> N
     assert _exec_target(osascript_execs[0])["signing_id"] == "com.apple.osascript"
 
 
-def test_hunt2_beavertail_npm_node_exec_chain(tmp_path: Path) -> None:
-    output = _generate(tmp_path)
+def test_hunt2_beavertail_npm_node_exec_chain(generated: Path) -> None:
+    output = generated
     records = _eslogger_records(output, MACOS_HOSTS["MAC-DEV-01"])
     execs = [r for r in records if _event_name(r) == "exec"]
 
@@ -185,8 +195,8 @@ def test_hunt2_beavertail_npm_node_exec_chain(tmp_path: Path) -> None:
     )
 
 
-def test_hunt1_amos_runs_in_real_order_and_dropper_owns_exfil(tmp_path: Path) -> None:
-    output = _generate(tmp_path)
+def test_hunt1_amos_runs_in_real_order_and_dropper_owns_exfil(generated: Path) -> None:
+    output = generated
     records = _eslogger_records(output, MACOS_HOSTS["MAC-DESIGN-01"])
 
     dropper = next(
@@ -207,7 +217,10 @@ def test_hunt1_amos_runs_in_real_order_and_dropper_owns_exfil(tmp_path: Path) ->
     keychain = next(
         r
         for r in records
-        if _event_name(r) == "open" and r["event"]["open"]["file"]["path"] == KEYCHAIN_PATH
+        if _event_name(r) == "open"
+        and r["event"]["open"]["file"]["path"] == KEYCHAIN_PATH
+        # Chrome (a red herring) also reads the keychain; select the dropper's read.
+        and r["process"]["executable"]["path"] == AMOS_DROPPER
     )
     # Real AMOS phishes the password first, then reads the keychain.
     assert dropper["time"] < prompt["time"] < keychain["time"]
@@ -220,8 +233,8 @@ def test_hunt1_amos_runs_in_real_order_and_dropper_owns_exfil(tmp_path: Path) ->
     )
 
 
-def test_hunt3_cloudmensis_plist_create_drives_btm(tmp_path: Path) -> None:
-    output = _generate(tmp_path)
+def test_hunt3_cloudmensis_plist_create_drives_btm(generated: Path) -> None:
+    output = generated
     records = _eslogger_records(output, MACOS_HOSTS["MAC-IT-01"])
 
     # The plist create (file-event new vocabulary) must render.
@@ -241,10 +254,10 @@ def test_hunt3_cloudmensis_plist_create_drives_btm(tmp_path: Path) -> None:
     assert "file://" + LAUNCHAGENT_PLIST in btm_paths, f"BTM path mismatch: {btm_paths}"
 
 
-def test_file_events_render_with_new_vocabulary(tmp_path: Path) -> None:
+def test_file_events_render_with_new_vocabulary(generated: Path) -> None:
     """Task 9 reviewer risk: the `open`/`create` (Task 6 vocabulary) file events
     must actually appear in eslogger output, not be silently dropped."""
-    output = _generate(tmp_path)
+    output = generated
     all_names: set[str] = set()
     for host_fqdn in MACOS_HOSTS.values():
         all_names.update(_event_name(r) for r in _eslogger_records(output, host_fqdn))
@@ -252,8 +265,8 @@ def test_file_events_render_with_new_vocabulary(tmp_path: Path) -> None:
     assert "create" in all_names, "plist `create` file event did not render"
 
 
-def test_zeek_correlates_with_macos_egress(tmp_path: Path) -> None:
-    output = _generate(tmp_path)
+def test_zeek_correlates_with_macos_egress(generated: Path) -> None:
+    output = generated
     conn = _zeek_records(output, "conn")
     dns = _zeek_records(output, "dns")
 
@@ -271,9 +284,9 @@ def test_zeek_correlates_with_macos_egress(tmp_path: Path) -> None:
     assert "api.ipcheck-beaver.cc" in queries, "BeaverTail C2 DNS lookup missing"
 
 
-def test_eslogger_output_is_byte_deterministic(tmp_path: Path) -> None:
+def test_eslogger_output_is_byte_deterministic(generated: Path, tmp_path: Path) -> None:
     """facts.md item 20: identical scenario input -> byte-identical ES output."""
-    first = _generate(tmp_path, "first")
+    first = generated
     second = _generate(tmp_path, "second")
     for host_fqdn in MACOS_HOSTS.values():
         a = (first / "data" / host_fqdn / "eslogger.ndjson").read_bytes()
@@ -281,10 +294,10 @@ def test_eslogger_output_is_byte_deterministic(tmp_path: Path) -> None:
         assert a == b, f"eslogger output not byte-identical for {host_fqdn}"
 
 
-def test_no_orphan_openssh_logout(tmp_path: Path) -> None:
+def test_no_orphan_openssh_logout(generated: Path) -> None:
     """Task 11c watch item: every openssh_logout must have a preceding
     openssh_login for the same session on the same host (no orphan logouts)."""
-    output = _generate(tmp_path)
+    output = generated
     found_a_pair = False
     for host_fqdn in MACOS_HOSTS.values():
         records = _eslogger_records(output, host_fqdn)

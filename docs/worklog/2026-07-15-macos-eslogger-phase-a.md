@@ -285,3 +285,56 @@ in saved searches; `bitand()` returned nothing on 10.2.3.
 Nuance for the talk: macOS `/bin/sh` is bash in sh mode, and `sh -c "<single command>"` usually
 execs in place. Real telemetry can show the postinstall `node` on the same pid as the `sh`, which
 breaks a pid/ppid chain join like `BeaverTail 2`.
+
+## Realism Fixes and Demo Rework (2026-09-29 to 2026-10-01)
+
+Branch `macos-eslogger-realism` (off `macos-eslogger`, not pushed). Fixes the SIEM-pass findings
+above plus problems that only showed at higher volume. Generation-behavior manifest revision 156.
+Invariants live in `tests/integration/test_macos_eslogger_realism.py` (21 tests over the demo).
+
+Generator (macOS-scoped unless noted, so Windows/Linux output stays upstream-identical):
+
+- eslogger files are time-sorted per Mac; `global_seq_num`/`seq_num` are assigned after the sort
+  (per ES client; `seq_num` per event type) via a new `ExternalSortedLineWriter`
+  publish-time line transform. exec is delivered 40–300 µs after its fork.
+- tty only under `login(1)` or an sshd shell; launchd jobs/apps report `tty: null`.
+- Exit records carry the real parent (canonical terminate `ProcessContext` had `parent_pid=0`;
+  all OSes).
+- macOS Remote Login is launchd socket activation: boot tree no longer seeds `sshd -i` or a root
+  `-zsh`; each connection is a launchd-spawned `/usr/sbin/sshd -i`, which reports
+  `openssh_login`/`logout`. `ssh`/`scp` clients stay under the user's zsh (macOS fell into the
+  Linux existing-parent fallback). Exact SSH close/deadline paths accept macOS hosts.
+- One loginwindow session per Mac user: baseline previously opened a session per activity burst
+  (19 sessions/user/2 h), which also spawned a Terminal→login→zsh chain per command. Running app
+  bundles are re-activated, not relaunched.
+- DNS/TLS: Macs no longer send WPAD/ISATAP/suffix-devolution probes or pick Windows/Linux update
+  hosts; new `macos` OS tag with Apple background domains (swscan/gdmf/mesu/configuration/xp,
+  iCloud, CloudKit, location). Storyline connections on macOS start ≥1.5 s after the owning
+  process so their DNS prerequisite can't precede it.
+- Lifecycle timing: macOS parents reap children with 0.15–3 ms gaps (was 1 µs cascades); authored
+  macOS process chains (npm → `sh -c` → node, dropper → osascript) exit child-first and follow the
+  child's actual close; storyline logoffs and suspicious noise avoid whole-second times; daemon
+  noise wraps within the hour instead of clamping to `:59:59.000000`.
+- `sh -c` wrappers get no shell temp/history file effects (data-driven
+  `exclude_command_prefixes`; all OSes).
+- macOS daemon noise (Spotlight, cfprefsd, iCloud, trustd) scales with
+  `baseline_activity.intensity` (rounds low/medium/high = 1/10/30).
+- New optional `file.launch_program` (scenario schema + `FileContext`): the BTM
+  `executable_path`, and a later authored process for that program is parented by launchd.
+  BTM `item_url` leaves `@` unescaped.
+
+Demo scenario: six Macs (+ `NS-01` internal resolver), `intensity: high` (~120–260 ES records per
+Mac, ~1.7k Zeek conns; 54 s to generate), and `red_herrings`: Homebrew postgres service +
+LaunchAgent, Chrome keychain reads on two Macs, node-gyp header download. README and the Splunk
+kit were updated; the kit adds `AMOS 1b`, `AMOS 3b`, `BeaverTail 3b`, per-event pivot windows,
+and six-host lookups. All 18 saved searches return the expected rows in Splunk.
+
+Notes for the next agent:
+
+- Long background runs stall when the Mac idles; wrap test/generation runs in `caffeinate -i`.
+  The macOS integration modules take ~5 min together.
+- Still open: ES volume is still far below a real Mac (thousands/min); hourly baseline logoffs
+  can log a Mac user out and back in mid-day (2 sessions); `NS-01` makes a few SSH/scan-like
+  connections to the Macs from the generic lateral-movement patterns; the macOS-scoped timing
+  fixes (reap gaps, DNS-after-process, sub-second placement) are upstream candidates for all
+  OSes; the eval uid→username gap and the live `eslogger` capture diff remain.

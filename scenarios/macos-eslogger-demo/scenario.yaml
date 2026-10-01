@@ -19,10 +19,15 @@ description: |
        under ~/Library/LaunchAgents; the BTM (Background Task Management)
        launch-item-add event is produced automatically by the causal engine.
 
+  Six Macs share one office, so each hunt stacks against a population. The
+  red_herrings are benign lookalikes a hunter has to rule out (Homebrew's
+  ad-hoc-signed services and LaunchAgent, Chrome reading the keychain, a
+  node-gyp postinstall that downloads headers).
+
   See README.md for the per-hunt evidence and self-verification recipe.
 
 environment:
-  description: "Small design/engineering shop: three macOS workstations behind a monitored egress"
+  description: "Small design/engineering shop: six macOS workstations and an internal resolver behind a monitored egress"
   domain: "clearwater-studio.test"
 
   users:
@@ -44,6 +49,24 @@ environment:
       persona: sysadmin
       primary_system: MAC-IT-01
       enabled: true
+    - username: jordan.lee
+      full_name: "Jordan Lee"
+      email: "jordan.lee@clearwater-studio.test"
+      persona: developer
+      primary_system: MAC-DEV-02
+      enabled: true
+    - username: priya.nair
+      full_name: "Priya Nair"
+      email: "priya.nair@clearwater-studio.test"
+      persona: sales
+      primary_system: MAC-SALES-01
+      enabled: true
+    - username: alex.kim
+      full_name: "Alex Kim"
+      email: "alex.kim@clearwater-studio.test"
+      persona: project_manager
+      primary_system: MAC-PM-01
+      enabled: true
 
   systems:
     - hostname: MAC-DESIGN-01
@@ -63,6 +86,28 @@ environment:
       type: workstation
       assigned_user: riley.chen
       services: ["ssh"]
+    - hostname: MAC-DEV-02
+      ip: "10.20.10.34"
+      os: "macOS 14.5"
+      type: workstation
+      assigned_user: jordan.lee
+    - hostname: MAC-SALES-01
+      ip: "10.20.10.35"
+      os: "macOS 14.5"
+      type: workstation
+      assigned_user: priya.nair
+    - hostname: MAC-PM-01
+      ip: "10.20.10.36"
+      os: "macOS 14.5"
+      type: workstation
+      assigned_user: alex.kim
+    # Internal recursive resolver: the Macs resolve through it, so internal names
+    # never leave the office and Zeek sees each client's lookups on the LAN.
+    - hostname: NS-01
+      ip: "10.20.1.10"
+      os: "Ubuntu 22.04"
+      type: server
+      roles: [dns_server]
 
   # A core SPAN sensor so Zeek records the macOS hosts' egress. The eslogger
   # emitter deliberately renders no network events (ESF has no TCP-connect
@@ -75,12 +120,17 @@ environment:
         description: "macOS workstation segment"
         exposure: both
         external_ratio: 0.5
-        systems: [MAC-DESIGN-01, MAC-DEV-01, MAC-IT-01]
+        systems: [MAC-DESIGN-01, MAC-DEV-01, MAC-IT-01, MAC-DEV-02, MAC-SALES-01, MAC-PM-01]
+      - name: servers
+        cidr: "10.20.1.0/24"
+        description: "Office infrastructure"
+        exposure: both
+        systems: [NS-01]
     sensors:
       - type: network
         name: core-span
         hostname: ZEEK-CORE
-        monitoring_segments: [mac-workstations]
+        monitoring_segments: [mac-workstations, servers]
         direction: bidirectional
         placement: span
         log_formats: [zeek]
@@ -91,9 +141,9 @@ time_window:
   duration: "2h"
 
 baseline_activity:
-  description: "Modest business-day macOS activity (app launches, zsh, browsing) so the hunts have realistic noise to stand out from"
-  intensity: low
-  variation: low
+  description: "Business-day macOS activity (app launches, zsh, browsing, daemons) so each hunt has a population to stand out from"
+  intensity: high
+  variation: medium
 
 output:
   logs:
@@ -212,6 +262,7 @@ storyline:
         description: "Helper drops a LaunchAgent plist masquerading as an Apple iCloud sync daemon (drives the BTM causal rule)"
         path: "/Users/riley.chen/Library/LaunchAgents/com.apple.cloudsyncd.plist"
         action: create
+        launch_program: "/Users/Shared/.cloudsync/cloudsyncd"
         process_ref: cloudmensis_helper
 
   # --- Supporting: legitimate admin SSH (exercises openssh_login + openssh_logout) --
@@ -236,3 +287,102 @@ storyline:
     events:
       - type: logoff
         description: "SSH session close (renders as ES openssh_logout on the macOS host)"
+
+# Benign lookalikes: each one matches a naive version of a hunt query, so the
+# hunter has to refine it (see README.md "Refining past the red herrings").
+red_herrings:
+  # Homebrew bottles are ad-hoc linker-signed with no Team ID, launched by launchd,
+  # and `brew services` writes a user LaunchAgent (BTM follows): the same shape
+  # as CloudMensis, without the com.apple.* masquerade or the /Users/Shared stage.
+  - id: rh-brew-services-postgres
+    time: "+38m"
+    actor: jordan.lee
+    system: MAC-DEV-02
+    activity: "Developer starts a Homebrew PostgreSQL service"
+    explanation: "brew services writes homebrew.mxcl.postgresql@16.plist and launchd starts the ad-hoc signed postgres bottle; normal developer tooling"
+    events:
+      - type: process
+        process_name: "/opt/homebrew/Library/Homebrew/vendor/portable-ruby/3.3.4/bin/ruby"
+        command_line: "/opt/homebrew/Library/Homebrew/vendor/portable-ruby/3.3.4/bin/ruby -W1 --disable=gems,rubyopt /opt/homebrew/Library/Homebrew/brew.rb services start postgresql@16"
+        working_directory: "/Users/jordan.lee/dev/api"
+        process_ref: brew_ruby
+      - type: file
+        path: "/Users/jordan.lee/Library/LaunchAgents/homebrew.mxcl.postgresql@16.plist"
+        action: create
+        launch_program: "/opt/homebrew/opt/postgresql@16/bin/postgres"
+        process_ref: brew_ruby
+      - type: process
+        process_name: "/bin/launchctl"
+        command_line: "/bin/launchctl bootstrap gui/511 /Users/jordan.lee/Library/LaunchAgents/homebrew.mxcl.postgresql@16.plist"
+        parent_ref: brew_ruby
+      - type: process
+        process_name: "/opt/homebrew/opt/postgresql@16/bin/postgres"
+        command_line: "/opt/homebrew/opt/postgresql@16/bin/postgres -D /opt/homebrew/var/postgresql@16"
+
+  # Browsers read the login keychain for their Safe Storage key: a non-platform
+  # keychain open, but Developer ID signed with a known Team ID.
+  - id: rh-chrome-keychain-design
+    time: "+9m"
+    actor: dana.reyes
+    system: MAC-DESIGN-01
+    activity: "Chrome reads its Safe Storage key from the login keychain"
+    explanation: "Chrome (Developer ID, Team EQHXZ8M8AV) opens login.keychain-db at startup to decrypt saved passwords and cookies"
+    events:
+      - type: process
+        process_name: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        command_line: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        process_ref: chrome_design
+      - type: file
+        path: "/Users/dana.reyes/Library/Keychains/login.keychain-db"
+        action: open
+        process_ref: chrome_design
+  - id: rh-chrome-keychain-sales
+    time: "+57m"
+    actor: priya.nair
+    system: MAC-SALES-01
+    activity: "Chrome reads its Safe Storage key from the login keychain"
+    explanation: "Chrome (Developer ID, Team EQHXZ8M8AV) opens login.keychain-db at startup to decrypt saved passwords and cookies"
+    events:
+      - type: process
+        process_name: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        command_line: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        process_ref: chrome_sales
+      - type: file
+        path: "/Users/priya.nair/Library/Keychains/login.keychain-db"
+        action: open
+        process_ref: chrome_sales
+
+  # A native npm module builds in its install script and downloads Node headers:
+  # the same node -> sh -c -> node chain as BeaverTail, going to nodejs.org.
+  - id: rh-npm-node-gyp
+    time: "+64m"
+    actor: jordan.lee
+    system: MAC-DEV-02
+    activity: "npm install of a native module runs node-gyp, which downloads Node headers"
+    explanation: "bcrypt's install script runs node-gyp rebuild, which fetches the Node.js headers tarball from nodejs.org; normal for native modules"
+    events:
+      - type: process
+        process_name: "/usr/local/bin/node"
+        command_line: "node /usr/local/bin/npm install bcrypt"
+        working_directory: "/Users/jordan.lee/dev/api"
+        process_ref: gyp_npm
+      - type: process
+        process_name: "/bin/sh"
+        command_line: "sh -c \"node-gyp rebuild\""
+        working_directory: "/Users/jordan.lee/dev/api/node_modules/bcrypt"
+        parent_ref: gyp_npm
+        process_ref: gyp_sh
+      - type: process
+        process_name: "/usr/local/bin/node"
+        command_line: "node /usr/local/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js rebuild"
+        working_directory: "/Users/jordan.lee/dev/api/node_modules/bcrypt"
+        parent_ref: gyp_sh
+        process_ref: gyp_node
+      - type: connection
+        dst_ip: "104.20.23.46"
+        dst_port: 443
+        hostname: "nodejs.org"
+        service: ssl
+        orig_bytes: 2100
+        resp_bytes: 8650000
+        process_ref: gyp_node

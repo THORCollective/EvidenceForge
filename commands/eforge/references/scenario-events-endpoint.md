@@ -36,12 +36,15 @@ actor is `pid`, else the named earlier `process_ref`, else the most recent story
 the system; always give file events a resolvable actor. `path` is literal (no `~` expansion).
 `open`/`write`/`rename`/`unlink` render only on macOS (eslogger). A `create` under
 `LaunchAgents`/`LaunchDaemons` automatically adds the macOS `btm_launch_item_add` event; never
-author BTM events directly.
+author BTM events directly. For such a plist, optional `launch_program` names the program the
+plist runs (the BTM `executable_path`; defaults to the writer). A later `process` event that
+starts exactly that program on the same Mac is parented by launchd, as `launchctl` would start it.
 
 ```yaml
 - type: file
   path: /Users/riley.chen/Library/LaunchAgents/com.apple.WindowServer.plist
   action: create
+  launch_program: /Users/Shared/.ws/WindowServerHelper
   process_ref: persistence-helper
 ```
 

@@ -1,9 +1,10 @@
 # Splunk hunt kit for the macOS eslogger demo
 
 A local, single-container Splunk that ingests the demo's `eslogger` NDJSON plus Zeek JSON, adds
-flat hunter-friendly fields, and ships one saved search per hunt beat. Verified on 2026-09-29
-against a fresh `eforge generate --target splunk` run of `../scenario.yaml`: all 15 searches
-return the expected beat.
+flat hunter-friendly fields, and ships one saved search per hunt beat plus refined searches
+that rule out the scenario's red herrings. Verified on 2026-10-01 against a fresh
+`eforge generate --target splunk` run of `../scenario.yaml` (six Macs, `high` baseline): all 18
+searches return the expected rows.
 
 ## Run it
 
@@ -33,7 +34,7 @@ Splunk Web is at http://127.0.0.1:8000 (Free license, so no login). The searches
 | `props.conf` | `_time` from the envelope `time` (ns ISO-8601, µs kept); `KV_MODE=json`; flat EVAL fields (below); Zeek `src_ip`/`dest_ip` aliases. |
 | `lookups/es_event_types.csv` | `event_type` integer → `es_event` name (ESTypes.h codes the emitter uses). |
 | `lookups/mac_hosts.csv` | host → `host_short`, `host_ip`, `owner`. **This is the ES↔Zeek join key**: ES has no IP or hostname field. Update it if the scenario's IPs change. |
-| `savedsearches.conf` | `OBTS 00/01` orientation, `AMOS 1-5`, `BeaverTail 1-3`, `CloudMensis 1-3`, `SSH 1-2`. |
+| `savedsearches.conf` | `OBTS 00/01` orientation, `AMOS 1-5`, `BeaverTail 1-3`, `CloudMensis 1-3`, `SSH 1-2`, and the refinements `AMOS 1b`/`3b` and `BeaverTail 3b` (naive query first, then the refined one, which makes a good stage sequence). |
 | `server.conf` | `allowRemoteLogin = always` (Free license otherwise blocks REST, which `run_hunts.py` uses). |
 
 Flat fields (raw nested names still work, e.g. `'event.exec.target.executable.path'`):
@@ -57,6 +58,9 @@ Flat fields (raw nested names still work, e.g. `'event.exec.target.executable.pa
   plus a time window (`AMOS 4`, `BeaverTail 3`). There is no PID on Zeek rows, so the window is
   the join. The BeaverTail window also catches the developer's browser traffic
   (`news.ycombinator.com`); the beacon is the `api.ipcheck-beaver.cc` DNS → TLS to 45.128.199.72.
+- **Pivot windows are per event.** With several keychain reads or lifecycle scripts on one Mac,
+  the Zeek pivots match each Zeek row to the nearest ES event via `mvmap` over all event times,
+  not to the host's earliest one.
 - **`map` doesn't work in saved searches**: `savedsearch` treats `$tokens$` as arguments. The
   pivots use `append` + `eventstats` time windows, which fits the demo's small Zeek volume. For
   bigger datasets, narrow the appended Zeek search first.

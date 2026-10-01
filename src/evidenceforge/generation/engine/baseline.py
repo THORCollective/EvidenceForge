@@ -317,6 +317,9 @@ _MACOS_SOFTWAREUPDATED_CHECK_PROBABILITY = 0.06
 _MACOS_PREFS_CHURN_PROBABILITY = 0.22
 _MACOS_ICLOUD_DAEMON_PROBABILITY = 0.10
 _MACOS_TRUSTD_CHECK_PROBABILITY = 0.20
+# Independent Spotlight/cfprefsd/iCloud/trustd rounds per host-hour. A real Mac's
+# daemons run all hour; "low" keeps the sparse original rhythm.
+_MACOS_DAEMON_ROUNDS_BY_INTENSITY = {"low": 1, "medium": 10, "high": 30}
 _MACOS_PREFERENCE_PLIST_POOL = (
     ".GlobalPreferences.plist",
     "com.apple.finder.plist",
@@ -6758,14 +6761,29 @@ class BaselineMixin:
             return
 
         rng = _get_rng()
+        rounds = _MACOS_DAEMON_ROUNDS_BY_INTENSITY.get(
+            str(self.scenario.baseline_activity.intensity), 1
+        )
         for system in macos_systems:
             sys_pids = self._system_pids.get(system.hostname, {})
-            self._maybe_emit_macos_spotlight_burst(current_hour, system, sys_pids, rng)
             self._maybe_emit_macos_time_machine_backup(current_hour, system, sys_pids, rng)
             self._maybe_emit_macos_softwareupdated_check(current_hour, system, sys_pids, rng)
-            self._maybe_emit_macos_prefs_churn(current_hour, system, sys_pids, rng)
-            self._maybe_emit_macos_icloud_churn(current_hour, system, sys_pids, rng)
-            self._maybe_emit_macos_trustd_check(current_hour, system, sys_pids, rng)
+            for round_index in range(rounds):
+                # Spread rounds across the hour with per-round jitter.
+                slot = 3600.0 / rounds
+                shift = round_index * slot + rng.uniform(-0.35, 0.35) * slot
+                self._maybe_emit_macos_spotlight_burst(
+                    current_hour, system, sys_pids, rng, phase_shift=shift
+                )
+                self._maybe_emit_macos_prefs_churn(
+                    current_hour, system, sys_pids, rng, phase_shift=shift
+                )
+                self._maybe_emit_macos_icloud_churn(
+                    current_hour, system, sys_pids, rng, phase_shift=shift
+                )
+                self._maybe_emit_macos_trustd_check(
+                    current_hour, system, sys_pids, rng, phase_shift=shift
+                )
 
     def _maybe_emit_macos_spotlight_burst(
         self,
@@ -6773,6 +6791,7 @@ class BaselineMixin:
         system: System,
         sys_pids: dict[str, int],
         rng: random.Random,
+        phase_shift: float = 0.0,
     ) -> None:
         """Occasionally spawn a short-lived mdworker_shared indexing burst under mds."""
         mds_pid = sys_pids.get("mds")
@@ -6786,8 +6805,8 @@ class BaselineMixin:
             "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/"
             "Metadata.framework/Versions/A/Support/mdworker_shared"
         )
-        phase = _stable_seed(f"macos_spotlight_phase:{hn}") % 3600
-        base_offset = max(0.0, min(3599.0, phase + rng.gauss(0, 180)))
+        phase = (_stable_seed(f"macos_spotlight_phase:{hn}") % 3600 + phase_shift) % 3600
+        base_offset = (phase + rng.gauss(0, 180)) % 3600.0
         num_workers = rng.randint(1, 3)
         offset = base_offset
         for _ in range(num_workers):
@@ -6831,7 +6850,7 @@ class BaselineMixin:
         hn = system.hostname
         image = "/System/Library/CoreServices/TimeMachine/backupd"
         phase = _stable_seed(f"macos_backupd_phase:{hn}") % 3600
-        offset = max(0.0, min(3599.0, phase + rng.gauss(0, 120)))
+        offset = (phase + rng.gauss(0, 120)) % 3600.0
         ts = current_hour + timedelta(seconds=offset)
         self.state_manager.set_current_time(ts)
         pid = self.activity_generator.generate_system_process(
@@ -6873,7 +6892,7 @@ class BaselineMixin:
             "/System/Library/CoreServices/Software Update.app/Contents/Resources/softwareupdated"
         )
         phase = _stable_seed(f"macos_softwareupdated_phase:{hn}") % 3600
-        offset = max(0.0, min(3599.0, phase + rng.gauss(0, 300)))
+        offset = (phase + rng.gauss(0, 300)) % 3600.0
         ts = current_hour + timedelta(seconds=offset)
         self.state_manager.set_current_time(ts)
         pid = self.activity_generator.generate_system_process(
@@ -6902,6 +6921,7 @@ class BaselineMixin:
         system: System,
         sys_pids: dict[str, int],
         rng: random.Random,
+        phase_shift: float = 0.0,
     ) -> None:
         """Occasionally emit cfprefsd preference-cache file open/write churn.
 
@@ -6924,8 +6944,8 @@ class BaselineMixin:
 
         hn = system.hostname
         host_ctx = self.activity_generator._build_host_context(system)
-        phase = _stable_seed(f"macos_cfprefsd_phase:{hn}") % 3600
-        offset = max(0.0, min(3599.0, phase + rng.gauss(0, 300)))
+        phase = (_stable_seed(f"macos_cfprefsd_phase:{hn}") % 3600 + phase_shift) % 3600
+        offset = (phase + rng.gauss(0, 300)) % 3600.0
         num_touches = rng.randint(1, 2)
         for _ in range(num_touches):
             ts = current_hour + timedelta(seconds=offset)
@@ -6956,7 +6976,7 @@ class BaselineMixin:
                     file=FileContext(path=plist_path, action=action, pid=running_proc.pid),
                 )
             )
-            offset = max(0.0, min(3599.0, offset + rng.uniform(60.0, 900.0)))
+            offset = (offset + rng.uniform(60.0, 900.0)) % 3600.0
 
     def _maybe_emit_macos_icloud_churn(
         self,
@@ -6964,6 +6984,7 @@ class BaselineMixin:
         system: System,
         sys_pids: dict[str, int],
         rng: random.Random,
+        phase_shift: float = 0.0,
     ) -> None:
         """Occasionally spawn brief cloudd/bird iCloud-sync check-ins.
 
@@ -6989,8 +7010,8 @@ class BaselineMixin:
         ):
             if rng.random() >= _MACOS_ICLOUD_DAEMON_PROBABILITY:
                 continue
-            phase = _stable_seed(f"{phase_key}:{hn}") % 3600
-            offset = max(0.0, min(3599.0, phase + rng.gauss(0, 240)))
+            phase = (_stable_seed(f"{phase_key}:{hn}") % 3600 + phase_shift) % 3600
+            offset = (phase + rng.gauss(0, 240)) % 3600.0
             ts = current_hour + timedelta(seconds=offset)
             self.state_manager.set_current_time(ts)
             pid = self.activity_generator.generate_system_process(
@@ -7019,6 +7040,7 @@ class BaselineMixin:
         system: System,
         sys_pids: dict[str, int],
         rng: random.Random,
+        phase_shift: float = 0.0,
     ) -> None:
         """Occasionally emit trustd trust-store file open/read churn.
 
@@ -7045,8 +7067,8 @@ class BaselineMixin:
 
         hn = system.hostname
         host_ctx = self.activity_generator._build_host_context(system)
-        phase = _stable_seed(f"macos_trustd_phase:{hn}") % 3600
-        offset = max(0.0, min(3599.0, phase + rng.gauss(0, 300)))
+        phase = (_stable_seed(f"macos_trustd_phase:{hn}") % 3600 + phase_shift) % 3600
+        offset = (phase + rng.gauss(0, 300)) % 3600.0
         trust_path = rng.choice(_MACOS_TRUSTD_PATH_POOL)
         action = rng.choice(("open", "write"))
         ts = current_hour + timedelta(seconds=offset)

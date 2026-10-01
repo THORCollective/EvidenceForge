@@ -751,10 +751,14 @@ class ESLoggerEmitter(HostMultiplexEmitter):
                         "legacy": True,
                         "managed": False,
                         "uid": uid,
-                        "item_url": "file://" + quote(plist),
+                        # NSURL file URLs leave RFC 3986 sub-delims (e.g. `@`) unescaped.
+                        "item_url": "file://" + quote(plist, safe="/!$&'()*+,;=:@~"),
                         "app_url": None,
                     },
-                    "executable_path": proc.image if proc is not None else None,
+                    "executable_path": (
+                        (event.file.launch_program if event.file is not None else "")
+                        or (proc.image if proc is not None else None)
+                    ),
                 },
             ),
         )

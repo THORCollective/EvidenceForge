@@ -65,7 +65,12 @@ def handle_file(
             src_host=self.activity_generator._build_host_context(system),
             auth=AuthContext(username=actor.username),
             process=process_ctx,
-            file=FileContext(path=spec.path, action=spec.action, pid=pid),
+            file=FileContext(
+                path=spec.path,
+                action=spec.action,
+                pid=pid,
+                launch_program=spec.launch_program or "",
+            ),
             storyline_origin=True,
         )
     )
@@ -74,6 +79,12 @@ def handle_file(
     if pid > 0:
         malicious_event["pid"] = pid
 
+    if spec.action == "create" and spec.launch_program:
+        programs = getattr(self, "_macos_launch_item_programs", None)
+        if programs is None:
+            programs = {}
+            self._macos_launch_item_programs = programs
+        programs.setdefault(system.hostname, set()).add(spec.launch_program)
     if spec.action == "create":
         self.activity_generator._maybe_expand_file_create(
             file_path=spec.path,
@@ -82,5 +93,6 @@ def handle_file(
             actor=actor,
             pid=pid if pid > 0 else None,
             process_image=running_proc.image if running_proc is not None else None,
+            launch_program=spec.launch_program,
         )
     return malicious_event

@@ -342,7 +342,9 @@ def _ssh_action_deadline_runtime_headrooms(
     if (
         type(source_os_categories) is not tuple
         or not source_os_categories
-        or any(os_category not in {"linux", "windows"} for os_category in source_os_categories)
+        or any(
+            os_category not in {"linux", "windows", "macos"} for os_category in source_os_categories
+        )
     ):
         raise ValueError("SSH deadline source OS categories must be a non-empty exact tuple")
     headrooms = (
@@ -965,7 +967,11 @@ class _SshCloseHostFacts:
         )
         if any(type(value) is not str or len(value) > 4_096 for value in values):
             raise ValueError("Exact SSH close host contains malformed or oversized text")
-        if not host.hostname or not host.ip or host.os_category not in {"linux", "windows"}:
+        if (
+            not host.hostname
+            or not host.ip
+            or host.os_category not in {"linux", "windows", "macos"}
+        ):
             raise ValueError("Exact SSH close host has incomplete canonical identity")
         return cls(
             hostname=host.hostname,

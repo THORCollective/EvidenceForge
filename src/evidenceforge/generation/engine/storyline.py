@@ -3179,7 +3179,15 @@ class StorylineMixin:
         if not callable(source_time_getter):
             return network_time
         process_source_time = source_time_getter(system, pid)
-        if not isinstance(process_source_time, datetime) or network_time > process_source_time:
+        if not isinstance(process_source_time, datetime):
+            return network_time
+        if _get_os_category(system.os) == "macos":
+            # The connection's DNS prerequisite leads it by up to 1.5 s
+            # (network.dns_before_tcp); the owning process must already exist
+            # when it resolves the name.
+            earliest = process_source_time + timedelta(milliseconds=1500 + rng.randint(120, 700))
+            return max(network_time, earliest)
+        if network_time > process_source_time:
             return network_time
         return process_source_time + timedelta(milliseconds=rng.randint(120, 700))
 

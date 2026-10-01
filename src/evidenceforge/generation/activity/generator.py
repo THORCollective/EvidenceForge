@@ -6675,6 +6675,39 @@ class ActivityGenerator:
             return None
         return max(candidates, key=lambda session: session.start_time)
 
+    def _active_user_macos_console_session(
+        self,
+        user: User,
+        system: System,
+        time: datetime,
+        *,
+        include_locked: bool = True,
+    ) -> ActiveSession | None:
+        """Return the user's durable loginwindow (console) session on a Mac.
+
+        A macOS user logs in at loginwindow once and every app and Terminal
+        window runs in that audit session; baseline activity reuses it instead
+        of opening a session per activity burst.
+        """
+        if _get_os_category(system.os) != "macos":
+            return None
+        candidates = [
+            session
+            for session in self.state_manager.get_sessions_for_user_at(user.username, time)
+            if (
+                session.system == system.hostname
+                and _is_macos_workstation_session(session)
+                and _session_started_by(session, time)
+                and (
+                    include_locked
+                    or not self._workstation_session_locked_at(session, user, system, time)
+                )
+            )
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda session: session.start_time)
+
     def _active_user_workstation_windows_session(
         self,
         user: User,
@@ -11654,6 +11687,7 @@ class ActivityGenerator:
             process_name=kwargs.get("process_name"),
             os_category=kwargs.get("os_category"),
             file_path=kwargs.get("file_path"),
+            launch_program=kwargs.get("launch_program"),
             hostname=kwargs.get("hostname"),
             source_system=kwargs.get("source_system"),
             target_system=kwargs.get("target_system"),
@@ -11750,6 +11784,7 @@ class ActivityGenerator:
         actor: User | None = None,
         pid: int | None = None,
         process_image: str | None = None,
+        launch_program: str | None = None,
     ) -> None:
         """Hot-path-safe causal-expansion hook for file_create dispatch sites.
 
@@ -11770,6 +11805,7 @@ class ActivityGenerator:
             actor=actor,
             source_pid=pid,
             source_image=process_image,
+            launch_program=launch_program,
             os_category=_get_os_category(system.os),
         )
 
@@ -11782,6 +11818,7 @@ class ActivityGenerator:
         actor: User | None = None,
         pid: int | None = None,
         process_image: str | None = None,
+        launch_program: str | None = None,
     ) -> None:
         """Emit a macOS BTM ``btm_launch_item_add`` occurrence (Endpoint Security only).
 
@@ -11826,7 +11863,12 @@ class ActivityGenerator:
                 src_host=self._build_host_context(system),
                 auth=AuthContext(username=username) if username else None,
                 process=proc_ctx,
-                file=FileContext(path=plist_path, action="create", pid=pid or 0),
+                file=FileContext(
+                    path=plist_path,
+                    action="create",
+                    pid=pid or 0,
+                    launch_program=launch_program or "",
+                ),
                 storyline_origin=True,
             )
         )
@@ -12017,11 +12059,11 @@ class ActivityGenerator:
                 session_end_plan=request.session_end_plan,
             )
             return rendered_logon_id
-        if logon_id is None and os_cat == "windows" and logon_type in (2, 11):
-            existing_interactive = self._active_user_workstation_windows_session(
-                user,
-                system,
-                time,
+        if logon_id is None and os_cat in ("windows", "macos") and logon_type in (2, 11):
+            existing_interactive = (
+                self._active_user_workstation_windows_session(user, system, time)
+                if os_cat == "windows"
+                else self._active_user_macos_console_session(user, system, time)
             )
             if existing_interactive is not None:
                 reusable = (
@@ -27751,6 +27793,10 @@ class ActivityGenerator:
             elif is_service_account:
                 # Service accounts on workstations: network + service logons
                 logon_type = rng.choices([3, 5, 3], weights=[70, 25, 5], k=1)[0]
+            elif os_category == "macos":
+                # A Mac user's workstation logon is the loginwindow console
+                # session; there are no Windows network/cached/unlock types.
+                logon_type = 2
             else:
                 # Regular users on workstations: Type 3 dominant, no Type 5
                 logon_type = rng.choices([3, 2, 7, 11, 3], weights=[55, 20, 10, 10, 5], k=1)[0]
@@ -27761,10 +27807,14 @@ class ActivityGenerator:
                 and not is_service_account
                 and sys_type not in ("server", "domain_controller")
             ):
-                active_interactive = self._active_user_workstation_windows_session(
-                    user,
-                    system,
-                    time,
+                active_interactive = (
+                    self._active_user_macos_console_session(user, system, time)
+                    if os_category == "macos"
+                    else self._active_user_workstation_windows_session(
+                        user,
+                        system,
+                        time,
+                    )
                 )
             if active_interactive is not None and logon_type in (2, 7, 11):
                 # A baseline "logon" activity while the same user's console
@@ -27953,6 +28003,10 @@ class ActivityGenerator:
                 )
             elif os_category == "linux":
                 active_session = self._active_user_linux_process_session(user, system, time)
+            elif os_category == "macos":
+                active_session = self._active_user_macos_console_session(
+                    user, system, time, include_locked=False
+                )
             else:
                 active_session = None
 
@@ -28086,6 +28140,14 @@ class ActivityGenerator:
                         )
                 if result:
                     process_name, command_line = result
+                    if (
+                        os_category == "macos"
+                        and catalog_category != "browser"
+                        and ".app/Contents/MacOS/" in process_name
+                    ):
+                        # LaunchServices re-activates a running app bundle rather
+                        # than starting a second instance.
+                        singleton_per_session = True
 
                     singleton_key: tuple[str, str, str, str] | None = None
                     if singleton_per_session:

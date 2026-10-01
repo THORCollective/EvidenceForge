@@ -224,6 +224,7 @@ class PlistCreateBeforeBtmLaunchItem(ExpansionRule):
                     "actor": ctx.actor,
                     "pid": ctx.source_pid,
                     "process_image": ctx.source_image,
+                    "launch_program": ctx.launch_program,
                 },
                 timing=_timing_spec(
                     "macos.btm_after_plist_create",

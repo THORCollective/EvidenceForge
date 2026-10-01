@@ -421,6 +421,8 @@ class FileContext:
     pid: int = 0
     artifact_identity: LocalArtifactIdentity | None = None
     content_identity: FileContentIdentity | None = None
+    # Launch-item plists only: the program the plist runs (ES BTM executable_path).
+    launch_program: str = ""
 
 
 @dataclass(slots=True)

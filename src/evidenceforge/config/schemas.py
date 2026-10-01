@@ -3400,6 +3400,8 @@ class EdrFileSideEffectProfile(BaseModel, extra="forbid"):
     executables: list[str] = Field(default_factory=list)
     executable_contains: list[str] = Field(default_factory=list)
     command_contains: list[str] = Field(default_factory=list)
+    # Commands starting with one of these prefixes never match (e.g. `sh -c ` wrappers).
+    exclude_command_prefixes: list[str] = Field(default_factory=list)
     actions: list[Literal["create", "modify", "delete", "read"]]
     paths_windows: list[str] = Field(default_factory=list)
     paths_linux: list[str] = Field(default_factory=list)
