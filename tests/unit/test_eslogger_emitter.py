@@ -295,12 +295,70 @@ class TestFileEvents:
             auth=AuthContext(username="alice"),
         )
         rows = _rows(emitter, event)
-        assert len(rows) == 1
-        assert rows[0]["event_type"] == code
-        assert es_name in rows[0]["event"]
+        # The canonical beat is always rendered exactly once, by the same process;
+        # open/write/create also carry their derived fd open/close records.
+        beat = [r for r in rows if r["event_type"] == code and es_name in r["event"]]
+        assert len(beat) == 1
         # the path shows up in the event payload regardless of ES sub-key
-        assert path in json.dumps(rows[0]["event"][es_name])
-        assert rows[0]["process"]["audit_token"]["pid"] == 1700
+        assert path in json.dumps(beat[0]["event"][es_name])
+        assert all(r["process"]["audit_token"]["pid"] == 1700 for r in rows)
+        expected = {
+            "create": ["create", "close"],
+            "open": ["open", "close"],
+            "write": ["open", "write", "close"],
+            "rename": ["rename"],
+            "unlink": ["unlink"],
+        }[es_name]
+        assert [_event_name(r) for r in sorted(rows, key=lambda r: r["time"])] == expected
+
+
+class TestFileDescriptorLifecycle:
+    def _file_rows(self, emitter, mac_host, ts, event_type, action):
+        proc = ProcessContext(1700, 1, "/usr/sbin/cfprefsd", "cfprefsd", "alice", start_time=ts)
+        event = OccurrenceBuilder(
+            timestamp=ts,
+            event_type=event_type,
+            src_host=mac_host,
+            process=proc,
+            file=FileContext(
+                path="/Users/alice/Library/Preferences/com.apple.dock.plist",
+                action=action,
+                pid=1700,
+            ),
+            auth=AuthContext(username="alice"),
+        )
+        return sorted(_rows(emitter, event), key=lambda r: r["time"])
+
+    def test_write_is_bracketed_by_read_write_open_and_modified_close(self, emitter, mac_host, ts):
+        opened, written, closed = self._file_rows(emitter, mac_host, ts, "file_write", "write")
+        assert opened["event"]["open"]["fflag"] == 0x3  # FREAD | FWRITE
+        assert opened["time"] < written["time"] < closed["time"]
+        assert closed["event_type"] == 12
+        assert closed["event"]["close"]["modified"] is True
+        assert closed["event"]["close"]["was_mapped_writable"] is False
+
+    def test_read_open_is_followed_by_unmodified_close(self, emitter, mac_host, ts):
+        opened, closed = self._file_rows(emitter, mac_host, ts, "file_open", "open")
+        assert opened["event"]["open"]["fflag"] == 0x1
+        assert closed["event"]["close"]["modified"] is False
+        assert closed["event"]["close"]["target"] == opened["event"]["open"]["file"]
+
+
+class TestLocalAccountUids:
+    def test_assigned_user_is_501_and_other_users_follow(self, emitter):
+        emitter.configure_local_accounts(
+            {"MAC-01": "alice", "MAC-02": "bob"}, ["carol", "bob", "alice"]
+        )
+        assert emitter._macos_ids("alice", "MAC-01") == {"uid": 501, "gid": 20}
+        assert emitter._macos_ids("bob", "MAC-02") == {"uid": 501, "gid": 20}
+        # Non-primary accounts on MAC-01, in sorted username order: bob, carol.
+        assert emitter._macos_ids("bob", "MAC-01")["uid"] == 502
+        assert emitter._macos_ids("carol", "MAC-01")["uid"] == 503
+        assert emitter._macos_ids("root", "MAC-01") == {"uid": 0, "gid": 0}
+
+    def test_without_account_layout_uids_stay_in_user_band(self, emitter):
+        uid = emitter._macos_ids("alice", "MAC-01")["uid"]
+        assert 501 <= uid <= 600
 
     def test_create_reports_existing_file_destination(self, emitter, mac_host, ts):
         path = "/Users/alice/Library/LaunchAgents/com.example.plist"

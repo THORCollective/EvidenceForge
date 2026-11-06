@@ -127,6 +127,12 @@ refined versions.
   values from `ESTypes.h`, the launched program in `event.exec.target` (the
   exec's `process` is the pre-exec image), PIDs only inside audit tokens, and
   `codesigning_flags` as the `cs_blobs.h` bitmask.
+- **File I/O is a descriptor lifecycle.** Every read is `open` (`fflag` FREAD) →
+  `close` (`modified: false`); every write is `open` (FREAD|FWRITE) → `write` →
+  `close` (`modified: true`). The trust stores trustd consults are only read.
+- **Local accounts.** Each Mac's assigned user is uid 501 (the Setup Assistant
+  account); another user with a local account on that Mac — e.g. `riley.chen`
+  SSHing into `MAC-DEV-01` — gets a 502+ uid local to that host.
 - **Signing identity is the hunt's thesis.** The AMOS dropper and the
   CloudMensis helper are ad-hoc signed with no Team ID; `osascript` and every
   binary on the system volume are Apple platform binaries; third-party apps

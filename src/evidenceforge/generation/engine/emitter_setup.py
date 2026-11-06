@@ -396,6 +396,17 @@ class EmitterSetupMixin:
             emitter.configure_output_target(self.output_target)
             logger.info(f"Initialized {format_name} emitter (threaded)")
 
+        # Give the eslogger emitter each Mac's local account layout (uid 501 = assigned user)
+        if "eslogger" in self.emitters:
+            self.emitters["eslogger"].configure_local_accounts(
+                {
+                    system.hostname: system.assigned_user
+                    for system in self.scenario.environment.systems
+                    if system.assigned_user
+                },
+                [user.username for user in self.scenario.environment.users],
+            )
+
         # Configure ASA emitters with network topology for interface resolution
         if "cisco_asa" in self.emitters:
             asa_emitter = self.emitters["cisco_asa"]

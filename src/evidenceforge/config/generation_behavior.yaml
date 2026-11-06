@@ -1,7 +1,7 @@
 schema_version: "1.0"
-current_revision: 156
+current_revision: 157
 history_start_revision: 1
-behavior_surface_sha256: 8feba5f17eff612e0ca13dcd00465e70a189d28a0da5e94faf7df7cadb058390
+behavior_surface_sha256: 0381b5bafcbe0e7d2f2861f6c1a421f517573a5a862bb6e3a06a8ac6a72b2bee
 changes:
   - revision: 1
     id: initial-generation-behavior-contract
@@ -1583,3 +1583,11 @@ changes:
       - zeek_dns
       - zeek_conn
     summary: Match real eslogger captures (time-ordered per-client sequence numbers, launchd-activated sshd, terminal-only ttys, exit parents) and keep Windows-only DNS off Macs.
+  - revision: 157
+    id: macos-eslogger-local-accounts-fd-lifecycle
+    impact: material
+    domains:
+      - macos-endpoint-telemetry
+    formats:
+      - eslogger
+    summary: Give each Mac's assigned user uid 501 (other local accounts 502+), render file reads and writes as open/write/close descriptor lifecycles, and keep trustd's trust stores read-only.

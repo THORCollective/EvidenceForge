@@ -266,6 +266,22 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         # `openssh_logout` renders only for a session in this map (see
         # can_handle()) and is reported by the same sshd.
         self._openssh_login_sessions: dict[tuple[str, int], dict[str, Any]] = {}
+        # Local account layout per Mac, set by the engine (configure_local_accounts).
+        # hostname -> primary (assigned) user, and the scenario's full user list.
+        self._host_primary_user: dict[str, str] = {}
+        self._known_usernames: list[str] = []
+
+    def configure_local_accounts(
+        self, host_primary_user: dict[str, str], usernames: list[str]
+    ) -> None:
+        """Record each Mac's assigned user and the scenario's user population.
+
+        macOS gives the first account created in Setup Assistant uid 501; later
+        local accounts get 502, 503, ...  The host's assigned user is that first
+        account, so it resolves to 501 on its own Mac (see ``_macos_ids``).
+        """
+        self._host_primary_user = dict(host_primary_user)
+        self._known_usernames = sorted(set(usernames))
 
     def _publish_line_transform_factory(self) -> Callable[[], Callable[[str], str]] | None:
         """Assign ES client sequence numbers in each host file's final time order."""
@@ -538,12 +554,56 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         else:  # write
             payload = {"target": self._es_file(path)}
 
+        # ES reports file I/O as a descriptor lifecycle: a write happens on an fd
+        # opened for writing and is followed by a close with ``modified`` set; a
+        # read-only open is followed by an unmodified close.  The canonical event
+        # carries one beat, so the surrounding open/close are derived here with
+        # small deterministic offsets.
+        scope = f"{host.hostname}:{process_obj.get('audit_token', {}).get('pid', 0)}:{path}"
+        if event_name == "write":
+            open_delta = timedelta(
+                microseconds=40 + _stable_seed(f"es_write_open:{scope}:{event.timestamp}") % 400
+            )
+            self._queue_file_record(
+                host,
+                "open",
+                event.timestamp - open_delta,
+                process_obj,
+                {"fflag": _FREAD | _FWRITE, "file": self._es_file(path)},
+            )
+        self._queue_file_record(host, event_name, event.timestamp, process_obj, payload)
+        if event_name in {"open", "write", "create"}:
+            modified = event_name != "open" or fc.action == "write"
+            close_delta = timedelta(
+                microseconds=60 + _stable_seed(f"es_close:{scope}:{event.timestamp}") % 2400
+            )
+            self._queue_file_record(
+                host,
+                "close",
+                event.timestamp + close_delta,
+                process_obj,
+                {
+                    "modified": modified,
+                    "target": self._es_file(path),
+                    "was_mapped_writable": False,
+                },
+            )
+
+    def _queue_file_record(
+        self,
+        host: HostContext,
+        event_name: str,
+        event_time: datetime,
+        process_obj: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> None:
+        """Queue one ES file-event record for ``host``."""
         self._queue_record(
             host,
             self._envelope(
                 host=host,
                 event_name=event_name,
-                event_time=event.timestamp,
+                event_time=event_time,
                 process_obj=process_obj,
                 event_payload=payload,
             ),
@@ -560,7 +620,7 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         # orphan and must be dropped.
         process_obj = self._connection_sshd_process_object(host, auth)
         self._openssh_login_sessions[(host.hostname, auth.session_id)] = process_obj
-        uid = self._macos_ids(auth.username)["uid"]
+        uid = self._macos_ids(auth.username, host.hostname)["uid"]
         success = auth.result != "failure"
         self._queue_record(
             host,
@@ -592,7 +652,7 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         process_obj = self._openssh_login_sessions.get(
             (host.hostname, auth.session_id)
         ) or self._connection_sshd_process_object(host, auth)
-        uid = self._macos_ids(auth.username)["uid"]
+        uid = self._macos_ids(auth.username, host.hostname)["uid"]
         self._queue_record(
             host,
             self._envelope(
@@ -665,8 +725,8 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         from_username = (auth.subject_username if auth is not None else "") or proc.username
         to_username = (auth.username if auth is not None else "") or "root"
         success = not (auth is not None and auth.result == "failure")
-        from_uid = self._macos_ids(from_username)["uid"]
-        to_uid = self._macos_ids(to_username)["uid"]
+        from_uid = self._macos_ids(from_username, host.hostname)["uid"]
+        to_uid = self._macos_ids(to_username, host.hostname)["uid"]
         payload: dict[str, Any]
         if tool == "sudo":
             payload = {
@@ -733,7 +793,7 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         elif proc is not None:
             username = proc.username
         # LaunchDaemons run as root; LaunchAgents belong to the owning user.
-        uid = self._macos_ids(username)["uid"] if is_agent and username else 0
+        uid = self._macos_ids(username, host.hostname)["uid"] if is_agent and username else 0
         self._queue_record(
             host,
             self._envelope(
@@ -793,7 +853,7 @@ class ESLoggerEmitter(HostMultiplexEmitter):
 
         is_login = self._is_login_session(username, logon_id, session_id)
         asid = self._resolve_asid(hostname, username, logon_id, session_id, is_login)
-        audit_token = self._audit_token(pid, pidversion, username, asid, is_login)
+        audit_token = self._audit_token(hostname, pid, pidversion, username, asid, is_login)
         parent_audit_token = self._parent_audit_token(host, ppid, asid)
         # Launchd jobs and apps are responsible for themselves; anything they
         # spawn is attributed to that responsible ancestor (approximated here
@@ -999,10 +1059,16 @@ class ESLoggerEmitter(HostMultiplexEmitter):
     # ------------------------------------------------------------------
 
     def _audit_token(
-        self, pid: int, pidversion: int, username: str, asid: int, is_login: bool
+        self,
+        hostname: str,
+        pid: int,
+        pidversion: int,
+        username: str,
+        asid: int,
+        is_login: bool,
     ) -> dict[str, Any]:
         """Build an ES audit token for a process."""
-        ids = self._macos_ids(username)
+        ids = self._macos_ids(username, hostname)
         auid = ids["uid"] if is_login else _KAUTH_UID_NONE
         return {
             "pid": pid,
@@ -1026,7 +1092,9 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         is_login = self._is_login_session(
             parent_username, parent_rp.logon_id if parent_rp is not None else "", 0
         )
-        return self._audit_token(ppid, parent_pidversion, parent_username, asid, is_login)
+        return self._audit_token(
+            host.hostname, ppid, parent_pidversion, parent_username, asid, is_login
+        )
 
     @staticmethod
     def _is_login_session(username: str, logon_id: str, session_id: int) -> bool:
@@ -1039,20 +1107,29 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         # when no explicit session id was threaded through.
         return bool(username) and not username.startswith("_") and username != "root"
 
-    @staticmethod
-    def _macos_ids(username: str) -> dict[str, int]:
-        """Return a deterministic macOS uid/gid for a username.
+    def _macos_ids(self, username: str, hostname: str = "") -> dict[str, int]:
+        """Return a deterministic macOS uid/gid for a username on a host.
 
         macOS reserves 0 for root, the 200-399 band for system service accounts
-        (``_``-prefixed), and 501+ for regular users (gid 20 == ``staff``).  No
-        other source owns a macOS uid, so it is derived here via ``_stable_seed``
-        (never ``hash()``) so the same user resolves identically across runs.
+        (``_``-prefixed), and 501+ for regular users (gid 20 == ``staff``).  uids
+        are local to each Mac: the host's assigned user is the first account
+        (501) and any other scenario user with a local account on that Mac gets
+        502, 503, ... in a stable (sorted-username) order.  Without account
+        layout (unit tests, raw emitters) users fall back to a stable 501-600
+        derivation via ``_stable_seed`` (never ``hash()``).
         """
         if username == "root":
             return {"uid": 0, "gid": 0}
         if username.startswith("_"):
             uid = 200 + (_stable_seed(f"macos_service_uid:{username}") % 200)
             return {"uid": uid, "gid": uid}
+        primary = self._host_primary_user.get(hostname)
+        if primary:
+            if username == primary:
+                return {"uid": 501, "gid": 20}
+            others = [u for u in self._known_usernames if u != primary]
+            if username in others:
+                return {"uid": 502 + others.index(username), "gid": 20}
         uid = 501 + (_stable_seed(f"macos_uid:{username}") % 100)
         return {"uid": uid, "gid": 20}
 
