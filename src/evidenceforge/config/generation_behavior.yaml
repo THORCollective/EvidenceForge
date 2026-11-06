@@ -1,7 +1,7 @@
 schema_version: "1.0"
-current_revision: 159
+current_revision: 160
 history_start_revision: 1
-behavior_surface_sha256: 45fcb108bbd7aacc84b16667a0b14fb46a041b831a7040167e1cafa9862c31d6
+behavior_surface_sha256: dc74c5c53e9d93b165ec0b16c69e3cea08fc704bd9bb1ef98a48c8f65cfb07f1
 changes:
   - revision: 1
     id: initial-generation-behavior-contract
@@ -1607,3 +1607,11 @@ changes:
     formats:
       - eslogger
     summary: Serialize eslogger records like eslogger itself, with per-record shuffled (seeded) key order and slashes escaped as \/.
+  - revision: 160
+    id: macos-application-install-stamp-realism
+    impact: localized
+    domains:
+      - macos-endpoint-telemetry
+    formats:
+      - eslogger
+    summary: Offset /Applications install stamps by time of day as well as days, and render archive-extracted birth/mtime as exact whole seconds.

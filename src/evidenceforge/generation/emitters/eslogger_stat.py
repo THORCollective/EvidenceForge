@@ -112,6 +112,9 @@ class _FileState:
     rdev: int = 0
     compression: float = 1.0
     whole_seconds: bool = False
+    # Archive-extracted files (/Applications) keep a whole-second birth time,
+    # and mtime stays whole while it still equals birth.
+    whole_birth: bool = False
 
 
 class MacFileStatModel:
@@ -215,7 +218,11 @@ class MacFileStatModel:
         uid, gid = self._owner(hostname, path, seed, owner_uid)
         perm = self._permissions(path, kind, is_dir)
         if path.startswith("/Applications/"):
-            installed = (at - timedelta(days=5 + seed % 300)).replace(microsecond=0)
+            # Offset the time of day too, so the install stamp never shares the
+            # clock time of the event that first touches the file.
+            installed = (
+                at - timedelta(days=5 + seed % 300, seconds=(seed >> 12) % 86_400)
+            ).replace(microsecond=0)
             later = self._with_ns(installed + timedelta(minutes=1 + seed % 90), seed)
             return _FileState(
                 ino=self._data_ino(seed),
@@ -229,6 +236,7 @@ class MacFileStatModel:
                 mtime=installed,
                 ctime=later,
                 atime=later,
+                whole_birth=True,
             )
 
         birth = self._with_ns(at - timedelta(days=20 + seed % 400, seconds=seed % 86_400), seed)
@@ -341,6 +349,8 @@ class MacFileStatModel:
             stored = max(1, math.ceil(state.size * state.compression))
             blocks = math.ceil(stored / 4096) * 8
         whole = state.whole_seconds
+        whole_birth = whole or state.whole_birth
+        whole_mtime = whole or (state.whole_birth and state.mtime == state.birth)
         return {
             "st_dev": self._dev(hostname, kind),
             "st_mode": state.mode,
@@ -350,9 +360,9 @@ class MacFileStatModel:
             "st_gid": state.gid,
             "st_rdev": state.rdev,
             "st_atimespec": self._timespec(state.atime, whole),
-            "st_mtimespec": self._timespec(state.mtime, whole),
+            "st_mtimespec": self._timespec(state.mtime, whole_mtime),
             "st_ctimespec": self._timespec(state.ctime, whole),
-            "st_birthtimespec": self._timespec(state.birth, whole),
+            "st_birthtimespec": self._timespec(state.birth, whole_birth),
             "st_size": state.size,
             "st_blocks": blocks,
             "st_blksize": 65_536 if kind == "tty" else 4_096,

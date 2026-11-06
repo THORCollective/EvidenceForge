@@ -785,3 +785,25 @@ class TestEsloggerSerialization:
         assert first == self._publish(records)
         orders = {tuple(json.loads(line)) for line in first}
         assert len(orders) > 1
+
+
+def test_application_install_stamp_is_whole_seconds_at_another_time_of_day():
+    """An /Applications file was unpacked from an archive: birth == mtime in whole
+    seconds, at a clock time unrelated to the event that first touches it."""
+    from datetime import UTC, datetime
+
+    from evidenceforge.generation.emitters.eslogger_stat import MacFileStatModel
+
+    model = MacFileStatModel(lambda user, host: 501)
+    at = datetime(2024, 6, 11, 14, 21, 53, 921201, tzinfo=UTC)
+    paths = [
+        "/Applications/CleanMyMacX Helper.app/Contents/MacOS/CleanMyMacX Helper",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Slack.app/Contents/MacOS/Slack",
+    ]
+    for path in paths:
+        stat = model.stat("MAC-01.example.test", path, at, kind="exec")
+        assert stat["st_birthtimespec"] == stat["st_mtimespec"]
+        assert stat["st_birthtimespec"].endswith(".000000000Z")
+        assert stat["st_birthtimespec"][11:19] != "14:21:53"
+        assert not stat["st_ctimespec"].endswith(".000000000Z")
