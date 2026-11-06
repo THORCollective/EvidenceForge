@@ -1,7 +1,7 @@
 schema_version: "1.0"
-current_revision: 157
+current_revision: 158
 history_start_revision: 1
-behavior_surface_sha256: 0381b5bafcbe0e7d2f2861f6c1a421f517573a5a862bb6e3a06a8ac6a72b2bee
+behavior_surface_sha256: 86163301e1ee01bc6e800159064b490f3c4d6ca3a89739d993a28309b12fa25a
 changes:
   - revision: 1
     id: initial-generation-behavior-contract
@@ -1591,3 +1591,11 @@ changes:
     formats:
       - eslogger
     summary: Give each Mac's assigned user uid 501 (other local accounts 502+), render file reads and writes as open/write/close descriptor lifecycles, and keep trustd's trust stores read-only.
+  - revision: 158
+    id: macos-trustd-verified-paths-file-stat
+    impact: material
+    domains:
+      - macos-endpoint-telemetry
+    formats:
+      - eslogger
+    summary: Use real-Mac trustd paths (WAL writes) and give every es_file_t a stateful struct stat matching a live eslogger capture.

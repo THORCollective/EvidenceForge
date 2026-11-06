@@ -326,23 +326,20 @@ _MACOS_PREFERENCE_PLIST_POOL = (
     "com.apple.systempreferences.plist",
     "com.apple.dock.plist",
 )
-# Local trust-store artifacts trustd consults/updates for cached OCSP and
-# certificate-validity decisions -- this is trustd's own eslogger-visible
-# footprint, distinct from (but conceptually paired with) the network-level
-# OCSP-fetch process attribution fix in ActivityGenerator._emit_ocsp_http_response.
+# Local trust-store artifacts trustd consults for certificate-validity decisions
+# -- trustd's own eslogger-visible footprint, distinct from (but conceptually
+# paired with) the network-level OCSP-fetch process attribution in
+# ActivityGenerator._emit_ocsp_http_response.  Paths verified on a real Mac: the
+# root store lives on the sealed system volume, trustd's Valid and pinning
+# databases under /private/var/protected/trustd.  All of them are only read.
 _MACOS_TRUSTD_PATH_POOL = (
     "/System/Library/Keychains/SystemRootCertificates.keychain",
-    "/Library/Keychains/SystemCACertificates.keychain",
-    "/private/var/protected/trustd/private/thread-events.data",
+    "/private/var/protected/trustd/valid.sqlite3",
+    "/private/var/protected/trustd/pinningrules.sqlite3",
 )
-# The trust stores are read-only to trustd (the root store lives on the sealed
-# system volume); only trustd's private state file is ever written.
-_MACOS_TRUSTD_READ_ONLY_PATHS = frozenset(
-    {
-        "/System/Library/Keychains/SystemRootCertificates.keychain",
-        "/Library/Keychains/SystemCACertificates.keychain",
-    }
-)
+# trustd's Valid database runs in SQLite WAL mode, so its updates land in the
+# write-ahead log, never in the trust stores themselves.
+_MACOS_TRUSTD_WRITE_PATH = "/private/var/protected/trustd/valid.sqlite3-wal"
 
 
 def _ufw_block_syn_packet_len(src_ip: str) -> int:
@@ -7079,8 +7076,8 @@ class BaselineMixin:
         offset = (phase + rng.gauss(0, 300)) % 3600.0
         trust_path = rng.choice(_MACOS_TRUSTD_PATH_POOL)
         action = rng.choice(("open", "write"))
-        if trust_path in _MACOS_TRUSTD_READ_ONLY_PATHS:
-            action = "open"
+        if action == "write":
+            trust_path = _MACOS_TRUSTD_WRITE_PATH
         ts = current_hour + timedelta(seconds=offset)
         self.state_manager.set_current_time(ts)
         self.activity_generator.dispatcher.dispatch_builder(

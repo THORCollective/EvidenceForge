@@ -161,7 +161,9 @@ class TestProcessLifecycle:
         assert exec_event["target"]["audit_token"]["pid"] == 1500
         assert exec_event["target"]["executable"]["path"] == "/usr/bin/osascript"
         assert exec_event["args"] == ["osascript", "-e", "do shell script"]
-        assert exec_event["cwd"] == {"path": "/Users/alice", "path_truncated": False}
+        assert exec_event["cwd"]["path"] == "/Users/alice"
+        assert exec_event["cwd"]["path_truncated"] is False
+        assert exec_event["cwd"]["stat"]["st_mode"] & 0o170000 == 0o040000  # a directory
 
     def test_exec_subject_is_pre_exec_image_of_the_parent_binary(self, emitter, mac_host, ts):
         """es_event_exec_t: message process = image before exec, target = image after."""
@@ -342,6 +344,151 @@ class TestFileDescriptorLifecycle:
         assert opened["event"]["open"]["fflag"] == 0x1
         assert closed["event"]["close"]["modified"] is False
         assert closed["event"]["close"]["target"] == opened["event"]["open"]["file"]
+
+
+class TestFileStat:
+    """Every es_file_t carries a stat shaped like a real eslogger capture."""
+
+    _STAT_KEYS = {
+        "st_dev",
+        "st_mode",
+        "st_nlink",
+        "st_ino",
+        "st_uid",
+        "st_gid",
+        "st_rdev",
+        "st_atimespec",
+        "st_mtimespec",
+        "st_ctimespec",
+        "st_birthtimespec",
+        "st_size",
+        "st_blocks",
+        "st_blksize",
+        "st_flags",
+        "st_gen",
+    }
+
+    def _write_rows(self, emitter, mac_host, ts, path, image="/usr/sbin/cfprefsd"):
+        proc = ProcessContext(1700, 1, image, image.rsplit("/", 1)[-1], "alice", start_time=ts)
+        event = OccurrenceBuilder(
+            timestamp=ts,
+            event_type="file_write",
+            src_host=mac_host,
+            process=proc,
+            file=FileContext(path=path, action="write", pid=1700),
+            auth=AuthContext(username="alice"),
+        )
+        return sorted(_rows(emitter, event), key=lambda r: r["time"])
+
+    def test_every_es_file_has_a_full_stat(self, emitter, mac_host, ts):
+        rows = self._write_rows(emitter, mac_host, ts, "/Users/alice/Library/Preferences/x.plist")
+        for row in rows:
+            assert set(row["process"]["executable"]["stat"]) == self._STAT_KEYS
+            payload = next(iter(row["event"].values()))
+            es_file = payload.get("file") or payload.get("target")
+            assert set(es_file["stat"]) == self._STAT_KEYS
+
+    def test_write_grows_the_file_and_moves_mtime(self, emitter, mac_host, ts):
+        from evidenceforge.generation.emitters.eslogger import _es_client_sequence_numbering
+
+        rows = self._write_rows(emitter, mac_host, ts, "/Users/alice/Library/Preferences/x.plist")
+        number = _es_client_sequence_numbering()
+        opened, written, closed = [
+            json.loads(number(json.dumps(r, separators=(",", ":")))) for r in rows
+        ]
+        before = opened["event"]["open"]["file"]["stat"]
+        after = written["event"]["write"]["target"]["stat"]
+        assert after["st_ino"] == before["st_ino"]
+        assert after["st_size"] > before["st_size"]
+        assert after["st_mtimespec"] > before["st_mtimespec"]
+        assert after["st_mtimespec"] < written["time"]
+        assert after["st_blocks"] == -(-after["st_size"] // 4096) * 8
+        assert closed["event"]["close"]["target"]["stat"] == after
+
+    def test_out_of_order_emission_still_reads_in_time_order(self):
+        from evidenceforge.generation.emitters.eslogger_stat import FileWriteTimeline
+
+        def rec(event_type, key, time, size, mtime):
+            stat = {
+                "st_size": size,
+                "st_mtimespec": mtime,
+                "st_ctimespec": mtime,
+                "st_birthtimespec": mtime,
+                "st_blocks": 0,
+                "st_flags": 0,
+                "st_mode": 0o100644,
+            }
+            sub = (
+                {"file": {"path": "/p", "stat": stat}}
+                if key == "open"
+                else {"target": {"path": "/p", "stat": stat}}
+            )
+            return {"time": time, "event_type": event_type, "event": {key: sub}}
+
+        base = "2024-06-01T00:00:00.000000000Z"
+        timeline = FileWriteTimeline()
+        records = [
+            rec(10, "open", "2024-06-11T10:00:00.000000100Z", 1000, base),
+            rec(33, "write", "2024-06-11T10:00:00.000200100Z", 1000, base),
+            rec(12, "close", "2024-06-11T10:00:00.000400100Z", 1000, base),
+            rec(33, "write", "2024-06-11T10:00:00.000600100Z", 1000, base),
+            rec(12, "close", "2024-06-11T10:00:00.000800100Z", 1000, base),
+        ]
+        for r in records:
+            timeline.apply(r)
+        sizes = [
+            next(iter(next(iter(r["event"].values())).values()))["stat"]["st_size"] for r in records
+        ]
+        assert sizes[0] == 1000
+        assert sizes[1] > 1000 and sizes[2] == sizes[1]
+        assert sizes[3] > sizes[2] and sizes[4] == sizes[3]
+
+    def test_user_preference_file_shape(self, emitter, mac_host, ts):
+        emitter.configure_local_accounts({"MAC-01": "alice"}, ["alice"])
+        st = self._write_rows(emitter, mac_host, ts, "/Users/alice/Library/Preferences/y.plist")[1][
+            "event"
+        ]["write"]["target"]["stat"]
+        assert (st["st_mode"], st["st_uid"], st["st_gid"], st["st_flags"]) == (
+            0o100600,
+            501,
+            20,
+            0,
+        )
+        assert st["st_blocks"] == -(-st["st_size"] // 4096) * 8
+        assert not st["st_mtimespec"].endswith(".000000000Z")
+
+    def test_system_binary_shape(self, emitter, mac_host, ts):
+        exe = self._write_rows(emitter, mac_host, ts, "/tmp/z")[0]["process"]["executable"]
+        st = exe["stat"]
+        assert exe["path"] == "/usr/sbin/cfprefsd"
+        assert (st["st_mode"], st["st_uid"], st["st_gid"], st["st_nlink"]) == (
+            0o100755,
+            0,
+            0,
+            1,
+        )
+        assert st["st_flags"] == 0x80020  # SF_RESTRICTED | UF_COMPRESSED
+        assert st["st_blocks"] * 512 < st["st_size"]  # compressed on disk
+        times = {
+            st[k] for k in ("st_atimespec", "st_mtimespec", "st_ctimespec", "st_birthtimespec")
+        }
+        assert len(times) == 1 and times.pop().endswith(".000000000Z")
+
+    def test_created_file_is_owned_by_its_creator_and_starts_empty(self, emitter, mac_host, ts):
+        proc = ProcessContext(1800, 1, "/Users/Shared/.x/helper", "helper", "alice", start_time=ts)
+        event = OccurrenceBuilder(
+            timestamp=ts,
+            event_type="file_create",
+            src_host=mac_host,
+            process=proc,
+            file=FileContext(path="/Users/Shared/.x/dropped.plist", action="create", pid=1800),
+            auth=AuthContext(username="alice"),
+        )
+        created = next(r for r in _rows(emitter, event) if r["event_type"] == 13)
+        st = created["event"]["create"]["destination"]["existing_file"]["stat"]
+        assert st["st_size"] == 0 and st["st_blocks"] == 0
+        assert st["st_uid"] == created["process"]["audit_token"]["euid"]
+        assert st["st_birthtimespec"] == st["st_mtimespec"]
 
 
 class TestLocalAccountUids:

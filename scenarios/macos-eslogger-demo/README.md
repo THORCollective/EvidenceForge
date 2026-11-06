@@ -129,7 +129,15 @@ refined versions.
   `codesigning_flags` as the `cs_blobs.h` bitmask.
 - **File I/O is a descriptor lifecycle.** Every read is `open` (`fflag` FREAD) →
   `close` (`modified: false`); every write is `open` (FREAD|FWRITE) → `write` →
-  `close` (`modified: true`). The trust stores trustd consults are only read.
+  `close` (`modified: true`). trustd only reads its trust stores and Valid
+  database; its updates land in `valid.sqlite3-wal`.
+- **Every `es_file_t` carries `stat`.** Executables, ttys, working directories
+  and file targets all have the full `struct stat`, shaped after a live
+  `eslogger` capture: system-volume binaries are root-owned, restricted,
+  compressed and stamped with the OS build time; home-folder files belong to
+  the user (`0600` preferences); a file keeps its inode across events, and each
+  `write` grows it and moves its mtime in time order (the `open` before a write
+  still shows the old file). A created file starts empty, owned by its creator.
 - **Local accounts.** Each Mac's assigned user is uid 501 (the Setup Assistant
   account); another user with a local account on that Mac — e.g. `riley.chen`
   SSHing into `MAC-DEV-01` — gets a 502+ uid local to that host.

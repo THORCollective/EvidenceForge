@@ -55,6 +55,11 @@ from urllib.parse import quote
 from evidenceforge.events.base import CanonicalOccurrence
 from evidenceforge.events.contexts import HostContext
 from evidenceforge.generation.activity.macos_signing import get_signing_identity
+from evidenceforge.generation.emitters.eslogger_stat import (
+    FILE_EVENT_TYPES,
+    FileWriteTimeline,
+    MacFileStatModel,
+)
 from evidenceforge.generation.emitters.host_base import HostMultiplexEmitter
 from evidenceforge.utils.rng import _stable_seed
 
@@ -190,14 +195,22 @@ def _es_client_sequence_numbering() -> Callable[[str], str]:
     A Mac's eslogger client numbers messages in delivery order: ``global_seq_num``
     is contiguous across every event type, and ``seq_num`` is contiguous per
     ``event_type`` (ESMessage.h). Gaps would signal dropped messages.
+
+    The same pass applies file writes to ``stat`` in true time order
+    (FileWriteTimeline), since it is the one place records are seen sorted.
     """
     per_type: dict[str, int] = {}
     total = 0
+    timeline = FileWriteTimeline()
 
     def number(line: str) -> str:
         nonlocal total
         match = _EVENT_TYPE_RE.search(line)
         event_type = match.group(1) if match else ""
+        if event_type.isdigit() and int(event_type) in FILE_EVENT_TYPES:
+            record = json.loads(line)
+            if timeline.apply(record):
+                line = json.dumps(record, separators=(",", ":"))
         per_type[event_type] = per_type.get(event_type, 0) + 1
         total += 1
         return _SEQ_FIELDS_RE.sub(
@@ -270,6 +283,11 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         # hostname -> primary (assigned) user, and the scenario's full user list.
         self._host_primary_user: dict[str, str] = {}
         self._known_usernames: list[str] = []
+        # Per-host file metadata for every es_file_t's `stat` (stable inodes,
+        # sizes and timestamps that advance on create/write).
+        self._stat_model = MacFileStatModel(
+            lambda username, hostname: self._macos_ids(username, hostname)["uid"]
+        )
 
     def configure_local_accounts(
         self, host_primary_user: dict[str, str], usernames: list[str]
@@ -479,7 +497,10 @@ class ESLoggerEmitter(HostMultiplexEmitter):
                     "dyld_exec_path": proc.image,
                     "script": None,
                     "cwd": self._es_file(
-                        proc.current_directory or self._default_cwd(proc.username)
+                        proc.current_directory or self._default_cwd(proc.username),
+                        host,
+                        start_time,
+                        kind="dir",
                     ),
                     "last_fd": 2 + _stable_seed(f"es_last_fd:{host.hostname}:{proc.pid}") % 6,
                     "image_cputype": _CPU_TYPE_ARM64,
@@ -527,64 +548,78 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         pid_hint = fc.pid or (event.process.pid if event.process else 0)
         process_obj = self._process_object_for(host, event, pid_hint)
         parent_dir, _, filename = path.rpartition("/")
+        hn = host.hostname
+        at = event.timestamp
+        actor_uid = process_obj.get("audit_token", {}).get("euid", 0)
 
-        if event_name == "create":
-            payload: dict[str, Any] = {
-                "destination_type": _ES_DESTINATION_TYPE_EXISTING_FILE,
-                "destination": {"existing_file": self._es_file(path)},
-            }
-        elif event_name == "open":
-            fflag = _FREAD | _FWRITE if fc.action == "write" else _FREAD
-            payload = {"fflag": fflag, "file": self._es_file(path)}
-        elif event_name == "rename":
-            # FileContext carries a single path; the rename destination is not
-            # modeled canonically, so report the new name in the same directory.
-            payload = {
-                "source": self._es_file(path),
-                "destination_type": _ES_DESTINATION_TYPE_NEW_PATH,
-                "destination": {
-                    "new_path": {"dir": self._es_file(parent_dir or "/"), "filename": filename}
-                },
-            }
-        elif event_name == "unlink":
-            payload = {
-                "target": self._es_file(path),
-                "parent_dir": self._es_file(parent_dir or "/"),
-            }
-        else:  # write
-            payload = {"target": self._es_file(path)}
+        def es_file(target: str, when: datetime, kind: str = "file") -> dict[str, Any]:
+            return self._es_file(target, host, when, kind=kind, owner_uid=actor_uid)
 
         # ES reports file I/O as a descriptor lifecycle: a write happens on an fd
         # opened for writing and is followed by a close with ``modified`` set; a
         # read-only open is followed by an unmodified close.  The canonical event
         # carries one beat, so the surrounding open/close are derived here with
-        # small deterministic offsets.
-        scope = f"{host.hostname}:{process_obj.get('audit_token', {}).get('pid', 0)}:{path}"
+        # small deterministic offsets.  Writes reach ``stat`` (size, mtime) in
+        # the time-ordered publish pass (FileWriteTimeline), so the open before a
+        # write still shows the old file.
+        scope = f"{hn}:{process_obj.get('audit_token', {}).get('pid', 0)}:{path}"
         if event_name == "write":
-            open_delta = timedelta(
-                microseconds=40 + _stable_seed(f"es_write_open:{scope}:{event.timestamp}") % 400
+            open_at = at - timedelta(
+                microseconds=40 + _stable_seed(f"es_write_open:{scope}:{at}") % 400
             )
             self._queue_file_record(
                 host,
                 "open",
-                event.timestamp - open_delta,
+                open_at,
                 process_obj,
-                {"fflag": _FREAD | _FWRITE, "file": self._es_file(path)},
+                {"fflag": _FREAD | _FWRITE, "file": es_file(path, open_at)},
             )
-        self._queue_file_record(host, event_name, event.timestamp, process_obj, payload)
+        elif event_name == "create":
+            self._stat_model.record_create(hn, path, at, actor_uid)
+
+        if event_name == "create":
+            payload: dict[str, Any] = {
+                "destination_type": _ES_DESTINATION_TYPE_EXISTING_FILE,
+                "destination": {"existing_file": es_file(path, at)},
+            }
+        elif event_name == "open":
+            fflag = _FREAD | _FWRITE if fc.action == "write" else _FREAD
+            payload = {"fflag": fflag, "file": es_file(path, at)}
+        elif event_name == "rename":
+            # FileContext carries a single path; the rename destination is not
+            # modeled canonically, so report the new name in the same directory.
+            payload = {
+                "source": es_file(path, at),
+                "destination_type": _ES_DESTINATION_TYPE_NEW_PATH,
+                "destination": {
+                    "new_path": {
+                        "dir": es_file(parent_dir or "/", at, "dir"),
+                        "filename": filename,
+                    }
+                },
+            }
+        elif event_name == "unlink":
+            payload = {
+                "target": es_file(path, at),
+                "parent_dir": es_file(parent_dir or "/", at, "dir"),
+            }
+        else:  # write
+            payload = {"target": es_file(path, at)}
+
+        self._queue_file_record(host, event_name, at, process_obj, payload)
         if event_name in {"open", "write", "create"}:
             modified = event_name != "open" or fc.action == "write"
-            close_delta = timedelta(
-                microseconds=60 + _stable_seed(f"es_close:{scope}:{event.timestamp}") % 2400
+            close_at = at + timedelta(
+                microseconds=60 + _stable_seed(f"es_close:{scope}:{at}") % 2400
             )
             self._queue_file_record(
                 host,
                 "close",
-                event.timestamp + close_delta,
+                close_at,
                 process_obj,
                 {
                     "modified": modified,
-                    "target": self._es_file(path),
+                    "target": es_file(path, close_at),
                     "was_mapped_writable": False,
                 },
             )
@@ -878,8 +913,20 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             "cdhash": signing["cdhash"],
             "signing_id": signing["signing_id"],
             "team_id": signing["team_id"],
-            "executable": self._es_file(image),
-            "tty": self._es_file(tty) if tty else None,
+            "executable": self._es_file(
+                image, host, start_time or _MACH_TIME_FALLBACK_BOOT, kind="exec"
+            ),
+            "tty": (
+                self._es_file(
+                    tty,
+                    host,
+                    start_time or _MACH_TIME_FALLBACK_BOOT,
+                    kind="tty",
+                    owner_uid=audit_token["euid"],
+                )
+                if tty
+                else None
+            ),
             "start_time": self._iso(start_time) if start_time is not None else None,
             "responsible_audit_token": responsible_audit_token,
             "parent_audit_token": parent_audit_token,
@@ -1250,10 +1297,25 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             return 7
         return 6
 
-    @staticmethod
-    def _es_file(path: str) -> dict[str, Any]:
-        """Render an es_file_t (path + truncation flag; stat is not modeled)."""
-        return {"path": path, "path_truncated": False}
+    def _es_file(
+        self,
+        path: str,
+        host: HostContext | None = None,
+        at: datetime | None = None,
+        *,
+        kind: str = "file",
+        owner_uid: int | None = None,
+    ) -> dict[str, Any]:
+        """Render an es_file_t: path, truncation flag and the file's ``stat``.
+
+        ``stat`` is omitted only when no host/time context is available.
+        """
+        es_file: dict[str, Any] = {"path": path, "path_truncated": False}
+        if host is not None and at is not None:
+            es_file["stat"] = self._stat_model.stat(
+                host.hostname, path, at, kind=kind, owner_uid=owner_uid
+            )
+        return es_file
 
     @staticmethod
     def _addr_type(source_ip: str) -> int:
