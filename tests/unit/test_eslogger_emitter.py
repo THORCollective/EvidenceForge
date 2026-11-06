@@ -750,3 +750,38 @@ class TestEnvelope:
         row = _rows(emitter, event)[0]
         # 26 hours between BOOT and ts = 93600 s, in 24 MHz Apple Silicon ticks
         assert row["mach_time"] == 93600 * 24_000_000
+
+
+class TestEsloggerSerialization:
+    """Published lines are written the way `eslogger --format json` writes them."""
+
+    def _publish(self, records):
+        from evidenceforge.generation.emitters.eslogger import _es_client_sequence_numbering
+
+        number = _es_client_sequence_numbering()
+        return [number(json.dumps(r, separators=(",", ":"))) for r in records]
+
+    def _record(self, i):
+        return {
+            "time": f"2024-06-11T10:00:{i:02d}.000000000Z",
+            "seq_num": 0,
+            "global_seq_num": 0,
+            "event_type": 9,
+            "process": {"executable": {"path": "/usr/bin/osascript", "path_truncated": False}},
+            "event": {"exec": {"args": ["osascript", "-e", "display dialog"]}},
+        }
+
+    def test_slashes_are_escaped_and_json_round_trips(self):
+        (line,) = self._publish([self._record(0)])
+        assert "/usr/bin" not in line
+        assert "\\/usr\\/bin\\/osascript" in line
+        parsed = json.loads(line)
+        assert parsed["process"]["executable"]["path"] == "/usr/bin/osascript"
+        assert parsed["event"]["exec"]["args"] == ["osascript", "-e", "display dialog"]
+
+    def test_key_order_varies_but_is_reproducible(self):
+        records = [self._record(i) for i in range(12)]
+        first = self._publish(records)
+        assert first == self._publish(records)
+        orders = {tuple(json.loads(line)) for line in first}
+        assert len(orders) > 1

@@ -45,6 +45,7 @@ macOS network egress is correlated via the host's existing Zeek conn/dns logs
 
 import json
 import logging
+import random
 import re
 import shlex
 from collections.abc import Callable
@@ -189,33 +190,61 @@ def _eslogger_sort_key(line: str) -> tuple[str, str]:
     return (match.group(1) if match else "", _SEQ_FIELDS_RE.sub("", line, count=1))
 
 
+def _eslogger_key_order(value: Any, rng: random.Random) -> Any:
+    """Return ``value`` with every object's keys in a shuffled order.
+
+    ``eslogger`` serializes ES messages through Foundation dictionaries, so key
+    order differs from object to object and record to record.  Arrays (argv,
+    env) keep their order: that order is data.
+    """
+    if isinstance(value, dict):
+        items = list(value.items())
+        rng.shuffle(items)
+        return {key: _eslogger_key_order(item, rng) for key, item in items}
+    if isinstance(value, list):
+        return [_eslogger_key_order(item, rng) for item in value]
+    return value
+
+
+def _eslogger_serialize(record: dict[str, Any]) -> str:
+    """Serialize one ES record the way ``eslogger --format json`` writes it.
+
+    Keys come out in a per-record shuffled (seeded, reproducible) order, and
+    every ``/`` is escaped as ``\\/`` -- so a raw-text grep for ``/usr/bin``
+    finds nothing in a real capture, and none here either.
+    """
+    seed = _stable_seed(f"es_key_order:{record.get('global_seq_num', 0)}:{record.get('time', '')}")
+    ordered = _eslogger_key_order(record, random.Random(seed))
+    return json.dumps(ordered, separators=(",", ":")).replace("/", "\\/")
+
+
 def _es_client_sequence_numbering() -> Callable[[str], str]:
-    """Return a fresh numbering pass for one ES client's time-ordered records.
+    """Return a fresh publish pass for one ES client's time-ordered records.
 
     A Mac's eslogger client numbers messages in delivery order: ``global_seq_num``
     is contiguous across every event type, and ``seq_num`` is contiguous per
     ``event_type`` (ESMessage.h). Gaps would signal dropped messages.
 
     The same pass applies file writes to ``stat`` in true time order
-    (FileWriteTimeline), since it is the one place records are seen sorted.
+    (FileWriteTimeline), since it is the one place records are seen sorted,
+    and writes each record in eslogger's own serialization (shuffled keys,
+    escaped slashes) as the last step before publication.
     """
-    per_type: dict[str, int] = {}
+    per_type: dict[int, int] = {}
     total = 0
     timeline = FileWriteTimeline()
 
     def number(line: str) -> str:
         nonlocal total
-        match = _EVENT_TYPE_RE.search(line)
-        event_type = match.group(1) if match else ""
-        if event_type.isdigit() and int(event_type) in FILE_EVENT_TYPES:
-            record = json.loads(line)
-            if timeline.apply(record):
-                line = json.dumps(record, separators=(",", ":"))
+        record = json.loads(line)
+        event_type = record.get("event_type", -1)
+        if event_type in FILE_EVENT_TYPES:
+            timeline.apply(record)
         per_type[event_type] = per_type.get(event_type, 0) + 1
         total += 1
-        return _SEQ_FIELDS_RE.sub(
-            f'"seq_num":{per_type[event_type]},"global_seq_num":{total}', line, count=1
-        )
+        record["seq_num"] = per_type[event_type]
+        record["global_seq_num"] = total
+        return _eslogger_serialize(record)
 
     return number
 

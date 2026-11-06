@@ -131,6 +131,10 @@ refined versions.
   `close` (`modified: false`); every write is `open` (FREAD|FWRITE) → `write` →
   `close` (`modified: true`). trustd only reads its trust stores and Valid
   database; its updates land in `valid.sqlite3-wal`.
+- **Serialized like `eslogger` itself.** Keys come out in a different order
+  per record, and every `/` is escaped as `\/` — exactly as a real capture.
+  A raw-text `grep '/Users/Shared'` finds nothing; parse the JSON (`jq`,
+  Splunk `KV_MODE = json`) or grep the escaped form.
 - **Every `es_file_t` carries `stat`.** Executables, ttys, working directories
   and file targets all have the full `struct stat`, shaped after a live
   `eslogger` capture: system-volume binaries are root-owned, restricted,
