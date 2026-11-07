@@ -69,7 +69,7 @@ _DIRECT_CONTINUOUS_RNG_CAPS_TEXT = """
 2|activity/generator.py|_ensure_email_server_process|uniform
 2|activity/generator.py|_ensure_explicit_proxy_client_process|uniform
 2|activity/generator.py|_ensure_linux_apt_frontend_process|uniform
-1|actions/process_support/parents.py|_ensure_parent_chain|uniform
+2|actions/process_support/parents.py|_ensure_parent_chain|uniform
 2|activity/generator.py|_ensure_system_connection_owner_process|uniform
 2|activity/generator.py|_ensure_user_connection_owner_process|uniform
 1|activity/generator.py|_ensure_visible_created_account_kerberos_exchange|uniform
@@ -144,6 +144,7 @@ _DIRECT_CONTINUOUS_RNG_CAPS_TEXT = """
 1|engine/baseline.py|_generate_inline_windows_baseline_smb_activity|gauss
 4|engine/baseline.py|_generate_inline_windows_baseline_smb_activity|uniform
 4|engine/baseline.py|_generate_lateral_movement_noise|uniform
+1|engine/baseline.py|_generate_macos_daemon_noise|uniform
 1|engine/baseline.py|_generate_pack_persona_traffic|uniform
 3|engine/baseline.py|_generate_profile_traffic|uniform
 5|engine/baseline.py|_generate_rsat_sessions|uniform
@@ -170,6 +171,17 @@ _DIRECT_CONTINUOUS_RNG_CAPS_TEXT = """
 1|engine/baseline.py|_generate_system_remote_thread_activity|uniform
 1|engine/baseline.py|_generate_system_service_logons|uniform
 1|engine/baseline.py|_generate_system_service_processes|uniform
+1|engine/baseline.py|_maybe_emit_macos_icloud_churn|gauss
+1|engine/baseline.py|_maybe_emit_macos_icloud_churn|uniform
+1|engine/baseline.py|_maybe_emit_macos_prefs_churn|gauss
+1|engine/baseline.py|_maybe_emit_macos_prefs_churn|uniform
+1|engine/baseline.py|_maybe_emit_macos_softwareupdated_check|gauss
+1|engine/baseline.py|_maybe_emit_macos_softwareupdated_check|uniform
+1|engine/baseline.py|_maybe_emit_macos_spotlight_burst|gauss
+2|engine/baseline.py|_maybe_emit_macos_spotlight_burst|uniform
+1|engine/baseline.py|_maybe_emit_macos_time_machine_backup|gauss
+1|engine/baseline.py|_maybe_emit_macos_time_machine_backup|uniform
+1|engine/baseline.py|_maybe_emit_macos_trustd_check|gauss
 1|engine/baseline.py|_plan_system_rdp_requests|uniform
 1|engine/baseline.py|_generate_user_traffic_affinity|uniform
 1|engine/baseline.py|_gpo_refresh_interval_seconds|uniform
@@ -195,7 +207,7 @@ _DIRECT_CONTINUOUS_RNG_CAPS_TEXT = """
 2|engine/emitter_setup.py|_advance_boot_clock|uniform
 1|engine/emitter_setup.py|_emit_dhcp_leases|uniform
 1|engine/emitter_setup.py|_emit_sensor_startup|uniform
-2|engine/emitter_setup.py|process_time|uniform
+3|engine/emitter_setup.py|process_time|uniform
 1|engine/storyline.py|_apply_storyline_shell_availability|uniform
 1|engine/storyline.py|_effective_rate_interval|uniform
 4|engine/storyline.py|_emit_linux_storyline_shell_friction|uniform
@@ -316,13 +328,13 @@ def test_generation_has_no_remaining_legacy_timing_helper_calls() -> None:
 
 
 def test_direct_continuous_rng_inventory_can_only_shrink() -> None:
-    """The exact 358-call compatibility census cannot gain selectors or calls."""
+    """The exact 373-call compatibility census cannot gain selectors or calls."""
 
     caps = _direct_continuous_rng_caps()
     observed = _generation_call_inventory(_DIRECT_CONTINUOUS_METHODS)
 
-    assert len(caps) == 195
-    assert sum(caps.values()) == 358
+    assert len(caps) == 207
+    assert sum(caps.values()) == 373
     assert not observed - caps
     assert len(observed) <= len(caps)
     assert sum(observed.values()) <= sum(caps.values())
