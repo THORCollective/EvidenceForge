@@ -1666,10 +1666,20 @@ class TestSslContextPopulation:
         )
         base_time = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
         _seed_macos_launchd(gen, source, base_time - timedelta(minutes=10))
+        user = User(username="admin", full_name="Admin User", email="admin@example.com")
+        # The client must ride on an already-admitted interactive session on the Mac.
+        gen.state_manager.set_current_time(base_time - timedelta(minutes=5))
+        gen.state_manager.create_session(
+            username=user.username,
+            system=source.hostname,
+            logon_type=2,
+            source_ip="",
+            start_time=base_time - timedelta(minutes=5),
+        )
         gen.state_manager.set_current_time(base_time)
 
         request = SshSessionRequest(
-            user=User(username="admin", full_name="Admin User", email="admin@example.com"),
+            user=user,
             target_system=target,
             time=base_time,
             source_ip=source.ip,
@@ -1711,15 +1721,20 @@ class TestSslContextPopulation:
             )
             base_time = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
             gen.state_manager.set_current_time(base_time - timedelta(seconds=30))
-            sshd_pid = gen.state_manager.create_process(
-                system=target.hostname,
-                parent_pid=0,
-                image="/usr/sbin/sshd",
-                command_line="/usr/sbin/sshd -D",
-                username="root",
-                integrity_level="System",
-            )
-            gen._system_pids = {target.hostname: {"sshd": sshd_pid}}
+            if os_string.startswith("macOS"):
+                # macOS Remote Login is launchd socket activation: launchd spawns
+                # `sshd -i` per connection, with no persistent sshd listener.
+                _seed_macos_launchd(gen, target, base_time - timedelta(seconds=30))
+            else:
+                sshd_pid = gen.state_manager.create_process(
+                    system=target.hostname,
+                    parent_pid=0,
+                    image="/usr/sbin/sshd",
+                    command_line="/usr/sbin/sshd -D",
+                    username="root",
+                    integrity_level="System",
+                )
+                gen._system_pids = {target.hostname: {"sshd": sshd_pid}}
             gen.state_manager.set_current_time(base_time)
             user = User(username="admin", full_name="Admin User", email="admin@example.com")
             logon_id = gen.state_manager.create_session(
@@ -1747,8 +1762,10 @@ class TestSslContextPopulation:
         macos_shell, macos_sshd = _run("macOS 14")
         assert macos_shell.image == "/bin/zsh"
         assert macos_shell.command_line == "-zsh"
-        # The per-session sshd image is unchanged across OSes.
+        # The per-session sshd image is unchanged across OSes; on macOS it is
+        # launchd's per-connection `sshd -i`.
         assert macos_sshd.image == "/usr/sbin/sshd"
+        assert macos_sshd.command_line == "/usr/sbin/sshd -i"
 
         linux_shell, linux_sshd = _run("Ubuntu 24.04")
         # Linux behavior is byte-for-byte unchanged.

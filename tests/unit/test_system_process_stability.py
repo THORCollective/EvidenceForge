@@ -2658,7 +2658,15 @@ class TestSystemProcessProtection:
         assert launchd.parent_pid == 0
         assert launchd.username == "root"
         assert state_manager.get_process_object_id(macos_system.hostname, 1)
-        assert state_manager.get_pidversion(macos_system.hostname, 1) == 0
+        # pidversion comes from one per-boot counter, so launchd (the first
+        # process) carries a real, nonzero value that is the lowest on the host.
+        launchd_pidversion = state_manager.get_pidversion(macos_system.hostname, 1)
+        assert launchd_pidversion > 0
+        assert all(
+            state_manager.get_pidversion(macos_system.hostname, pid) > launchd_pidversion
+            for role, pid in pids.items()
+            if role != "launchd"
+        )
         assert windowserver is not None
         assert windowserver.parent_pid == 1
 
@@ -2727,9 +2735,11 @@ class TestSystemProcessProtection:
                 "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/"
                 "Metadata.framework/Versions/A/Support/mds"
             ),
-            "sshd": "/usr/sbin/sshd",
-            "zsh": "/bin/zsh",
         }
+        # Remote Login is launchd socket activation: no persistent sshd listener
+        # or root login shell sits in the boot tree between connections.
+        assert "sshd" not in pids
+        assert "zsh" not in pids
         for role, expected_image in expected_images.items():
             assert role in pids, f"Expected seeded role '{role}' missing from macOS process tree"
             proc = state_manager.get_process(macos_system.hostname, pids[role])
