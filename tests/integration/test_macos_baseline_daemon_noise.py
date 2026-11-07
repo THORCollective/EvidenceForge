@@ -34,11 +34,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from evidenceforge.cli.commands import EXIT_SUCCESS, app
 
 runner = CliRunner()
+
+# Full multi-day generation: runs in the sharded release-gate suite.
+pytestmark = pytest.mark.slow
 
 _SCENARIO_YAML = """\
 version: "1.0"
@@ -121,6 +125,12 @@ def _generate(tmp_path: Path) -> Path:
     return out
 
 
+@pytest.fixture(scope="module")
+def output_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Generate the deterministic scenario once for the read-only assertions."""
+    return _generate(tmp_path_factory.mktemp("macos-daemon-noise"))
+
+
 def _eslogger_records(output_dir: Path, host_fqdn: str) -> list[dict]:
     path = output_dir / "data" / host_fqdn / "eslogger.ndjson"
     assert path.exists(), f"missing eslogger output for {host_fqdn}: {path}"
@@ -131,9 +141,8 @@ def _event_name(record: dict) -> str:
     return next(iter(record["event"]))
 
 
-def test_all_named_daemons_produce_eslogger_activity(tmp_path: Path):
+def test_all_named_daemons_produce_eslogger_activity(output_dir: Path):
     """Each of facts.md's 6 named macOS daemons shows verifiable low-volume activity."""
-    output_dir = _generate(tmp_path)
 
     all_records: list[dict] = []
     for host_fqdn in MACOS_HOSTS.values():
@@ -156,9 +165,8 @@ def test_all_named_daemons_produce_eslogger_activity(tmp_path: Path):
     )
 
 
-def test_spotlight_and_backupd_have_process_lifecycle_pairs(tmp_path: Path):
+def test_spotlight_and_backupd_have_process_lifecycle_pairs(output_dir: Path):
     """Spawned mdworker_shared/backupd instances have both a create and a terminate."""
-    output_dir = _generate(tmp_path)
 
     for host_fqdn in MACOS_HOSTS.values():
         records = _eslogger_records(output_dir, host_fqdn)
@@ -181,9 +189,8 @@ def test_spotlight_and_backupd_have_process_lifecycle_pairs(tmp_path: Path):
             )
 
 
-def test_time_machine_backup_timing_is_not_fixed_interval(tmp_path: Path):
+def test_time_machine_backup_timing_is_not_fixed_interval(output_dir: Path):
     """backupd firings across the run must not land on the hour or at identical gaps."""
-    output_dir = _generate(tmp_path)
 
     for host_fqdn in MACOS_HOSTS.values():
         records = _eslogger_records(output_dir, host_fqdn)
@@ -213,9 +220,8 @@ def test_time_machine_backup_timing_is_not_fixed_interval(tmp_path: Path):
         )
 
 
-def test_cfprefsd_churn_reuses_existing_seeded_process(tmp_path: Path):
+def test_cfprefsd_churn_reuses_existing_seeded_process(output_dir: Path):
     """cfprefsd churn should attach to the already-seeded persistent daemon, not spawn a new one."""
-    output_dir = _generate(tmp_path)
 
     for host_fqdn in MACOS_HOSTS.values():
         records = _eslogger_records(output_dir, host_fqdn)

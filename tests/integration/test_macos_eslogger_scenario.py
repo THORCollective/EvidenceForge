@@ -48,6 +48,9 @@ from typer.testing import CliRunner
 
 from evidenceforge.cli.commands import EXIT_SUCCESS, app
 
+# Full demo generation: runs in the sharded release-gate suite.
+pytestmark = pytest.mark.slow
+
 runner = CliRunner()
 
 SCENARIO = (

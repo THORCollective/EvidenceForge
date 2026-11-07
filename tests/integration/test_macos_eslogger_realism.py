@@ -42,6 +42,9 @@ from typer.testing import CliRunner
 
 from evidenceforge.cli.commands import EXIT_SUCCESS, app
 
+# Full demo generation: runs in the sharded release-gate suite.
+pytestmark = pytest.mark.slow
+
 SCENARIO = (
     Path(__file__).resolve().parents[2] / "scenarios" / "macos-eslogger-demo" / "scenario.yaml"
 )
