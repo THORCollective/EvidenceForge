@@ -276,6 +276,8 @@ _MACOS_PID_MIN = 100
 _MACOS_PID_MAX_EXCLUSIVE = 99_999
 _MINUTES_PER_WEEK = 7 * 24 * 60
 _ENDED_IDENTITY_RETENTION = timedelta(hours=48)
+# Max gap between an sshd process starting and its SSH session starting.
+_TRANSPORT_SESSION_SETUP_WINDOW = timedelta(minutes=2)
 # This is a hard combined capacity. Protected terminal SMB identities displace
 # the earliest ordinary retained rows until outer acknowledgement releases them.
 _MAX_RETAINED_SESSION_IDENTITIES = 500_000
@@ -8633,6 +8635,56 @@ class StateManager:
                 logon_id
             )
             return ended[0].session_id if ended is not None else 0
+
+    def get_session_for_transport(
+        self,
+        system: str,
+        pid: int,
+        process_start: datetime | None = None,
+    ) -> ActiveSession | None:
+        """Return the active or ended SSH session an sshd process served, if any.
+
+        A session's ``transport_pid`` binding is exact but short-lived: ending
+        the transport clears it on still-active sessions, and state runs ahead
+        of rendering, so it is often gone by the time the sshd's later records
+        render, and the post-auth session sshd is never the bound transport.
+        With the sshd's start time, an SSH session matches when it began within
+        the connection-setup window of that start (the per-connection sshd
+        starts seconds before its session; the post-auth sshd seconds after).
+        An exact binding wins; otherwise the closest session wins.
+        """
+
+        if pid <= 0:
+            return None
+        started = ensure_utc(process_start) if process_start is not None else None
+
+        def offset(session: ActiveSession) -> timedelta | None:
+            if session.system != system:
+                return None
+            if session.transport_pid == pid:
+                if started is None or ensure_utc(session.start_time) >= started:
+                    return timedelta(0)
+                return None
+            if session.session_kind != "ssh":
+                return None
+            if started is None:
+                return None
+            distance = abs(ensure_utc(session.start_time) - started)
+            return distance if distance <= _TRANSPORT_SESSION_SETUP_WINDOW else None
+
+        with self._lock:
+            sessions = [
+                *self._active_sessions.find("system", system),
+                *(session for session, _end_time in self._ended_sessions.values()),
+            ]
+            ranked = [
+                (distance, session.start_time, session.logon_id, session)
+                for session in sessions
+                if (distance := offset(session)) is not None
+            ]
+            if not ranked:
+                return None
+            return min(ranked, key=lambda row: row[:3])[3]
 
     def get_or_create_session_logon_guid(
         self,

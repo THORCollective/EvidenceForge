@@ -447,6 +447,56 @@ def test_boot_epoch_and_explicit_thread_allocation_fence_prepared_process_plan()
         # Strictly increasing per host.
         assert first < second < third
 
+    def _ssh_session_at(self, sm, start, *, transport_pid=None):
+        sm.set_current_time(start)
+        return sm.create_session(
+            username="alice",
+            system="mac01",
+            logon_type=10,
+            source_ip="10.0.0.10",
+            start_time=start,
+            session_kind="ssh",
+            session_id=100031,
+            transport_pid=transport_pid,
+        )
+
+    def test_get_session_for_transport_exact_binding_wins(self):
+        # Arrange
+        sm = StateManager()
+        start = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+        self._ssh_session_at(sm, start - timedelta(seconds=30))
+        bound = self._ssh_session_at(sm, start, transport_pid=812)
+
+        # Act
+        session = sm.get_session_for_transport("mac01", 812, start - timedelta(seconds=3))
+
+        # Assert
+        assert session is not None and session.logon_id == bound
+
+    def test_get_session_for_transport_ended_session_within_setup_window(self):
+        # Arrange
+        sm = StateManager()
+        start = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+        logon_id = self._ssh_session_at(sm, start)
+        sm.end_session(logon_id, start + timedelta(minutes=9))
+
+        # Act
+        session = sm.get_session_for_transport("mac01", 812, start - timedelta(seconds=5))
+
+        # Assert
+        assert session is not None and session.logon_id == logon_id
+
+    def test_get_session_for_transport_outside_window_or_other_host_is_none(self):
+        # Arrange
+        sm = StateManager()
+        start = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+        self._ssh_session_at(sm, start)
+
+        # Act / Assert
+        assert sm.get_session_for_transport("mac01", 812, start + timedelta(hours=1)) is None
+        assert sm.get_session_for_transport("mac02", 812, start) is None
+        assert sm.get_session_for_transport("mac01", 0, start) is None
+
     def test_macos_audit_session_ids_are_per_host(self):
         """Each host keeps its own macOS audit-session sequence."""
         import random

@@ -77,6 +77,25 @@ _KAUTH_UID_NONE = 4294967295
 # StateManager.next_macos_audit_session_id); daemons run in the system session.
 _MACOS_SYSTEM_ASID = 100000
 
+# Login sessions with no allocated asid (no session-creating bundle recorded one)
+# derive a stable asid from this disjoint band. The allocator starts at most 900
+# above the system asid and steps by at most 6 per session, so it would need
+# thousands of sessions on one host to reach this band; derived and allocated
+# asids therefore never collide in practice.
+_MACOS_DERIVED_ASID_BASE = 150000
+_MACOS_DERIVED_ASID_SPAN = 40000
+
+# Windows well-known service LogonIDs (SYSTEM, NETWORK SERVICE, LOCAL SERVICE,
+# IUSR) and "no logon" markers that shared state may carry for daemon-owned
+# processes. They are not macOS login sessions: such processes belong to the
+# system audit session (auid == KAUTH_UID_NONE), not a derived per-logon session.
+_NON_SESSION_LOGON_IDS = frozenset({"", "-", "0x0", "0x3e4", "0x3e5", "0x3e6", "0x3e7"})
+
+# Logon types of a local (console) login, whose loginwindow audit session also
+# hosts the user's launchd agents and apps.
+_CONSOLE_LOGON_TYPES = frozenset({2, 11})
+_CONSOLE_SESSION_KINDS = frozenset({"interactive", "logon"})
+
 # Fixed reference only used to derive mach_time when no boot time is registered
 # (unit tests without a seeded process tree).  In real runs StateManager returns
 # the per-host boot time registered during process-tree seeding.
@@ -745,8 +764,15 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         if host is None or auth is None:
             return
         event_name = _LW_SESSION_EVENT_NAMES[event.event_type]
-        graphical_session_id = auth.session_id or self._resolve_asid(
-            host.hostname, auth.username, auth.logon_id, 0, True
+        # Console sessions may carry a Windows-style terminal session number
+        # (1, 2); only a real audit session id above the system asid is kept,
+        # otherwise resolve the asid exactly as the session's processes do.
+        session_id = auth.session_id if (auth.session_id or 0) > _MACOS_SYSTEM_ASID else 0
+        logon_id = "" if auth.logon_id in _NON_SESSION_LOGON_IDS else auth.logon_id
+        if not session_id and logon_id:
+            session_id = self._session_asid(logon_id)
+        graphical_session_id = self._resolve_asid(
+            host.hostname, auth.username, logon_id, session_id, True
         )
         process_obj = self._loginwindow_process_object(host, graphical_session_id)
         self._queue_record(
@@ -915,6 +941,18 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         if pidversion:
             pidversion += pidversion_offset
 
+        if logon_id in _NON_SESSION_LOGON_IDS:
+            logon_id = ""
+        if not logon_id and session_id <= 0 and pid > 0 and image.rsplit("/", 1)[-1] == "sshd":
+            # The per-connection sshd reports openssh_login/logout with its
+            # session's asid; every record of that process keeps the same token.
+            session_id = self._transport_session_asid(hostname, pid, start_time)
+        if not logon_id and session_id <= 0 and self._is_login_session(username, "", 0):
+            # A user's launchd agents and apps carry no logon of their own; on a
+            # Mac they run in that user's console (loginwindow) audit session.
+            logon_id = self._console_logon_id(hostname, username, start_time)
+        if session_id <= 0 and logon_id:
+            session_id = self._session_asid(logon_id)
         is_login = self._is_login_session(username, logon_id, session_id)
         asid = self._resolve_asid(hostname, username, logon_id, session_id, is_login)
         audit_token = self._audit_token(hostname, pid, pidversion, username, asid, is_login)
@@ -1165,9 +1203,10 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             sm.get_pidversion(host.hostname, ppid) if sm is not None and ppid > 0 else 0
         )
         parent_username = parent_rp.username if parent_rp is not None else "root"
-        is_login = self._is_login_session(
-            parent_username, parent_rp.logon_id if parent_rp is not None else "", 0
-        )
+        parent_logon_id = parent_rp.logon_id if parent_rp is not None else ""
+        if parent_logon_id in _NON_SESSION_LOGON_IDS:
+            parent_logon_id = ""
+        is_login = self._is_login_session(parent_username, parent_logon_id, 0)
         return self._audit_token(
             host.hostname, ppid, parent_pidversion, parent_username, asid, is_login
         )
@@ -1209,6 +1248,60 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         uid = 501 + (_stable_seed(f"macos_uid:{username}") % 100)
         return {"uid": uid, "gid": 20}
 
+    def _console_logon_id(self, hostname: str, username: str, at_time: datetime | None) -> str:
+        """Return the LogonID of a user's console session on a host, or ""."""
+        sm = getattr(self, "_state_manager", None)
+        if sm is None:
+            return ""
+        sessions = (
+            sm.get_sessions_for_user_at(username, at_time)
+            if at_time is not None
+            else sm.get_sessions_for_user(username)
+        )
+        if not sessions and at_time is not None:
+            # A locked console is not "valid for activity" yet remains the
+            # user's audit session; keep any active session already started.
+            sessions = [
+                session
+                for session in sm.get_sessions_for_user(username)
+                if session.start_time <= at_time
+            ]
+        console = [
+            session
+            for session in sessions
+            if session.system == hostname
+            and session.logon_type in _CONSOLE_LOGON_TYPES
+            and session.session_kind in _CONSOLE_SESSION_KINDS
+        ]
+        if not console:
+            return ""
+        return min(console, key=lambda session: (session.start_time, session.logon_id)).logon_id
+
+    def _transport_session_asid(self, hostname: str, pid: int, start_time: datetime | None) -> int:
+        """Return the asid of the session a transport process served, or 0."""
+        sm = getattr(self, "_state_manager", None)
+        if sm is None:
+            return 0
+        session = sm.get_session_for_transport(hostname, pid, start_time)
+        session_id = session.session_id if session is not None else 0
+        return session_id if type(session_id) is int and session_id > _MACOS_SYSTEM_ASID else 0
+
+    def _session_asid(self, logon_id: str) -> int:
+        """Return the allocated audit session id of a login session, or 0.
+
+        Session-creating bundles (SSH) allocate the asid once through
+        ``StateManager.next_macos_audit_session_id`` and record it on the
+        session. Every process of that session must carry the same asid so a
+        login joins to its shell and descendants. Values at or below the system
+        asid are not macOS audit sessions (e.g. a Windows-style terminal
+        session number) and are ignored.
+        """
+        sm = getattr(self, "_state_manager", None)
+        if sm is None:
+            return 0
+        session_id = sm.get_session_id(logon_id)
+        return session_id if type(session_id) is int and session_id > _MACOS_SYSTEM_ASID else 0
+
     @staticmethod
     def _resolve_asid(
         hostname: str, username: str, logon_id: str, session_id: int, is_login: bool
@@ -1223,7 +1316,8 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             return session_id
         if is_login:
             scope = logon_id or username
-            return _MACOS_SYSTEM_ASID + 1 + (_stable_seed(f"macos_asid:{hostname}:{scope}") % 90000)
+            seed = _stable_seed(f"macos_asid:{hostname}:{scope}")
+            return _MACOS_DERIVED_ASID_BASE + 1 + (seed % _MACOS_DERIVED_ASID_SPAN)
         return _MACOS_SYSTEM_ASID
 
     def _has_controlling_terminal(self, host: HostContext, image: str, ppid: int) -> bool:

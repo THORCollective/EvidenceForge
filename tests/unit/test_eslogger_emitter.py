@@ -28,6 +28,7 @@ field values, types, and envelope fields.
 """
 
 import json
+import random
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -807,3 +808,217 @@ def test_application_install_stamp_is_whole_seconds_at_another_time_of_day():
         assert stat["st_birthtimespec"].endswith(".000000000Z")
         assert stat["st_birthtimespec"][11:19] != "14:21:53"
         assert not stat["st_ctimespec"].endswith(".000000000Z")
+
+
+class TestAuditSessionIds:
+    """asid/auid consistency between a login session and its processes."""
+
+    def test_build_process_object_session_logon_uses_allocated_asid(self, emitter, mac_host, ts):
+        # Arrange: an SSH bundle records the allocated asid on the session.
+        sm = emitter._state_manager
+        sm.set_current_time(ts)
+        logon_id = sm.create_session(
+            username="alice",
+            system="MAC-01",
+            logon_type=10,
+            source_ip="10.0.0.10",
+            start_time=ts,
+            session_kind="ssh",
+            session_id=100031,
+        )
+
+        # Act: the session's shell is rendered without an explicit session id.
+        shell = emitter._build_process_object(
+            mac_host, pid=4321, ppid=4320, image="/bin/zsh", username="alice", logon_id=logon_id
+        )
+
+        # Assert
+        assert shell["audit_token"]["asid"] == 100031
+
+    def test_build_process_object_ended_session_keeps_allocated_asid(self, emitter, mac_host, ts):
+        # Arrange
+        sm = emitter._state_manager
+        sm.set_current_time(ts)
+        logon_id = sm.create_session(
+            username="alice",
+            system="MAC-01",
+            logon_type=10,
+            source_ip="10.0.0.10",
+            start_time=ts,
+            session_kind="ssh",
+            session_id=100031,
+        )
+        sm.end_session(logon_id, ts + timedelta(minutes=5))
+
+        # Act: a process exit rendered after logoff.
+        shell = emitter._build_process_object(
+            mac_host, pid=4321, ppid=4320, image="/bin/zsh", username="alice", logon_id=logon_id
+        )
+
+        # Assert
+        assert shell["audit_token"]["asid"] == 100031
+
+    @pytest.mark.parametrize("logon_id", ["0x3e7", "0x3e4", "0x3e5", "-", "0x0"])
+    def test_build_process_object_service_logon_id_is_system_session(
+        self, emitter, mac_host, logon_id
+    ):
+        # Act
+        daemon = emitter._build_process_object(
+            mac_host, pid=812, ppid=1, image="/usr/sbin/sshd", username="root", logon_id=logon_id
+        )
+
+        # Assert
+        assert daemon["audit_token"]["asid"] == 100000
+        assert daemon["audit_token"]["auid"] == 4294967295
+
+    def test_resolve_asid_derived_band_disjoint_from_allocator(self):
+        # Arrange
+        sm = StateManager()
+        rng = random.Random(7)
+        allocated = {sm.next_macos_audit_session_id("MAC-01", rng) for _ in range(500)}
+
+        # Act
+        derived = {
+            ESLoggerEmitter._resolve_asid("MAC-01", f"user{n}", f"0x{n:x}", 0, True)
+            for n in range(1000)
+        }
+
+        # Assert
+        assert max(allocated) < min(derived)
+
+    def _console_session(self, emitter, ts, *, session_id):
+        sm = emitter._state_manager
+        sm.set_current_time(ts)
+        return sm.create_session(
+            username="alice",
+            system="MAC-01",
+            logon_type=2,
+            source_ip="-",
+            start_time=ts,
+            session_kind="interactive",
+            session_id=session_id,
+        )
+
+    def test_build_process_object_user_agent_joins_console_session(self, emitter, mac_host, ts):
+        # Arrange: a console login, then a user launchd agent with no logon of its own.
+        console_logon = self._console_session(emitter, ts, session_id=1)
+        console_shell = emitter._build_process_object(
+            mac_host, pid=700, ppid=1, image="/bin/zsh", username="alice", logon_id=console_logon
+        )
+
+        # Act
+        agent = emitter._build_process_object(
+            mac_host,
+            pid=701,
+            ppid=1,
+            image="/System/Library/PrivateFrameworks/CloudKitDaemon.framework/Support/cloudd",
+            username="alice",
+            logon_id="0x3e7",
+            start_time=ts + timedelta(minutes=10),
+        )
+
+        # Assert
+        assert agent["audit_token"]["asid"] == console_shell["audit_token"]["asid"]
+        assert agent["audit_token"]["auid"] == agent["audit_token"]["euid"]
+
+    def test_render_lw_session_windows_style_session_id_matches_console_processes(
+        self, emitter, mac_host, ts
+    ):
+        # Arrange: the console session carries a Windows-style terminal number.
+        console_logon = self._console_session(emitter, ts, session_id=2)
+        shell = emitter._build_process_object(
+            mac_host, pid=700, ppid=1, image="/bin/zsh", username="alice", logon_id=console_logon
+        )
+        lock_event = OccurrenceBuilder(
+            timestamp=ts + timedelta(minutes=5),
+            event_type="workstation_locked",
+            src_host=mac_host,
+            dst_host=mac_host,
+            auth=AuthContext(username="alice", logon_id=console_logon, session_id=2),
+        )
+
+        # Act
+        row = _rows(emitter, lock_event)[0]
+
+        # Assert
+        assert (
+            row["event"]["lw_session_lock"]["graphical_session_id"]
+            == (shell["audit_token"]["asid"])
+        )
+        assert row["process"]["audit_token"]["asid"] == shell["audit_token"]["asid"]
+
+    def _ssh_session(self, emitter, ts, *, transport_pid=None):
+        sm = emitter._state_manager
+        sm.set_current_time(ts)
+        return sm.create_session(
+            username="alice",
+            system="MAC-01",
+            logon_type=10,
+            source_ip="10.0.0.10",
+            start_time=ts,
+            session_kind="ssh",
+            session_id=100031,
+            transport_pid=transport_pid,
+        )
+
+    def test_build_process_object_connection_sshd_after_logoff_keeps_session_asid(
+        self, emitter, mac_host, ts
+    ):
+        # Arrange: the per-connection sshd started seconds before its session,
+        # and the session has ended (binding cleared) before sshd's exit renders.
+        logon_id = self._ssh_session(emitter, ts)
+        emitter._state_manager.end_session(logon_id, ts + timedelta(minutes=9))
+
+        # Act
+        sshd = emitter._build_process_object(
+            mac_host,
+            pid=36316,
+            ppid=1,
+            image="/usr/sbin/sshd",
+            username="root",
+            logon_id="0x3e7",
+            start_time=ts - timedelta(seconds=5),
+        )
+
+        # Assert
+        assert sshd["audit_token"]["asid"] == 100031
+
+    def test_build_process_object_post_auth_sshd_joins_session(self, emitter, mac_host, ts):
+        # Arrange: the session is bound to the connection sshd; the post-auth
+        # sshd starts just after the session does.
+        self._ssh_session(emitter, ts, transport_pid=36316)
+
+        # Act
+        sshd = emitter._build_process_object(
+            mac_host,
+            pid=36322,
+            ppid=1,
+            image="/usr/sbin/sshd",
+            username="root",
+            logon_id="0x3e7",
+            start_time=ts + timedelta(milliseconds=700),
+        )
+
+        # Assert
+        assert sshd["audit_token"]["asid"] == 100031
+
+    def test_build_process_object_unrelated_sshd_stays_in_system_session(
+        self, emitter, mac_host, ts
+    ):
+        # Arrange: an sshd started long after the only SSH session began.
+        self._ssh_session(emitter, ts)
+
+        # Act
+        sshd = emitter._build_process_object(
+            mac_host,
+            pid=40000,
+            ppid=1,
+            image="/usr/sbin/sshd",
+            username="root",
+            logon_id="0x3e7",
+            start_time=ts + timedelta(hours=1),
+        )
+
+        # Assert
+        assert sshd["audit_token"]["asid"] == 100000
+        assert sshd["audit_token"]["auid"] == 4294967295
