@@ -25,6 +25,7 @@ class EventKind(StrEnum):
     ACCOUNT_CREATED = "account_created"
     ACCOUNT_DELETED = "account_deleted"
     BASH_COMMAND = "bash_command"
+    BTM_LAUNCH_ITEM_ADD = "btm_launch_item_add"
     CONNECTION = "connection"
     CREATE_REMOTE_THREAD = "create_remote_thread"
     DHCP_LEASE = "dhcp_lease"
@@ -33,7 +34,11 @@ class EventKind(StrEnum):
     FILE_CREATE = "file_create"
     FILE_DELETE = "file_delete"
     FILE_MODIFY = "file_modify"
+    FILE_OPEN = "file_open"
     FILE_READ = "file_read"
+    FILE_RENAME = "file_rename"
+    FILE_UNLINK = "file_unlink"
+    FILE_WRITE = "file_write"
     GROUP_MEMBER_ADDED_GLOBAL = "group_member_added_global"
     GROUP_MEMBER_ADDED_LOCAL = "group_member_added_local"
     GROUP_MEMBER_ADDED_UNIVERSAL = "group_member_added_universal"
@@ -52,6 +57,7 @@ class EventKind(StrEnum):
     NTLM_VALIDATION = "ntlm_validation"
     PASSWORD_CHANGE = "password_change"
     PASSWORD_RESET = "password_reset"
+    PRIVILEGE_ELEVATION = "privilege_elevation"
     PROCESS_ACCESS = "process_access"
     PROCESS_CREATE = "process_create"
     PROCESS_TERMINATE = "process_terminate"
@@ -132,6 +138,7 @@ class FormatKind(StrEnum):
     BASH_HISTORY = "bash_history"
     CISCO_ASA = "cisco_asa"
     ECAR = "ecar"
+    ESLOGGER = "eslogger"
     PROXY_ACCESS = "proxy_access"
     SNORT_ALERT = "snort_alert"
     SYSLOG = "syslog"
@@ -594,6 +601,9 @@ _WINDOWS_ENDPOINT = _formats(
     FormatKind.WINDOWS_EVENT_SYSMON,
 )
 _ECAR_SYSMON = _formats(FormatKind.ECAR, FormatKind.WINDOWS_EVENT_SYSMON)
+# Process lifecycle renderers across Windows, Linux (eCAR), and macOS (eslogger).
+_PROCESS_ENDPOINT = _WINDOWS_ENDPOINT | _formats(FormatKind.ESLOGGER)
+_ESLOGGER = _formats(FormatKind.ESLOGGER)
 _FILE_OPTIONAL = _contexts(ContextKind.AUTH, ContextKind.PROCESS)
 _ACCOUNT_REQUIRED = _contexts(
     ContextKind.ACCOUNT_MANAGEMENT,
@@ -729,8 +739,10 @@ EVENT_KIND_CONTRACTS: dict[EventKind, EventKindContract] = {
             lifecycle=LifecycleRole.DEPENDENT,
             state=StateEffect.READ if kind is EventKind.FILE_READ else StateEffect.WRITE,
             emitters=(
-                _formats(FormatKind.ECAR, FormatKind.WINDOWS_EVENT_SYSMON)
-                if kind in {EventKind.FILE_CREATE, EventKind.FILE_MODIFY}
+                _formats(FormatKind.ECAR, FormatKind.ESLOGGER, FormatKind.WINDOWS_EVENT_SYSMON)
+                if kind is EventKind.FILE_CREATE
+                else _formats(FormatKind.ECAR, FormatKind.WINDOWS_EVENT_SYSMON)
+                if kind is EventKind.FILE_MODIFY
                 else _formats(FormatKind.ECAR)
             ),
         )
@@ -741,6 +753,42 @@ EVENT_KIND_CONTRACTS: dict[EventKind, EventKindContract] = {
             EventKind.FILE_READ,
         )
     },
+    # macOS Endpoint Security file operations with no Windows/Linux projection.
+    **{
+        kind: _contract(
+            kind,
+            required=_contexts(ContextKind.FILE, ContextKind.SRC_HOST),
+            optional=_FILE_OPTIONAL,
+            src=HostSemantic.LOCAL_ACTOR,
+            identity=IdentityRequirement.OPTIONAL,
+            lifecycle=LifecycleRole.DEPENDENT,
+            state=StateEffect.WRITE,
+            emitters=_ESLOGGER,
+        )
+        for kind in (
+            EventKind.FILE_OPEN,
+            EventKind.FILE_RENAME,
+            EventKind.FILE_UNLINK,
+            EventKind.FILE_WRITE,
+        )
+    },
+    EventKind.BTM_LAUNCH_ITEM_ADD: _contract(
+        EventKind.BTM_LAUNCH_ITEM_ADD,
+        required=_contexts(ContextKind.FILE, ContextKind.SRC_HOST),
+        optional=_FILE_OPTIONAL,
+        src=HostSemantic.LOCAL_ACTOR,
+        lifecycle=LifecycleRole.DEPENDENT,
+        state=StateEffect.NONE,
+        emitters=_ESLOGGER,
+    ),
+    EventKind.PRIVILEGE_ELEVATION: _contract(
+        EventKind.PRIVILEGE_ELEVATION,
+        required=_contexts(ContextKind.AUTH, ContextKind.SRC_HOST),
+        optional=_contexts(ContextKind.PROCESS),
+        src=HostSemantic.LOCAL_ACTOR,
+        state=StateEffect.NONE,
+        emitters=_ESLOGGER,
+    ),
     **{
         kind: _contract(
             kind,
@@ -798,7 +846,7 @@ EVENT_KIND_CONTRACTS: dict[EventKind, EventKindContract] = {
         identity=IdentityRequirement.REQUIRED,
         lifecycle=LifecycleRole.CLOSURE,
         state=StateEffect.WRITE,
-        emitters=_formats(FormatKind.ECAR, FormatKind.WINDOWS_EVENT_SECURITY),
+        emitters=_formats(FormatKind.ECAR, FormatKind.ESLOGGER, FormatKind.WINDOWS_EVENT_SECURITY),
     ),
     EventKind.LOGON: _contract(
         EventKind.LOGON,
@@ -936,7 +984,7 @@ EVENT_KIND_CONTRACTS: dict[EventKind, EventKindContract] = {
         identity=IdentityRequirement.REQUIRED,
         lifecycle=LifecycleRole.START,
         state=StateEffect.WRITE,
-        emitters=_WINDOWS_ENDPOINT,
+        emitters=_PROCESS_ENDPOINT,
     ),
     EventKind.PROCESS_TERMINATE: _contract(
         EventKind.PROCESS_TERMINATE,
@@ -946,7 +994,7 @@ EVENT_KIND_CONTRACTS: dict[EventKind, EventKindContract] = {
         identity=IdentityRequirement.REQUIRED,
         lifecycle=LifecycleRole.CLOSURE,
         state=StateEffect.WRITE,
-        emitters=_WINDOWS_ENDPOINT,
+        emitters=_PROCESS_ENDPOINT,
     ),
     EventKind.REGISTRY_MODIFY: _contract(
         EventKind.REGISTRY_MODIFY,
@@ -997,7 +1045,7 @@ EVENT_KIND_CONTRACTS: dict[EventKind, EventKindContract] = {
         identity=IdentityRequirement.REQUIRED,
         lifecycle=LifecycleRole.START,
         state=StateEffect.WRITE,
-        emitters=_formats(FormatKind.ECAR),
+        emitters=_formats(FormatKind.ECAR, FormatKind.ESLOGGER),
     ),
     EventKind.SYSLOG: _contract(
         EventKind.SYSLOG,
@@ -1015,7 +1063,7 @@ EVENT_KIND_CONTRACTS: dict[EventKind, EventKindContract] = {
         identity=IdentityRequirement.REQUIRED,
         lifecycle=LifecycleRole.START,
         state=StateEffect.WRITE,
-        emitters=_WINDOWS_ENDPOINT,
+        emitters=_PROCESS_ENDPOINT,
     ),
     EventKind.WFP_CONNECTION: _contract(
         EventKind.WFP_CONNECTION,
@@ -1036,14 +1084,14 @@ EVENT_KIND_CONTRACTS: dict[EventKind, EventKindContract] = {
         required=_contexts(ContextKind.AUTH, ContextKind.DST_HOST),
         dst=HostSemantic.TARGET,
         state=StateEffect.WRITE,
-        emitters=_WINDOWS_SECURITY,
+        emitters=_WINDOWS_SECURITY | _ESLOGGER,
     ),
     EventKind.WORKSTATION_UNLOCKED: _contract(
         EventKind.WORKSTATION_UNLOCKED,
         required=_contexts(ContextKind.AUTH, ContextKind.DST_HOST),
         dst=HostSemantic.TARGET,
         state=StateEffect.WRITE,
-        emitters=_WINDOWS_SECURITY,
+        emitters=_WINDOWS_SECURITY | _ESLOGGER,
     ),
 }
 

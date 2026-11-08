@@ -59,6 +59,7 @@ _CHATGPT_REFERENCES_BY_SKILL = {
     "evaluate": (
         "references/record-validation.md",
         "references/evidence-endpoint-linux.md",
+        "references/evidence-endpoint-macos.md",
         "references/evidence-network-ids.md",
         "references/evidence-web-email.md",
         "references/evidence-windows.md",
@@ -69,6 +70,7 @@ _CHATGPT_REFERENCES_BY_SKILL = {
         "references/project-context.md",
         "references/checkpoint-recovery.md",
         "references/evidence-endpoint-linux.md",
+        "references/evidence-endpoint-macos.md",
         "references/evidence-network-ids.md",
         "references/evidence-web-email.md",
         "references/evidence-windows.md",
@@ -111,6 +113,7 @@ _CHATGPT_REFERENCES_BY_SKILL = {
         "references/record-validation.md",
         "references/project-context.md",
         "references/evidence-endpoint-linux.md",
+        "references/evidence-endpoint-macos.md",
         "references/evidence-network-ids.md",
         "references/evidence-web-email.md",
         "references/evidence-windows.md",

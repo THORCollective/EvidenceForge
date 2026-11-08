@@ -150,6 +150,7 @@ def test_default_catalog_is_complete_and_expands_existing_groups() -> None:
         "windows_event_security",
         "windows_event_sysmon",
         "ecar",
+        "eslogger",
         "syslog",
         "bash_history",
         "proxy_access",

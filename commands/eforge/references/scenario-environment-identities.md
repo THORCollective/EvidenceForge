@@ -24,7 +24,9 @@ Each `systems` entry supports required `hostname`, `ip`, `os`, and
 `architecture: x86|x64|arm64`, `assigned_user`; and lists `services`, `roles`, and
 `public_hostnames` (all default `[]`). IPs must be IPv4 or IPv6. Public hostnames describe
 internet-facing names for modeled defender-controlled services; external systems themselves
-belong in `network_identities`.
+belong in `network_identities`. An `os` naming macOS (for example `"macOS 14.4"`) produces
+`eslogger` Endpoint Security telemetry; add `ssh` to `services` when the Mac should accept inbound
+SSH (Remote Login is off by default).
 
 ```yaml
 environment:

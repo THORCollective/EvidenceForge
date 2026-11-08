@@ -730,6 +730,31 @@ class _PlannedFileEffectOccurrence:
     identity_plan: EventIdentityPlan
 
 
+def _expand_launch_item_for_file_create(
+    executor: Any,
+    occurrence: _PlannedFileEffectOccurrence | None,
+    actor: Any,
+) -> None:
+    """Run macOS BTM causal expansion for a dispatched plist create.
+
+    A plist written under LaunchAgents/LaunchDaemons registers a launch item.
+    The generator hook pre-checks the path, so this is a no-op for other files.
+    """
+
+    if occurrence is None:
+        return
+    btm_hook = getattr(executor.activity_generator, "_maybe_expand_file_create", None)
+    if callable(btm_hook):
+        btm_hook(
+            file_path=occurrence.path,
+            time=occurrence.timestamp,
+            system=occurrence.system,
+            actor=actor,
+            pid=occurrence.process_identity.pid,
+            process_image=occurrence.process_image,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class StagedArchiveSmbReadExecutionPlan:
     """Frozen transfer, file, and optional process-close effects for staged SMB reads."""
@@ -1421,6 +1446,7 @@ class StagedArchiveSmbReadActionBundle:
                     )
             if artifact_commit is not None:
                 artifact_commit.commit()
+        _expand_launch_item_for_file_create(self._executor, plan.local_create, self._request.actor)
         if plan.termination_time is not None and plan.source_process is not None:
             self._executor.activity_generator.generate_process_termination(
                 user=self._request.actor,
@@ -2135,6 +2161,9 @@ class ScpReceiverFileActionBundle:
                 (plan.source_read, None),
                 (plan.receiver_create, receiver_publication),
             ),
+        )
+        _expand_launch_item_for_file_create(
+            self._executor, plan.receiver_create, self._request.actor
         )
         _record_effect_reconciliation(self._executor, plan.reconciliation)
         return True

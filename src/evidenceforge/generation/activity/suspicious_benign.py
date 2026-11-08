@@ -47,6 +47,7 @@ from evidenceforge.generation.timing import (
     WeightedDistribution,
 )
 from evidenceforge.models.scenario import Persona, System, User
+from evidenceforge.utils.rng import _stable_seed
 
 from .suspicious_benign_config import pick_suspicious_dns_host, pick_unusual_connection
 
@@ -98,8 +99,13 @@ def _sample_hourly_placement_seconds(
     current_hour: datetime,
     timing_runtime: _SuspiciousBenignTimingRuntime | None,
     timing_ordinal: int,
-) -> int:
-    """Return one owner-audited, order-independent offset inside the current hour."""
+    sub_second: bool = False,
+) -> float:
+    """Return one owner-audited, order-independent offset inside the current hour.
+
+    ``sub_second`` adds a stable fractional second so macOS noise does not land
+    on whole-second timestamps (upstream Windows/Linux placement is unchanged).
+    """
 
     maximum = _HOURLY_PLACEMENT_MAX_SECONDS[pattern]
     runtime = timing_runtime or TimingRuntime.compatibility_default()
@@ -115,7 +121,17 @@ def _sample_hourly_placement_seconds(
         ),
         sample_key="offset_seconds",
     )
-    return int(sampled + 0.5)
+    whole = int(sampled + 0.5)
+    if not sub_second:
+        return whole
+    fraction = (
+        _stable_seed(
+            f"suspicious_benign_subsecond:{pattern}:{hostname}:{current_hour.isoformat()}:"
+            f"{timing_ordinal}"
+        )
+        % 1_000_000
+    )
+    return min(float(maximum), whole + fraction / 1_000_000)
 
 
 def _domain_to_dn(domain: str) -> str:
@@ -168,6 +184,22 @@ _BENIGN_LINUX_CMD = [
     "last -n 50",
     "journalctl -u sshd --since '1 hour ago'",
     "lsof -i :22",
+]
+
+# macOS commands that look like recon or credential/code-signing access but are
+# routine admin and developer tasks (image path, command line).
+_BENIGN_MACOS_CMD = [
+    ("/usr/bin/security", "security find-identity -v -p codesigning"),
+    ("/usr/bin/codesign", "codesign -dv --verbose=4 /Applications/Slack.app"),
+    ("/usr/bin/dscl", "dscl . -list /Users UniqueID"),
+    ("/usr/sbin/spctl", "spctl --status"),
+    ("/usr/bin/csrutil", "csrutil status"),
+    ("/bin/launchctl", "launchctl list"),
+    ("/usr/bin/defaults", "defaults read /Library/Preferences/com.apple.loginwindow"),
+    ("/usr/sbin/system_profiler", "system_profiler SPSoftwareDataType"),
+    ("/usr/bin/log", "log show --last 1h --predicate 'process == \"sshd\"'"),
+    ("/usr/sbin/lsof", "lsof -i :22"),
+    ("/usr/bin/last", "last -n 50"),
 ]
 
 
@@ -270,6 +302,7 @@ def generate_after_hours_admin(
         seconds=_sample_hourly_placement_seconds(
             pattern="after_hours_admin",
             hostname=system.hostname,
+            sub_second=_get_os_category(system) == "macos",
             current_hour=current_hour,
             timing_runtime=timing_runtime,
             timing_ordinal=timing_ordinal,
@@ -277,12 +310,23 @@ def generate_after_hours_admin(
     )
     event_time = current_hour + offset
 
+    # RDP (remote-interactive, logon_type 10) is a Windows-only concept — there
+    # is no mstsc.exe / RDP session on macOS or Linux. On a non-Windows target,
+    # after-hours remote admin surfaces as a network logon (logon_type 3), not a
+    # fabricated RDP session. Emitting a generic logon_type-10 session on macOS
+    # would also produce a spurious eslogger `openssh_logout` at teardown with no
+    # matching `openssh_login` (only real SSH-bundle sessions carry that pair).
+    if _get_os_category(system) == "windows":
+        logon_type = 10 if rng.random() < 0.4 else 3  # RDP or network
+    else:
+        logon_type = 3  # network logon (no RDP on macOS/Linux)
+
     return {
         "pattern": "after_hours_admin",
         "user": user,
         "system": system,
         "time": event_time,
-        "logon_type": 10 if rng.random() < 0.4 else 3,  # RDP or network
+        "logon_type": logon_type,
     }
 
 
@@ -305,6 +349,7 @@ def generate_suspicious_cli(
         seconds=_sample_hourly_placement_seconds(
             pattern="suspicious_cli",
             hostname=system.hostname,
+            sub_second=_get_os_category(system) == "macos",
             current_hour=current_hour,
             timing_runtime=timing_runtime,
             timing_ordinal=timing_ordinal,
@@ -320,6 +365,8 @@ def generate_suspicious_cli(
         else:
             cmd = rng.choice(_BENIGN_CMD)
             process = r"C:\Windows\System32\cmd.exe"
+    elif os_cat == "macos":
+        process, cmd = rng.choice(_BENIGN_MACOS_CMD)
     else:
         cmd = rng.choice(_BENIGN_LINUX_CMD)
         process = cmd.split()[0]
@@ -354,6 +401,7 @@ def generate_failed_logon_burst(
         seconds=_sample_hourly_placement_seconds(
             pattern="failed_logon_burst",
             hostname=system.hostname,
+            sub_second=_get_os_category(system) == "macos",
             current_hour=current_hour,
             timing_runtime=timing_runtime,
             timing_ordinal=timing_ordinal,
@@ -396,6 +444,7 @@ def generate_service_account_anomaly(
         seconds=_sample_hourly_placement_seconds(
             pattern="service_account_anomaly",
             hostname=system.hostname,
+            sub_second=_get_os_category(system) == "macos",
             current_hour=current_hour,
             timing_runtime=timing_runtime,
             timing_ordinal=timing_ordinal,
@@ -431,6 +480,7 @@ def generate_suspicious_dns(
         seconds=_sample_hourly_placement_seconds(
             pattern="suspicious_dns",
             hostname=system.hostname,
+            sub_second=_get_os_category(system) == "macos",
             current_hour=current_hour,
             timing_runtime=timing_runtime,
             timing_ordinal=timing_ordinal,
@@ -468,6 +518,7 @@ def generate_unusual_outbound(
         seconds=_sample_hourly_placement_seconds(
             pattern="unusual_outbound",
             hostname=system.hostname,
+            sub_second=_get_os_category(system) == "macos",
             current_hour=current_hour,
             timing_runtime=timing_runtime,
             timing_ordinal=timing_ordinal,
@@ -548,6 +599,7 @@ def generate_temp_dir_execution(
         seconds=_sample_hourly_placement_seconds(
             pattern="temp_dir_execution",
             hostname=system.hostname,
+            sub_second=_get_os_category(system) == "macos",
             current_hour=current_hour,
             timing_runtime=timing_runtime,
             timing_ordinal=timing_ordinal,
@@ -627,6 +679,7 @@ def generate_unusual_powershell(
         seconds=_sample_hourly_placement_seconds(
             pattern="unusual_powershell",
             hostname=system.hostname,
+            sub_second=_get_os_category(system) == "macos",
             current_hour=current_hour,
             timing_runtime=timing_runtime,
             timing_ordinal=timing_ordinal,
@@ -678,4 +731,15 @@ def _get_os_category(system: System) -> str:
     os_lower = system.os.lower()
     if "windows" in os_lower:
         return "windows"
-    return "linux"
+    elif (
+        "linux" in os_lower
+        or "ubuntu" in os_lower
+        or "centos" in os_lower
+        or "debian" in os_lower
+        or "rhel" in os_lower
+    ):
+        return "linux"
+    elif "macos" in os_lower or "mac os" in os_lower or "darwin" in os_lower or "osx" in os_lower:
+        return "macos"
+    else:
+        return "unknown"

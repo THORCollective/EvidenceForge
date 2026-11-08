@@ -124,7 +124,8 @@ For an explicitly requested qualitative review:
 - Read only one relevant reference: `/eforge:references:generation-bundle-targets` for bundle/target
   layout, `/eforge:references:evidence-windows` for Windows, `/eforge:references:evidence-network-ids`
   for network/IDS, `/eforge:references:evidence-web-email` for web/email, or
-  `/eforge:references:evidence-endpoint-linux` for eCAR/Linux.
+  `/eforge:references:evidence-endpoint-linux` for eCAR/Linux, or
+  `/eforge:references:evidence-endpoint-macos` for macOS eslogger.
 - Separate deterministic score findings from qualitative observations and state the sample limits.
 
 ## 5. Recommend changes at the owning layer

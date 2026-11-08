@@ -32,3 +32,14 @@ query:
     - SQLEXPRESS
 
 linux_query: {}
+
+# Per-OS overrides: on a host of this os_category, these pools replace the
+# same-named general pools (which default to Windows-shaped values).
+os_overrides:
+  macos:
+    project_path:
+      - /Users/{username}/dev/webapp
+      - /Users/{username}/dev/api-service
+      - /Users/{username}/dev/design-system
+      - /Users/{username}/Projects/analytics-dashboard
+      - /Users/{username}/src/internal-tools

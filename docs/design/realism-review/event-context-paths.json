@@ -7862,6 +7862,59 @@
       ]
     },
     {
+      "authored_spec": null,
+      "constructors": [
+        {
+          "call": "OccurrenceBuilder",
+          "contexts_attached_at_construction": [
+            "auth",
+            "file",
+            "process",
+            "src_host"
+          ],
+          "event_type_expression": "'btm_launch_item_add'",
+          "event_type_literals": [
+            "btm_launch_item_add"
+          ],
+          "file": "src/evidenceforge/generation/activity/generator.py",
+          "line": 11805,
+          "scope": "ActivityGenerator._emit_btm_launch_item_add"
+        }
+      ],
+      "contexts_attached_at_literal_constructors": [
+        "auth",
+        "file",
+        "process",
+        "src_host"
+      ],
+      "emitter_consumers": [
+        "eslogger"
+      ],
+      "event_type": "btm_launch_item_add",
+      "kind": "internal_occurrence",
+      "path_classification": "pending_manual_trace",
+      "review_status": "static_inventory_complete",
+      "static_references": [
+        {
+          "call": "OccurrenceBuilder",
+          "file": "src/evidenceforge/generation/activity/generator.py",
+          "kind": "call_keyword",
+          "line": 11805,
+          "scope": "ActivityGenerator._emit_btm_launch_item_add"
+        }
+      ],
+      "storyline_dispatch": null,
+      "test_files": [
+        "tests/integration/test_macos_eslogger_scenario.py",
+        "tests/unit/test_eslogger_emitter.py",
+        "tests/unit/test_eslogger_evaluation_rules.py",
+        "tests/unit/test_eslogger_parser.py",
+        "tests/unit/test_eslogger_spec_compliance.py",
+        "tests/unit/test_file_storyline_event.py",
+        "tests/unit/test_macos_btm_causal.py"
+      ]
+    },
+    {
       "authored_spec": {
         "event_type": "connection",
         "fields": [
@@ -9260,6 +9313,63 @@
           "contexts_attached_at_construction": [
             "auth",
             "file",
+            "process",
+            "src_host"
+          ],
+          "event_type_expression": "_FILE_ACTION_EVENT_TYPES[action_name]",
+          "event_type_literals": [],
+          "file": "src/evidenceforge/generation/activity/generator.py",
+          "line": 23917,
+          "resolved_dynamically": true,
+          "scope": "ActivityGenerator._emit_email_endpoint_file_event"
+        },
+        {
+          "call": "OccurrenceBuilder",
+          "contexts_attached_at_construction": [
+            "auth",
+            "file",
+            "process",
+            "src_host"
+          ],
+          "event_type_expression": "_FILE_ACTION_EVENT_TYPES[spec.action]",
+          "event_type_literals": [],
+          "file": "src/evidenceforge/generation/engine/typed_handlers/file.py",
+          "line": 62,
+          "resolved_dynamically": true,
+          "scope": "handle_file"
+        }
+      ],
+      "contexts_attached_at_literal_constructors": [
+        "auth",
+        "file",
+        "process",
+        "src_host"
+      ],
+      "emitter_consumers": [
+        "eslogger"
+      ],
+      "event_type": "file_open",
+      "kind": "internal_occurrence",
+      "path_classification": "pending_manual_trace",
+      "review_status": "static_inventory_complete",
+      "static_references": [],
+      "storyline_dispatch": null,
+      "test_files": [
+        "tests/unit/test_eslogger_emitter.py",
+        "tests/unit/test_eslogger_evaluation_rules.py",
+        "tests/unit/test_eslogger_spec_compliance.py",
+        "tests/unit/test_events.py",
+        "tests/unit/test_file_storyline_event.py"
+      ]
+    },
+    {
+      "authored_spec": null,
+      "constructors": [
+        {
+          "call": "OccurrenceBuilder",
+          "contexts_attached_at_construction": [
+            "auth",
+            "file",
             "identity_plan",
             "process",
             "src_host"
@@ -9437,6 +9547,172 @@
         "tests/unit/test_ecar_spec_compliance.py",
         "tests/unit/test_edr_pools.py",
         "tests/unit/test_storyline_command_networks.py"
+      ]
+    },
+    {
+      "authored_spec": null,
+      "constructors": [
+        {
+          "call": "OccurrenceBuilder",
+          "contexts_attached_at_construction": [
+            "auth",
+            "file",
+            "process",
+            "src_host"
+          ],
+          "event_type_expression": "_FILE_ACTION_EVENT_TYPES[action_name]",
+          "event_type_literals": [],
+          "file": "src/evidenceforge/generation/activity/generator.py",
+          "line": 23917,
+          "resolved_dynamically": true,
+          "scope": "ActivityGenerator._emit_email_endpoint_file_event"
+        },
+        {
+          "call": "OccurrenceBuilder",
+          "contexts_attached_at_construction": [
+            "auth",
+            "file",
+            "process",
+            "src_host"
+          ],
+          "event_type_expression": "_FILE_ACTION_EVENT_TYPES[spec.action]",
+          "event_type_literals": [],
+          "file": "src/evidenceforge/generation/engine/typed_handlers/file.py",
+          "line": 62,
+          "resolved_dynamically": true,
+          "scope": "handle_file"
+        }
+      ],
+      "contexts_attached_at_literal_constructors": [
+        "auth",
+        "file",
+        "process",
+        "src_host"
+      ],
+      "emitter_consumers": [
+        "eslogger"
+      ],
+      "event_type": "file_rename",
+      "kind": "internal_occurrence",
+      "path_classification": "pending_manual_trace",
+      "review_status": "static_inventory_complete",
+      "static_references": [],
+      "storyline_dispatch": null,
+      "test_files": [
+        "tests/unit/test_eslogger_emitter.py",
+        "tests/unit/test_eslogger_evaluation_rules.py",
+        "tests/unit/test_events.py"
+      ]
+    },
+    {
+      "authored_spec": null,
+      "constructors": [
+        {
+          "call": "OccurrenceBuilder",
+          "contexts_attached_at_construction": [
+            "auth",
+            "file",
+            "process",
+            "src_host"
+          ],
+          "event_type_expression": "_FILE_ACTION_EVENT_TYPES[action_name]",
+          "event_type_literals": [],
+          "file": "src/evidenceforge/generation/activity/generator.py",
+          "line": 23917,
+          "resolved_dynamically": true,
+          "scope": "ActivityGenerator._emit_email_endpoint_file_event"
+        },
+        {
+          "call": "OccurrenceBuilder",
+          "contexts_attached_at_construction": [
+            "auth",
+            "file",
+            "process",
+            "src_host"
+          ],
+          "event_type_expression": "_FILE_ACTION_EVENT_TYPES[spec.action]",
+          "event_type_literals": [],
+          "file": "src/evidenceforge/generation/engine/typed_handlers/file.py",
+          "line": 62,
+          "resolved_dynamically": true,
+          "scope": "handle_file"
+        }
+      ],
+      "contexts_attached_at_literal_constructors": [
+        "auth",
+        "file",
+        "process",
+        "src_host"
+      ],
+      "emitter_consumers": [
+        "eslogger"
+      ],
+      "event_type": "file_unlink",
+      "kind": "internal_occurrence",
+      "path_classification": "pending_manual_trace",
+      "review_status": "static_inventory_complete",
+      "static_references": [],
+      "storyline_dispatch": null,
+      "test_files": [
+        "tests/unit/test_eslogger_emitter.py",
+        "tests/unit/test_eslogger_evaluation_rules.py",
+        "tests/unit/test_events.py"
+      ]
+    },
+    {
+      "authored_spec": null,
+      "constructors": [
+        {
+          "call": "OccurrenceBuilder",
+          "contexts_attached_at_construction": [
+            "auth",
+            "file",
+            "process",
+            "src_host"
+          ],
+          "event_type_expression": "_FILE_ACTION_EVENT_TYPES[action_name]",
+          "event_type_literals": [],
+          "file": "src/evidenceforge/generation/activity/generator.py",
+          "line": 23917,
+          "resolved_dynamically": true,
+          "scope": "ActivityGenerator._emit_email_endpoint_file_event"
+        },
+        {
+          "call": "OccurrenceBuilder",
+          "contexts_attached_at_construction": [
+            "auth",
+            "file",
+            "process",
+            "src_host"
+          ],
+          "event_type_expression": "_FILE_ACTION_EVENT_TYPES[spec.action]",
+          "event_type_literals": [],
+          "file": "src/evidenceforge/generation/engine/typed_handlers/file.py",
+          "line": 62,
+          "resolved_dynamically": true,
+          "scope": "handle_file"
+        }
+      ],
+      "contexts_attached_at_literal_constructors": [
+        "auth",
+        "file",
+        "process",
+        "src_host"
+      ],
+      "emitter_consumers": [
+        "eslogger"
+      ],
+      "event_type": "file_write",
+      "kind": "internal_occurrence",
+      "path_classification": "pending_manual_trace",
+      "review_status": "static_inventory_complete",
+      "static_references": [],
+      "storyline_dispatch": null,
+      "test_files": [
+        "tests/unit/test_eslogger_emitter.py",
+        "tests/unit/test_eslogger_evaluation_rules.py",
+        "tests/unit/test_events.py",
+        "tests/unit/test_lifecycle_registry.py"
       ]
     },
     {
@@ -10740,6 +11016,53 @@
       ]
     },
     {
+      "authored_spec": null,
+      "constructors": [
+        {
+          "call": "OccurrenceBuilder",
+          "contexts_attached_at_construction": [
+            "auth",
+            "process",
+            "src_host"
+          ],
+          "event_type_expression": "'privilege_elevation'",
+          "event_type_literals": [
+            "privilege_elevation"
+          ],
+          "file": "src/evidenceforge/generation/actions/macos_privilege.py",
+          "line": 34,
+          "scope": "dispatch_privilege_elevation"
+        }
+      ],
+      "contexts_attached_at_literal_constructors": [
+        "auth",
+        "process",
+        "src_host"
+      ],
+      "emitter_consumers": [
+        "eslogger"
+      ],
+      "event_type": "privilege_elevation",
+      "kind": "internal_occurrence",
+      "path_classification": "pending_manual_trace",
+      "review_status": "static_inventory_complete",
+      "static_references": [
+        {
+          "call": "OccurrenceBuilder",
+          "file": "src/evidenceforge/generation/actions/macos_privilege.py",
+          "kind": "call_keyword",
+          "line": 34,
+          "scope": "dispatch_privilege_elevation"
+        }
+      ],
+      "storyline_dispatch": null,
+      "test_files": [
+        "tests/unit/test_eslogger_evaluation_rules.py",
+        "tests/unit/test_eslogger_new_signals.py",
+        "tests/unit/test_eslogger_spec_compliance.py"
+      ]
+    },
+    {
       "authored_spec": {
         "event_type": "process",
         "fields": [
@@ -11278,49 +11601,6 @@
       ]
     },
     {
-      "authored_spec": {
-        "event_type": "rdp_session",
-        "fields": [
-          "type",
-          "source_ip"
-        ],
-        "file": "src/evidenceforge/models/scenario.py",
-        "line": 1130,
-        "model": "RdpSessionEventSpec",
-        "validators": []
-      },
-      "constructors": [],
-      "contexts_attached_at_literal_constructors": [],
-      "emitter_consumers": [],
-      "event_type": "rdp_session",
-      "kind": "authored_intent",
-      "path_classification": "intentional_adapter",
-      "path_review": {
-        "assessment": "These are authored intent names, not canonical occurrence kinds. Their branches deliberately expand into lower-level occurrences.",
-        "classification": "intentional_adapter",
-        "owner": "typed storyline dispatcher and the delegated action/generator family"
-      },
-      "review_status": "path_review_complete",
-      "static_references": [],
-      "storyline_dispatch": {
-        "calls": [
-          {
-            "call": "self.activity_generator.generate_rdp_session",
-            "line": 4778,
-            "name": "generate_rdp_session"
-          }
-        ],
-        "file": "src/evidenceforge/generation/engine/storyline.py",
-        "line": 4743
-      },
-      "test_files": [
-        "tests/integration/test_ids_alert_generation.py",
-        "tests/unit/test_ground_truth.py",
-        "tests/unit/test_install_skills.py",
-        "tests/unit/test_storyline_command_networks.py"
-      ]
-    },
-    {
       "authored_spec": null,
       "constructors": [
         {
@@ -11471,6 +11751,49 @@
       "storyline_dispatch": null,
       "test_files": [
         "tests/unit/test_rdp_deferred_production.py"
+      ]
+    },
+    {
+      "authored_spec": {
+        "event_type": "rdp_session",
+        "fields": [
+          "type",
+          "source_ip"
+        ],
+        "file": "src/evidenceforge/models/scenario.py",
+        "line": 1130,
+        "model": "RdpSessionEventSpec",
+        "validators": []
+      },
+      "constructors": [],
+      "contexts_attached_at_literal_constructors": [],
+      "emitter_consumers": [],
+      "event_type": "rdp_session",
+      "kind": "authored_intent",
+      "path_classification": "intentional_adapter",
+      "path_review": {
+        "assessment": "These are authored intent names, not canonical occurrence kinds. Their branches deliberately expand into lower-level occurrences.",
+        "classification": "intentional_adapter",
+        "owner": "typed storyline dispatcher and the delegated action/generator family"
+      },
+      "review_status": "path_review_complete",
+      "static_references": [],
+      "storyline_dispatch": {
+        "calls": [
+          {
+            "call": "self.activity_generator.generate_rdp_session",
+            "line": 4778,
+            "name": "generate_rdp_session"
+          }
+        ],
+        "file": "src/evidenceforge/generation/engine/storyline.py",
+        "line": 4743
+      },
+      "test_files": [
+        "tests/integration/test_ids_alert_generation.py",
+        "tests/unit/test_ground_truth.py",
+        "tests/unit/test_install_skills.py",
+        "tests/unit/test_storyline_command_networks.py"
       ]
     },
     {
@@ -13400,6 +13723,57 @@
         "tests/unit/test_system_process_stability.py",
         "tests/unit/test_systemd_ecar_correlation.py",
         "tests/unit/test_zeek_activity_contexts.py"
+      ]
+    },
+    {
+      "definition": "src/evidenceforge/config/formats/eslogger.yaml",
+      "emitter_class": "ESLoggerEmitter",
+      "emitter_file": "src/evidenceforge/generation/emitters/eslogger.py",
+      "emitter_line": 166,
+      "evaluator_files": [
+        "src/evidenceforge/evaluation/parsers/__init__.py",
+        "src/evidenceforge/evaluation/parsers/eslogger.py",
+        "src/evidenceforge/evaluation/validation_routes.py",
+        "src/evidenceforge/evaluation/visibility.py"
+      ],
+      "format": "eslogger",
+      "occurrence_builder_fields_consumed": [
+        "auth",
+        "dst_host",
+        "event_type",
+        "file",
+        "process",
+        "src_host",
+        "timestamp"
+      ],
+      "path_classification": "pending_manual_trace",
+      "review_status": "static_inventory_complete",
+      "supported_event_types": [
+        "btm_launch_item_add",
+        "file_create",
+        "file_open",
+        "file_rename",
+        "file_unlink",
+        "file_write",
+        "logoff",
+        "privilege_elevation",
+        "process_create",
+        "process_terminate",
+        "ssh_session",
+        "system_process_create",
+        "workstation_locked",
+        "workstation_unlocked"
+      ],
+      "test_files": [
+        "tests/integration/test_eslogger_evaluation_e2e.py",
+        "tests/integration/test_format_definitions.py",
+        "tests/unit/test_eslogger_emitter.py",
+        "tests/unit/test_eslogger_evaluation_rules.py",
+        "tests/unit/test_eslogger_new_signals.py",
+        "tests/unit/test_eslogger_parser.py",
+        "tests/unit/test_eslogger_spec_compliance.py",
+        "tests/unit/test_source_deployment_compiler.py",
+        "tests/unit/test_validation.py"
       ]
     },
     {

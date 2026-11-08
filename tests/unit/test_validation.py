@@ -49,7 +49,7 @@ from evidenceforge.models import (
 )
 from evidenceforge.utils import load_yaml
 from evidenceforge.validation import ScenarioValidator
-from evidenceforge.validation.schema import BUILTIN_ACCOUNTS
+from evidenceforge.validation.schema import BUILTIN_ACCOUNTS, _get_os_category
 
 
 def _scenario_with_smb_reference(
@@ -1592,6 +1592,30 @@ class TestScenarioValidator:
         assert "root" in BUILTIN_ACCOUNTS
 
 
+class TestSchemaGetOsCategory:
+    """Tests for validation.schema._get_os_category."""
+
+    def test_windows(self):
+        assert _get_os_category("Windows 10") == "windows"
+        assert _get_os_category("Windows Server 2019") == "windows"
+
+    def test_linux(self):
+        assert _get_os_category("Linux Ubuntu 20.04") == "linux"
+        assert _get_os_category("CentOS 8") == "linux"
+        assert _get_os_category("Debian 11") == "linux"
+        assert _get_os_category("RHEL 9") == "linux"
+
+    def test_macos(self):
+        """macOS strings (macos/mac os/darwin/osx substrings) classify as 'macos'."""
+        assert _get_os_category("macOS 14.5") == "macos"
+        assert _get_os_category("Darwin") == "macos"
+        assert _get_os_category("macOS Sonoma") == "macos"
+        assert _get_os_category("OSX") == "macos"
+
+    def test_unknown_fallback(self):
+        assert _get_os_category("AmigaOS") == "unknown"
+
+
 class TestNetworkValidation:
     """Tests for network topology validation."""
 
@@ -2144,6 +2168,98 @@ class TestFormatOsCompatibility:
             if "output.logs" == i.field_path and ("requires" in i.message or "no" in i.message)
         ]
         assert len(os_issues) == 0
+
+    def test_macos_format_no_macos_systems_error(self):
+        """eslogger format with only Linux systems should error."""
+        scenario = Scenario(
+            version="1.0",
+            name="test",
+            description="Test",
+            environment=Environment(
+                description="Test env",
+                users=[User(username="u1", full_name="U", email="u@test.com")],
+                systems=[
+                    System(
+                        hostname="LNX-01", ip="10.0.0.1", os="Linux Ubuntu 22.04", type="server"
+                    ),
+                ],
+            ),
+            time_window=TimeWindow(start=datetime(2024, 1, 15, 10, 0, 0), duration="1h"),
+            baseline_activity=BaselineActivity(
+                description="Test", intensity="medium", variation="low"
+            ),
+            output=OutputSpec(logs=[{"format": "eslogger"}], destination="./output"),
+        )
+        validator = ScenarioValidator(scenario)
+        issues = validator.validate()
+
+        errors = [
+            i for i in issues if i.severity == "error" and "requires macos" in i.message.lower()
+        ]
+        assert len(errors) >= 1
+
+    def test_macos_system_and_eslogger_format_no_issues(self):
+        """macOS system with eslogger in output should produce no OS-binding issues."""
+        scenario = Scenario(
+            version="1.0",
+            name="test",
+            description="Test",
+            environment=Environment(
+                description="Test env",
+                users=[User(username="u1", full_name="U", email="u@test.com")],
+                systems=[
+                    System(hostname="MAC-01", ip="10.0.0.1", os="macOS 14.5", type="workstation"),
+                ],
+            ),
+            time_window=TimeWindow(start=datetime(2024, 1, 15, 10, 0, 0), duration="1h"),
+            baseline_activity=BaselineActivity(
+                description="Test", intensity="medium", variation="low"
+            ),
+            output=OutputSpec(logs=[{"format": "eslogger"}], destination="./output"),
+        )
+        validator = ScenarioValidator(scenario)
+        issues = validator.validate()
+
+        os_issues = [
+            i
+            for i in issues
+            if "output.logs" == i.field_path and ("requires" in i.message or "no" in i.message)
+        ]
+        assert len(os_issues) == 0
+
+    def test_macos_system_windows_format_only_produces_mismatch(self):
+        """macOS system with only windows_event_security format should error + warn."""
+        scenario = Scenario(
+            version="1.0",
+            name="test",
+            description="Test",
+            environment=Environment(
+                description="Test env",
+                users=[User(username="u1", full_name="U", email="u@test.com")],
+                systems=[
+                    System(hostname="MAC-01", ip="10.0.0.1", os="macOS 14.5", type="workstation"),
+                ],
+            ),
+            time_window=TimeWindow(start=datetime(2024, 1, 15, 10, 0, 0), duration="1h"),
+            baseline_activity=BaselineActivity(
+                description="Test", intensity="medium", variation="low"
+            ),
+            output=OutputSpec(logs=[{"format": "windows_event_security"}], destination="./output"),
+        )
+        validator = ScenarioValidator(scenario)
+        issues = validator.validate()
+
+        errors = [
+            i for i in issues if i.severity == "error" and "requires windows" in i.message.lower()
+        ]
+        assert len(errors) >= 1
+
+        warnings = [
+            i
+            for i in issues
+            if i.severity == "warning" and "MAC-01" in i.message and "macos" in i.message.lower()
+        ]
+        assert len(warnings) >= 1
 
 
 class TestProxyOutputTopology:
@@ -2802,6 +2918,111 @@ class TestStorylineOsPlausibility:
         warnings = [i for i in issues if "Linux-specific" in i.message]
         assert len(warnings) >= 1
 
+    def test_file_eslogger_only_action_on_windows_warning(self):
+        """A `file` event with an eslogger-only action on Windows should warn."""
+        scenario = Scenario(
+            version="1.0",
+            name="test",
+            description="Test",
+            environment=Environment(
+                description="Test env",
+                users=[User(username="jdoe", full_name="J", email="j@test.com")],
+                systems=[
+                    System(hostname="WS-01", ip="10.0.0.1", os="Windows 10", type="workstation"),
+                ],
+            ),
+            storyline=[
+                StorylineEvent(
+                    id="evt-val-file-open-windows",
+                    time="2024-01-15T10:00:00Z",
+                    actor="jdoe",
+                    system="WS-01",
+                    activity="open a file",
+                    events=[{"type": "file", "path": "C:\\notes.txt", "action": "open"}],
+                ),
+            ],
+            time_window=TimeWindow(start=datetime(2024, 1, 15, 10, 0, 0), duration="1h"),
+            baseline_activity=BaselineActivity(
+                description="Test", intensity="medium", variation="low"
+            ),
+            output=OutputSpec(logs=[{"format": "windows"}], destination="./output"),
+        )
+        validator = ScenarioValidator(scenario)
+        issues = validator.validate()
+
+        warnings = [i for i in issues if "only rendered by the macOS eslogger" in i.message]
+        assert len(warnings) >= 1
+
+    def test_file_create_action_on_windows_no_warning(self):
+        """`action: create` renders on Windows via Sysmon/eCAR, so no warning."""
+        scenario = Scenario(
+            version="1.0",
+            name="test",
+            description="Test",
+            environment=Environment(
+                description="Test env",
+                users=[User(username="jdoe", full_name="J", email="j@test.com")],
+                systems=[
+                    System(hostname="WS-01", ip="10.0.0.1", os="Windows 10", type="workstation"),
+                ],
+            ),
+            storyline=[
+                StorylineEvent(
+                    id="evt-val-file-create-windows",
+                    time="2024-01-15T10:00:00Z",
+                    actor="jdoe",
+                    system="WS-01",
+                    activity="create a file",
+                    events=[{"type": "file", "path": "C:\\notes.txt", "action": "create"}],
+                ),
+            ],
+            time_window=TimeWindow(start=datetime(2024, 1, 15, 10, 0, 0), duration="1h"),
+            baseline_activity=BaselineActivity(
+                description="Test", intensity="medium", variation="low"
+            ),
+            output=OutputSpec(logs=[{"format": "windows"}], destination="./output"),
+        )
+        validator = ScenarioValidator(scenario)
+        issues = validator.validate()
+
+        warnings = [i for i in issues if "only rendered by the macOS eslogger" in i.message]
+        assert warnings == []
+
+    def test_file_open_action_on_macos_no_warning(self):
+        """`action: open` on a macOS system is exactly what eslogger renders."""
+        scenario = Scenario(
+            version="1.0",
+            name="test",
+            description="Test",
+            environment=Environment(
+                description="Test env",
+                users=[User(username="jdoe", full_name="J", email="j@test.com")],
+                systems=[
+                    System(hostname="MAC-01", ip="10.0.0.1", os="macOS 14", type="workstation"),
+                ],
+            ),
+            storyline=[
+                StorylineEvent(
+                    id="evt-val-file-open-macos",
+                    time="2024-01-15T10:00:00Z",
+                    actor="jdoe",
+                    system="MAC-01",
+                    activity="open a file",
+                    events=[{"type": "file", "path": "/Users/jdoe/notes.txt", "action": "open"}],
+                ),
+            ],
+            time_window=TimeWindow(start=datetime(2024, 1, 15, 10, 0, 0), duration="1h"),
+            baseline_activity=BaselineActivity(
+                description="Test", intensity="medium", variation="low"
+            ),
+            output=OutputSpec(logs=[{"format": "eslogger"}], destination="./output"),
+        )
+        validator = ScenarioValidator(scenario)
+        issues = validator.validate()
+
+        warnings = [i for i in issues if "only rendered by the macOS eslogger" in i.message]
+        assert warnings == []
+
     def test_powershell_on_linux_warning(self):
         """Process with powershell.exe on Linux should warn."""
         scenario = Scenario(
@@ -2924,6 +3145,97 @@ class TestStorylineOsPlausibility:
             for issue in issues
         )
 
+    def test_unknown_binary_full_path_is_not_flagged_as_noncanonical(self):
+        """An attacker-chosen path for a binary with no configured path is legitimate."""
+        scenario = Scenario(
+            version="1.0",
+            name="test",
+            description="Test",
+            environment=Environment(
+                description="Test env",
+                users=[User(username="jdoe", full_name="J", email="j@test.com")],
+                systems=[
+                    System(hostname="MAC-01", ip="10.0.0.1", os="macOS 14.5", type="workstation"),
+                ],
+            ),
+            storyline=[
+                StorylineEvent(
+                    id="evt-val-unknown-binary",
+                    time="2024-01-15T10:00:00Z",
+                    actor="jdoe",
+                    system="MAC-01",
+                    activity="run dropper",
+                    events=[
+                        {
+                            "type": "process",
+                            "process_name": "/Users/Shared/.cloudsync/cloudsyncd",
+                        }
+                    ],
+                ),
+            ],
+            time_window=TimeWindow(start=datetime(2024, 1, 15, 10, 0, 0), duration="1h"),
+            baseline_activity=BaselineActivity(
+                description="Test", intensity="medium", variation="low"
+            ),
+            output=OutputSpec(logs=[{"format": "eslogger"}], destination="./output"),
+        )
+
+        issues = ScenarioValidator(scenario).validate()
+
+        assert not any(
+            "differs from configured canonical path" in issue.message for issue in issues
+        )
+
+    @pytest.mark.parametrize("event_type", ["file", "connection"])
+    def test_file_and_connection_process_ref_must_match_earlier_process(self, event_type):
+        """process_ref on a file/connection event names an earlier storyline process."""
+        action = (
+            {"type": "file", "path": "/Users/jdoe/Library/Keychains/login.keychain-db"}
+            if event_type == "file"
+            else {"type": "connection", "dst_ip": "203.0.113.10", "dst_port": 443}
+        )
+        scenario = Scenario(
+            version="1.0",
+            name="test",
+            description="Test",
+            environment=Environment(
+                description="Test env",
+                users=[User(username="jdoe", full_name="J", email="j@test.com")],
+                systems=[
+                    System(hostname="MAC-01", ip="10.0.0.1", os="macOS 14.5", type="workstation"),
+                ],
+            ),
+            storyline=[
+                StorylineEvent(
+                    id="evt-val-action-ref",
+                    time="2024-01-15T10:00:00Z",
+                    actor="jdoe",
+                    system="MAC-01",
+                    activity="dropper acts",
+                    events=[
+                        {
+                            "type": "process",
+                            "process_name": "/tmp/dropper",
+                            "process_ref": "dropper",
+                        },
+                        {**action, "process_ref": "dropper"},
+                        {**action, "process_ref": "missing"},
+                    ],
+                ),
+            ],
+            time_window=TimeWindow(start=datetime(2024, 1, 15, 10, 0, 0), duration="1h"),
+            baseline_activity=BaselineActivity(
+                description="Test", intensity="medium", variation="low"
+            ),
+            output=OutputSpec(logs=[{"format": "eslogger"}], destination="./output"),
+        )
+
+        issues = ScenarioValidator(scenario).validate()
+        ref_warnings = [issue for issue in issues if issue.field_path.endswith("process_ref")]
+
+        assert [issue.field_path for issue in ref_warnings] == ["storyline.0.events.2.process_ref"]
+        assert "missing" in ref_warnings[0].message
+
     def test_linux_path_on_windows_warning(self):
         """Process with /usr/ path on Windows should warn."""
         scenario = Scenario(
@@ -3025,6 +3337,41 @@ class TestStorylineOsPlausibility:
             if "specific" in i.message.lower() and ("Windows" in i.message or "Linux" in i.message)
         ]
         assert len(os_warnings) == 0
+
+    def test_ssh_on_macos_no_warning(self):
+        """SSH session on macOS system should not warn (SSH bundle supports macOS)."""
+        scenario = Scenario(
+            version="1.0",
+            name="test",
+            description="Test",
+            environment=Environment(
+                description="Test env",
+                users=[User(username="jdoe", full_name="J", email="j@test.com")],
+                systems=[
+                    System(hostname="MAC-01", ip="10.0.0.1", os="macOS 14.5", type="workstation"),
+                ],
+            ),
+            storyline=[
+                StorylineEvent(
+                    id="evt-val-021",
+                    time="2024-01-15T10:00:00Z",
+                    actor="jdoe",
+                    system="MAC-01",
+                    activity="ssh session",
+                    events=[{"type": "ssh_session"}],
+                ),
+            ],
+            time_window=TimeWindow(start=datetime(2024, 1, 15, 10, 0, 0), duration="1h"),
+            baseline_activity=BaselineActivity(
+                description="Test", intensity="medium", variation="low"
+            ),
+            output=OutputSpec(logs=[{"format": "eslogger"}], destination="./output"),
+        )
+        validator = ScenarioValidator(scenario)
+        issues = validator.validate()
+
+        warnings = [i for i in issues if "Linux-specific" in i.message]
+        assert len(warnings) == 0
 
 
 class TestStorylineLinkability:

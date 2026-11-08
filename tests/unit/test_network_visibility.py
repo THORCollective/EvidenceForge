@@ -25,6 +25,7 @@
 Phase 2.5: Tests NetworkVisibilityEngine for sensor-based connection filtering.
 """
 
+from evidenceforge.evaluation.visibility import _get_os_category
 from evidenceforge.generation.network_visibility import NetworkVisibilityEngine
 from evidenceforge.models.scenario import (
     NatRule,
@@ -49,6 +50,30 @@ def _make_systems():
 def _make_config(segments, sensors):
     """Helper to create NetworkConfig."""
     return NetworkConfig(segments=segments, sensors=sensors)
+
+
+class TestVisibilityGetOsCategory:
+    """Tests for evaluation.visibility._get_os_category."""
+
+    def test_windows(self):
+        assert _get_os_category("Windows 10") == "windows"
+        assert _get_os_category("Windows Server 2019") == "windows"
+
+    def test_linux(self):
+        assert _get_os_category("Linux Ubuntu 20.04") == "linux"
+        assert _get_os_category("CentOS 8") == "linux"
+        assert _get_os_category("Debian 11") == "linux"
+        assert _get_os_category("RHEL 9") == "linux"
+
+    def test_macos(self):
+        """macOS strings (macos/mac os/darwin/osx substrings) classify as 'macos'."""
+        assert _get_os_category("macOS 14.5") == "macos"
+        assert _get_os_category("Darwin") == "macos"
+        assert _get_os_category("macOS Sonoma") == "macos"
+        assert _get_os_category("OSX") == "macos"
+
+    def test_unknown_fallback(self):
+        assert _get_os_category("AmigaOS") == "unknown"
 
 
 class TestNoNetworkConfig:

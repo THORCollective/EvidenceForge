@@ -316,6 +316,22 @@ systems:
     roles: [web_server]        # Optional: forward_proxy, web_server, dns_server, dhcp_server, mail_server
 ```
 
+`os` also accepts Linux (e.g. `"Ubuntu 22.04"`) and macOS (e.g. `"macOS 14.4"`) strings; OS
+category detection is pattern-based (`windows`/`linux`/`macos`/`darwin`/`osx` substrings), not an
+enum. A macOS system produces `eslogger` (Endpoint Security) NDJSON instead of Windows Event/Sysmon
+or Linux syslog/bash history. macOS Remote Login is off by default, so a Mac accepts inbound SSH
+only when it lists an `ssh` service (or is a server).
+
+```yaml
+systems:
+  - hostname: MAC-DESIGN-01
+    ip: "10.0.1.20"
+    os: "macOS 14.4"
+    type: workstation
+    assigned_user: dana.reyes
+    services: ["ssh"]          # Optional: enables inbound SSH (Remote Login)
+```
+
 `roles` and `services` materially affect realism. They feed the compiled world model that drives infrastructure discovery, proxy routing, legitimate lateral-movement patterns, and whether remote access should look like SSH, RDP, or generic network activity.
 
 `os_build` and `architecture` are optional identity facts. When supplied, deployment and content
@@ -1117,11 +1133,12 @@ minutes or hours. `explicit_offsets` accepts one offset per child event, such as
 
 | Type | Generates | Required Fields | Optional Fields |
 |------|-----------|-----------------|-----------------|
-| `process` | 4688, Sysmon 1, eCAR PROCESS | `process_name` | `command_line`, `process_ref`, `parent_ref`, `supplementary` (auto/none) |
+| `process` | 4688, Sysmon 1, eCAR PROCESS, macOS eslogger fork/exec | `process_name` | `command_line`, `process_ref`, `parent_ref`, `supplementary` (auto/none), `working_directory` (process cwd: Sysmon `CurrentDirectory`, eslogger `exec.cwd`; derived when omitted) |
+| `file` | Sysmon 11/eCAR file events (create/modify/delete/read), macOS eslogger (create/open/write/rename/unlink); `create` under LaunchAgents/LaunchDaemons also drives the BTM causal rule | `path` | `action` (create/modify/delete/read/open/write/rename/unlink, default create), `pid` (explicit actor PID), `process_ref` (earlier `process_ref` of the process performing the file action; default is the most recent storyline process on that system), `launch_program` (LaunchAgents/LaunchDaemons plist creates only: the program the plist runs, rendered as the BTM `executable_path`, default the writer; a later `process` event for that program on the same Mac is parented by launchd) |
 | `logon` | 4624, target-host 4672 for elevated sessions, eCAR LOGIN; Type 9 uses the host's active/assigned desktop user as the local caller and the event actor as outbound credentials | | `logon_type` (default 3), `source_ip` (ignored for local Type 9) |
 | `failed_logon` | 4625, eCAR LOGIN failure | | `source_ip`, `logon_type` (default 3), `target_username` |
 | `logoff` | 4634, eCAR LOGOUT | | |
-| `connection` | Zeek conn, eCAR FLOW, + web_access/zeek_http/files when `service: http` | `dst_ip` | `dst_port` (default 443), `hostname`, `service`, `source_ip`, `method`, `uri`, `status_code`, `user_agent`, `referrer`, `request_body_len`, `request_multipart`, `response_body_len`, `response_multipart`, `orig_bytes`, `resp_bytes`, `conn_state`, `ids_alerts` |
+| `connection` | Zeek conn, eCAR FLOW, + web_access/zeek_http/files when `service: http` | `dst_ip` | `dst_port` (default 443), `hostname`, `service`, `source_ip`, `method`, `uri`, `status_code`, `user_agent`, `referrer`, `request_body_len`, `request_multipart`, `response_body_len`, `response_multipart`, `orig_bytes`, `resp_bytes`, `conn_state`, `ids_alerts`, `process_ref` (earlier `process_ref` of the owning process; for uploads this keeps the named process as the uploader) |
 | `smb_activity` | SMB transport/auth/session/tree/file lifecycle; Zeek SMB/files, platform-eligible Windows or Samba audit, eCAR | `operation` plus its share/client location shape | `purpose`, `batch`, `outcome`, `path_style`, `mapping`, `client_access`, `auth_protocol`, `smb_principal`, external `client`, `ids_alerts` |
 | `ssh_session` | canonical SSH connection (Zeek conn) + syslog sshd + EDR/eCAR | | `source_ip`, `ids_alerts` |
 | `rdp_session` | Zeek conn + 4624 type 10 + eCAR | | `source_ip`, `ids_alerts` |
@@ -1831,7 +1848,7 @@ output:
 writes the bundle beside the scenario by default; pass `eforge generate --output <bundle-root>` to
 choose another location explicitly.
 
-Supported formats: `windows`, `zeek`, `ecar` (simulated EDR using the eCAR record format), `syslog`, `bash_history`, `snort_alert`, `cisco_asa`, `web_access`, `proxy_access`.
+Supported formats: `windows`, `zeek`, `ecar` (simulated EDR using the eCAR record format), `eslogger` (macOS Endpoint Security NDJSON), `syslog`, `bash_history`, `snort_alert`, `cisco_asa`, `web_access`, `proxy_access`.
 
 Output formats here are canonical and target-neutral. Choose target-specific
 file shapes, such as SOF-ELK® Snare Windows events or year-partitioned RFC3164

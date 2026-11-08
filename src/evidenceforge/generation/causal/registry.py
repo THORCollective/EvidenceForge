@@ -28,6 +28,7 @@ from evidenceforge.generation.causal.rules import (
     DnsBeforeConnection,
     ExpansionRule,
     KerberosBeforeLogon,
+    PlistCreateBeforeBtmLaunchItem,
     ProcessAccessAfterRemoteThread,
     SupplementaryAuditEvents,
 )
@@ -41,6 +42,7 @@ def default_rules() -> list[ExpansionRule]:
     """
     return [
         DnsBeforeConnection(),
+        PlistCreateBeforeBtmLaunchItem(),
         KerberosBeforeLogon(),
         ProcessAccessAfterRemoteThread(),
         SupplementaryAuditEvents(),

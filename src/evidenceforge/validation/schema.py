@@ -86,6 +86,7 @@ BUILTIN_ACCOUNTS = WINDOWS_BUILTIN_ACCOUNTS | LINUX_BUILTIN_ACCOUNTS
 # OS detection patterns (mirrors evaluation/visibility.py)
 _WINDOWS_PATTERNS = ["windows"]
 _LINUX_PATTERNS = ["linux", "ubuntu", "centos", "debian", "rhel"]
+_MACOS_PATTERNS = ["macos", "mac os", "darwin", "osx"]
 
 # Formats that are bound to a specific OS
 _OS_BOUND_FORMATS: dict[str, str] = {
@@ -93,12 +94,14 @@ _OS_BOUND_FORMATS: dict[str, str] = {
     "windows_event_sysmon": "windows",
     "syslog": "linux",
     "bash_history": "linux",
+    "eslogger": "macos",
 }
 
 # Reverse: OS → expected host-local formats
 _OS_EXPECTED_FORMATS: dict[str, set[str]] = {
     "windows": {"windows_event_security", "windows_event_sysmon"},
     "linux": {"syslog", "bash_history"},
+    "macos": {"eslogger"},
 }
 
 # Event types that are Windows-specific
@@ -116,6 +119,19 @@ _WINDOWS_EVENT_TYPES = {
 # Event types that imply Linux/SSH
 _LINUX_EVENT_TYPES = {"ssh_session"}
 
+# Event types from _LINUX_EVENT_TYPES that are ALSO valid on macOS (the SSH bundle
+# supports macOS sources/destinations per Task 5). Kept as an independent set
+# rather than merged/renamed into _LINUX_EVENT_TYPES: not every Linux-only event
+# type is meaningful on macOS, so each type needs its own per-OS decision.
+_MACOS_EVENT_TYPES = {"ssh_session"}
+
+# `file` storyline event actions rendered ONLY by the macOS eslogger emitter
+# (see generation/emitters/eslogger.py's supported action set). "create" is
+# excluded here because Sysmon/eCAR also render file_create on Windows/Linux;
+# these four actions have no non-macOS emitter, so placing them on a
+# non-macOS system would silently produce no rendered evidence.
+_MACOS_ONLY_FILE_ACTIONS = {"open", "write", "rename", "unlink"}
+
 # Process command patterns indicating wrong OS
 _WINDOWS_COMMAND_INDICATORS = {"powershell.exe", "cmd.exe", "reg.exe", "net.exe"}
 _LINUX_PATH_PREFIXES = ("/usr/", "/bin/", "/etc/", "/opt/", "/var/")
@@ -131,13 +147,15 @@ def _get_os_category(os_string: str) -> str:
         os_string: OS name/version string (e.g., "Windows 10", "Linux Ubuntu 20.04")
 
     Returns:
-        "windows", "linux", or "unknown"
+        "windows", "linux", "macos", or "unknown"
     """
     os_lower = os_string.lower()
     if any(p in os_lower for p in _WINDOWS_PATTERNS):
         return "windows"
     if any(p in os_lower for p in _LINUX_PATTERNS):
         return "linux"
+    if any(p in os_lower for p in _MACOS_PATTERNS):
+        return "macos"
     return "unknown"
 
 
@@ -2563,6 +2581,28 @@ class ScenarioValidator:
                             )
                         )
 
+                if getattr(spec, "type", "") in {"file", "connection"}:
+                    action_ref = getattr(spec, "process_ref", None)
+                    if (
+                        action_ref is not None
+                        and (event.system, event.actor, action_ref) not in process_refs
+                    ):
+                        self.issues.append(
+                            ValidationIssue(
+                                severity="warning",
+                                field_path=f"storyline.{idx}.events.{spec_idx}.process_ref",
+                                message=(
+                                    f"{spec.type} process_ref '{action_ref}' has no earlier "
+                                    "matching process_ref for the same storyline actor and system"
+                                ),
+                                suggestion=(
+                                    "Define the acting process earlier with process_ref, or omit "
+                                    "process_ref to attribute the action to the most recent "
+                                    "storyline process."
+                                ),
+                            )
+                        )
+
                 if getattr(spec, "type", "") == "process":
                     ref_key_base = (event.system, event.actor)
                     parent_ref = getattr(spec, "parent_ref", None)
@@ -2819,6 +2859,7 @@ class ScenarioValidator:
         # Accept both group names (zeek, windows) and individual format names (zeek_conn)
         known_output_formats = set(FORMAT_GROUPS.keys()) | {
             "ecar",
+            "eslogger",
             "syslog",
             "bash_history",
             "snort_alert",
@@ -3292,6 +3333,54 @@ class ScenarioValidator:
                         )
                     )
 
+                # Linux-specific events on macOS, EXCEPT the subset that Task 5's
+                # SSH bundle also supports on macOS (_MACOS_EVENT_TYPES). This is a
+                # per-type decision, not a blanket exemption: a future Linux-only
+                # event type not in _MACOS_EVENT_TYPES would still be flagged here.
+                if (
+                    os_cat == "macos"
+                    and event_type in _LINUX_EVENT_TYPES
+                    and event_type not in _MACOS_EVENT_TYPES
+                ):
+                    self.issues.append(
+                        ValidationIssue(
+                            severity="warning",
+                            field_path=(f"storyline.{idx}.events.{spec_idx}"),
+                            message=(
+                                f"[{event.id}] Event type '{event_type}' is Linux-specific "
+                                f"but system '{event.system}' is {os_cat}"
+                            ),
+                            suggestion=(
+                                "Change the target system to a Linux host "
+                                "or use a different event type"
+                            ),
+                        )
+                    )
+
+                # `file` events with an eslogger-only action (open/write/rename/
+                # unlink) render on macOS only; on any other OS no emitter
+                # handles them and the event would silently produce no evidence.
+                if (
+                    event_type == "file"
+                    and os_cat != "macos"
+                    and getattr(spec, "action", None) in _MACOS_ONLY_FILE_ACTIONS
+                ):
+                    self.issues.append(
+                        ValidationIssue(
+                            severity="warning",
+                            field_path=(f"storyline.{idx}.events.{spec_idx}.action"),
+                            message=(
+                                f"[{event.id}] File action '{spec.action}' is only rendered by "
+                                f"the macOS eslogger emitter, but system '{event.system}' is "
+                                f"{os_cat}; no emitter will render this event"
+                            ),
+                            suggestion=(
+                                "Change the target system to a macOS host or use action "
+                                "'create'/'modify'/'delete'/'read', which render on other OSes"
+                            ),
+                        )
+                    )
+
                 # Process command OS mismatch
                 if event_type == "process" and hasattr(spec, "command_line"):
                     cmd = spec.command_line or spec.process_name
@@ -3315,12 +3404,19 @@ class ScenarioValidator:
                         )
                     elif process_name:
                         from evidenceforge.generation.activity.application_catalog import (
+                            has_configured_image_path,
                             resolve_image_path,
                         )
 
                         basename = process_name.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
                         resolved = resolve_image_path(basename, os_cat)
-                        if resolved != basename and resolved.lower() != process_name.lower():
+                        # Only compare against a path that comes from config; an
+                        # unknown binary (e.g. malware under an attacker-chosen
+                        # path) has no canonical location to differ from.
+                        if (
+                            has_configured_image_path(basename, os_cat)
+                            and resolved.lower() != process_name.lower()
+                        ):
                             self.issues.append(
                                 ValidationIssue(
                                     severity="warning",
@@ -3460,11 +3556,17 @@ class ScenarioValidator:
                 field_path = f"storyline.{idx}.events.{spec_idx}"
 
                 # shell_history/syslog are Linux-modeled; emitting them on any non-Linux
-                # host (Windows OR an unknown OS such as macOS/BSD/Solaris) would silently
-                # drop the credential while still labeling it in ground truth — a phantom
-                # positive — so this is a hard error. The emitter only handles linux, so
-                # gate on != "linux", not == "windows". (process_command_line is cross-OS,
-                # so it is exempt.)
+                # host (Windows, macOS, or a still-unrecognized OS such as BSD/Solaris)
+                # would silently drop the credential while still labeling it in ground
+                # truth — a phantom positive — so this is a hard error. The emitter only
+                # handles linux, so gate on != "linux", not == "windows". macOS is a
+                # recognized OS category (not "unknown") but is deliberately excluded
+                # here too: its default shell is zsh (Task 4) and there is no
+                # zsh-history-rendering emitter in Phase A scope, and macOS has no
+                # Linux-style syslog daemon rendering path (the `syslog` format is
+                # Linux-bound per _OS_BOUND_FORMATS), so both surfaces would still be
+                # phantom positives on macOS. (process_command_line is cross-OS, so it
+                # is exempt.)
                 if os_cat != "linux" and spec.surface in LINUX_ONLY_SURFACES:
                     self.issues.append(
                         ValidationIssue(
@@ -3625,10 +3727,17 @@ class ScenarioValidator:
                     continue
                 field_path = f"storyline.{idx}.events.{spec_idx}"
 
-                # syslog_message is Linux-modeled; on any non-Linux host (Windows OR an
-                # unknown OS such as macOS/BSD/Solaris) the payload would be ground-truthed
-                # but never emitted — a phantom positive. The emitter only handles linux, so
-                # gate on != "linux", not == "windows".
+                # syslog_message/auth_user are Linux-modeled; on any non-Linux host
+                # (Windows, macOS, or a still-unrecognized OS such as BSD/Solaris) the
+                # payload would be ground-truthed but never emitted — a phantom
+                # positive. The emitter only handles linux, so gate on != "linux", not
+                # == "windows". macOS is a recognized OS category (not "unknown") but
+                # is deliberately excluded here too: there is no macOS syslog-daemon
+                # rendering path (the `syslog` format is Linux-bound per
+                # _OS_BOUND_FORMATS) and no Linux-sshd-style auth.log emitter for
+                # macOS in Phase A scope (the eslogger emitter renders SSH login as
+                # native ES session events, not a syslog-style auth.log line), so both
+                # surfaces would still be phantom positives on macOS.
                 if os_cat != "linux" and spec.surface in LINUX_ONLY_SURFACES:
                     self.issues.append(
                         ValidationIssue(

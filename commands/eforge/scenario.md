@@ -89,6 +89,7 @@ For exact expected evidence, conditionally read only the matching compact refere
 - `/eforge:references:evidence-network-ids` — Zeek, ASA, DHCP, DNS, TLS, or IDS.
 - `/eforge:references:evidence-web-email` — web, proxy, HTTP files, or email.
 - `/eforge:references:evidence-endpoint-linux` — eCAR, Linux syslog, or bash history.
+- `/eforge:references:evidence-endpoint-macos` — macOS Endpoint Security (eslogger).
 - `/eforge:references:generation-bundle-targets` — bundle layout, formats, and parser targets.
 
 ## Interview efficiently

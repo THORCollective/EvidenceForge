@@ -83,6 +83,12 @@ scenarios/llm-injection-demo/*
 !scenarios/llm-injection-demo/scenario.yaml
 !scenarios/llm-injection-demo/scenario-clean.yaml
 !scenarios/llm-injection-demo/README.md
+!scenarios/macos-eslogger-demo/
+scenarios/macos-eslogger-demo/*
+!scenarios/macos-eslogger-demo/scenario.yaml
+!scenarios/macos-eslogger-demo/README.md
+!scenarios/macos-eslogger-demo/CFP-ABSTRACT.md
+!scenarios/macos-eslogger-demo/splunk/
 !scenarios/iteration-test/
 scenarios/iteration-test/*
 !scenarios/iteration-test/scenario.yaml
@@ -105,3 +111,6 @@ requirements.txt
 
 # Sample data (reference only, not tracked)
 sample_data/
+
+# Agent goal-tracking scratch state (session-local, not project content)
+goals/

@@ -92,6 +92,26 @@ applications:
           architectures: [x86, x64, arm64]
         command_templates:
           - "google-chrome --new-tab {internal_url}"
+      macos:
+        image_path: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        command_templates:
+          - '"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --single-argument {internal_url}'
+        children:
+          - '"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --type=renderer'
+          - '"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --type=gpu-process'
+    categories: [user_app, browser]
+    personas: [developer, analyst, sysadmin, security_analyst, hr, accountant, intern, help_desk, default]
+    system_types: [workstation]
+
+  - id: safari
+    display_name: "Safari"
+    platforms:
+      macos:
+        image_path: "/Applications/Safari.app/Contents/MacOS/Safari"
+        command_templates:
+          - "/Applications/Safari.app/Contents/MacOS/Safari"
+        children:
+          - "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent"
     categories: [user_app, browser]
     personas: [developer, analyst, sysadmin, security_analyst, hr, accountant, intern, help_desk, default]
     system_types: [workstation]
@@ -162,6 +182,10 @@ applications:
         command_templates:
           - "firefox --new-tab {internal_url}"
           - "firefox -P default"
+      macos:
+        image_path: "/Applications/Firefox.app/Contents/MacOS/firefox"
+        command_templates:
+          - '"/Applications/Firefox.app/Contents/MacOS/firefox" --new-tab {internal_url}'
     categories: [user_app, browser]
     personas: [developer, analyst, sysadmin, security_analyst, hr, accountant, intern, help_desk, default]
     system_types: [workstation]
@@ -433,6 +457,10 @@ applications:
           architectures: [x86, x64, arm64]
         command_templates:
           - "code --no-sandbox {linux_project}"
+      macos:
+        image_path: "/Applications/Visual Studio Code.app/Contents/MacOS/Electron"
+        command_templates:
+          - '"/Applications/Visual Studio Code.app/Contents/MacOS/Electron" --folder-uri {project_path}'
     categories: [code]
     personas: [developer, sysadmin, analyst, default]
 
@@ -563,6 +591,11 @@ applications:
         command_templates:
           - 'node.exe scripts/build.js'
           - 'node.exe --max-old-space-size=4096 node_modules/.bin/webpack'
+      macos:
+        image_path: "/usr/local/bin/node"
+        command_templates:
+          - "node scripts/build.js"
+          - "node --max-old-space-size=4096 node_modules/.bin/webpack"
     categories: [build]
     personas: [developer]
 
@@ -610,6 +643,12 @@ applications:
           release_policy: host_build
           scope: machine
           architectures: [x86, x64, arm64]
+        command_templates:
+          - "git pull origin {git_branch}"
+          - "git status"
+          - "git log --oneline -10"
+      macos:
+        image_path: "/usr/bin/git"
         command_templates:
           - "git pull origin {git_branch}"
           - "git status"
@@ -715,6 +754,11 @@ applications:
         command_templates:
           - "ssh {username}@{ssh_target}"
           - "ssh -i ~/.ssh/id_rsa {username}@{ssh_target}"
+      macos:
+        image_path: "/usr/bin/ssh"
+        command_templates:
+          - "ssh {username}@{ssh_target}"
+          - "ssh -i ~/.ssh/id_rsa {username}@{ssh_target}"
     categories: [user_app]
     personas: [developer, analyst, sysadmin, default]
     system_types: [workstation, server]
@@ -729,6 +773,12 @@ applications:
           release_policy: host_build
           scope: machine
           architectures: [x86, x64, arm64]
+        command_templates:
+          - "curl -s {external_api_url}"
+          - "curl -sS -o /dev/null -w '%{http_code}' {internal_url}"
+          - "curl -X GET {internal_url} -H 'Accept: application/json'"
+      macos:
+        image_path: "/usr/bin/curl"
         command_templates:
           - "curl -s {external_api_url}"
           - "curl -sS -o /dev/null -w '%{http_code}' {internal_url}"
@@ -748,6 +798,12 @@ applications:
           product_id: linux-host
           scope: machine
           architectures: [x86, x64, arm64]
+        command_templates:
+          - "python3 -m pytest tests/"
+          - "python3 -m pytest tests/ -v --tb=short"
+          - "python3 -m pytest tests/unit/ -x"
+      macos:
+        image_path: "/usr/bin/python3"
         command_templates:
           - "python3 -m pytest tests/"
           - "python3 -m pytest tests/ -v --tb=short"

@@ -16,7 +16,7 @@ from evidenceforge.evaluation.parsers import get_parser
 from evidenceforge.evaluation.pillars.parseability import ParseabilityScorer
 from evidenceforge.evaluation.thresholds import load_thresholds
 from evidenceforge.formats.loader import load_format
-from tests.support.native_records import render_record
+from tests.support.native_records import json_field_slot, render_record
 
 ROOT = Path(__file__).parents[1] / "fixtures/record_validation"
 CASES = json.loads((ROOT / "formats.json").read_text()) + json.loads(
@@ -42,6 +42,13 @@ for case in CASES:
             ):
                 continue  # XML attributes/text have no independent object-valued representation.
             MUTATIONS.append((case, field.name, mode))
+
+
+def _native_json_suffix(name: str) -> str:
+    """Return the file suffix each native parser discovers for XML/JSON sources."""
+    if name.startswith("windows_"):
+        return ".xml"
+    return ".ndjson" if name == "eslogger" else ".json"
 
 
 def mutate_native(raw: str, name: str, field: str, mode: str) -> str:
@@ -74,16 +81,16 @@ def mutate_native(raw: str, name: str, field: str, mode: str) -> str:
             target.text = "" if mode == "empty" else "invalid-value"
         return ET.tostring(root, encoding="unicode")
     obj = json.loads(raw)
-    container = obj.get("properties", {}) if field in obj.get("properties", {}) else obj
-    assert field in container, field
+    container, key = json_field_slot(obj, name, field)
+    assert key in container, field
     if mode == "missing":
-        del container[field]
+        del container[key]
     elif mode == "empty":
-        container[field] = ""
+        container[key] = ""
     elif mode == "null":
-        container[field] = None
+        container[key] = None
     else:
-        container[field] = {"invalid": "type"}
+        container[key] = {"invalid": "type"}
     return json.dumps(obj)
 
 
@@ -148,16 +155,16 @@ def test_malformed_native_records_complete_all_pillars(tmp_path: Path) -> None:
     for case, field, mode in MUTATIONS:
         name = case["format"]
         raw = rendered[(name, case.get("variant"))]
-        path = tmp_path / (name + (".xml" if name.startswith("windows_") else ".json"))
+        path = tmp_path / (name + _native_json_suffix(name))
         with path.open("a") as stream:
             stream.write(mutate_native(raw, name, field, mode) + "\n")
         expected[name] = expected.get(name, 0) + 1
     for case, field in JSON_FIELD_CASES:
         name = case["format"]
         obj = json.loads(rendered[(name, case.get("variant"))])
-        container = obj["properties"] if name == "ecar" and field.name not in obj else obj
-        container[field.name] = {"wrong": "type"}
-        with (tmp_path / (name + ".json")).open("a") as stream:
+        container, slot = json_field_slot(obj, name, field.name)
+        container[slot] = {"wrong": "type"}
+        with (tmp_path / (name + _native_json_suffix(name))).open("a") as stream:
             stream.write(json.dumps(obj) + "\n")
         expected[name] = expected.get(name, 0) + 1
     for name in (
@@ -177,7 +184,7 @@ def test_malformed_native_records_complete_all_pillars(tmp_path: Path) -> None:
         )
         path.write_text(raw + "\n")
         expected[name] = len(list(get_parser(name).parse_file(path)))
-    assert len(expected) == 25
+    assert len(expected) == 26
     result = CliRunner().invoke(
         app,
         [
@@ -268,11 +275,11 @@ def test_rule_witness_through_native_parser(tmp_path: Path, witness: dict, outco
         assert definition.output.format == "json", definition.name
         obj = json.loads(raw)
         for key in set(witness["pass"]) | set(witness["fail"]):
-            container = obj["properties"] if definition.name == "ecar" and key not in obj else obj
+            container, slot = json_field_slot(obj, definition.name, key)
             if key in fields:
-                container[key] = fields[key]
+                container[slot] = fields[key]
             else:
-                container.pop(key, None)
+                container.pop(slot, None)
         raw = json.dumps(obj)
     path = tmp_path / "witness.log"
     path.write_text(raw + "\n")
@@ -331,8 +338,8 @@ def test_json_scalar_edges_and_native_sentinels(tmp_path: Path, case: dict, fiel
         candidates.extend([float("inf"), float("nan")])
     for value in candidates:
         obj = json.loads(json.dumps(raw))
-        container = obj["properties"] if case["format"] == "ecar" and field.name not in obj else obj
-        container[field.name] = value
+        container, slot = json_field_slot(obj, case["format"], field.name)
+        container[slot] = value
         path = tmp_path / "edge.log"
         path.write_text(json.dumps(obj) + "\n")
         records = list(get_parser(case["format"]).parse_file(path))

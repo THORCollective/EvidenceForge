@@ -598,7 +598,19 @@ def _dynamic_constructor_types(
 
     expression = constructor["event_type_expression"]
     scope = constructor["scope"]
-    if "_FILE_ACTION_EVENT_TYPES" in expression or scope.endswith(
+    if "_FILE_ACTION_EVENT_TYPES" in expression:
+        # The action map also carries the macOS eslogger-only file actions.
+        return {
+            "file_create",
+            "file_delete",
+            "file_modify",
+            "file_read",
+            "file_open",
+            "file_rename",
+            "file_unlink",
+            "file_write",
+        }
+    if scope.endswith(
         ("_execute_process_create_bundle", "_emit_smb_file_operations", "_emit_ecar_file_churn")
     ):
         return {"file_create", "file_delete", "file_modify", "file_read"}

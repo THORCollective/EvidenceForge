@@ -624,9 +624,19 @@ class CommandParameterPoolsConfig(BaseModel, extra="forbid"):
     general: dict[str, list[str]]
     query: dict[str, list[str]]
     linux_query: dict[str, list[str]] = Field(default_factory=dict)
+    os_overrides: dict[str, dict[str, list[str]]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def pools_are_non_empty_strings_and_urls_have_hosts(self) -> Self:
+        for os_category, section in self.os_overrides.items():
+            if os_category not in {"windows", "linux", "macos"}:
+                raise ValueError(
+                    f"os_overrides.{os_category} is not a known os_category "
+                    "(use windows, linux, or macos)"
+                )
+            for key, values in section.items():
+                if not values:
+                    raise ValueError(f"os_overrides.{os_category}.{key} must not be empty")
         for section_name in ("general", "query", "linux_query"):
             section = getattr(self, section_name)
             for key, values in section.items():
@@ -3390,9 +3400,12 @@ class EdrFileSideEffectProfile(BaseModel, extra="forbid"):
     executables: list[str] = Field(default_factory=list)
     executable_contains: list[str] = Field(default_factory=list)
     command_contains: list[str] = Field(default_factory=list)
+    # Commands starting with one of these prefixes never match (e.g. `sh -c ` wrappers).
+    exclude_command_prefixes: list[str] = Field(default_factory=list)
     actions: list[Literal["create", "modify", "delete", "read"]]
     paths_windows: list[str] = Field(default_factory=list)
     paths_linux: list[str] = Field(default_factory=list)
+    paths_macos: list[str] = Field(default_factory=list)
     probability: float = 1.0
 
     @model_validator(mode="after")
@@ -3402,8 +3415,8 @@ class EdrFileSideEffectProfile(BaseModel, extra="forbid"):
             raise ValueError(
                 "profile must define executables, executable_contains, or command_contains"
             )
-        if not self.paths_windows and not self.paths_linux:
-            raise ValueError("profile must define paths_windows or paths_linux")
+        if not self.paths_windows and not self.paths_linux and not self.paths_macos:
+            raise ValueError("profile must define paths_windows, paths_linux, or paths_macos")
         if not 0 <= self.probability <= 1:
             raise ValueError("probability must be between 0 and 1")
         return self

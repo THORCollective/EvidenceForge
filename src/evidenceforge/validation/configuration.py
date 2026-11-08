@@ -2133,7 +2133,7 @@ def _validate_timing_profiles(
                         )
                     )
                     continue
-                for os_name in ("windows", "linux"):
+                for os_name in ("windows", "linux", "macos"):
                     os_profile = profile_data.get(os_name)
                     if not isinstance(os_profile, dict):
                         result.issues.append(
@@ -2813,7 +2813,11 @@ def _validate_process_chains(
     # --- Checks 18-20: Process Chain ---
     # Collect all exe basenames from spawn rules
     spawn_children: set[str] = set()
-    for os_rules in [spawn_data.get("windows", {}), spawn_data.get("linux", {})]:
+    for os_rules in [
+        spawn_data.get("windows", {}),
+        spawn_data.get("linux", {}),
+        spawn_data.get("macos", {}),
+    ]:
         for _parent, parent_data in os_rules.items():
             if isinstance(parent_data, dict):
                 for child in parent_data.get("children", []):
@@ -2866,7 +2870,11 @@ def _validate_process_chains(
 
     # Check 19: Missing spawn rules (apps not in any spawn rule, case-insensitive)
     spawn_all_entries: set[str] = set()
-    for os_rules in [spawn_data.get("windows", {}), spawn_data.get("linux", {})]:
+    for os_rules in [
+        spawn_data.get("windows", {}),
+        spawn_data.get("linux", {}),
+        spawn_data.get("macos", {}),
+    ]:
         spawn_all_entries.update(os_rules.keys())
         for parent_data in os_rules.values():
             if isinstance(parent_data, dict):
@@ -3485,7 +3493,11 @@ def _validate_merged_schemas(
 
     # spawn_rules.yaml: spawn rule entries
     all_spawn_entries = []
-    for os_rules in [spawn_data.get("windows", {}), spawn_data.get("linux", {})]:
+    for os_rules in [
+        spawn_data.get("windows", {}),
+        spawn_data.get("linux", {}),
+        spawn_data.get("macos", {}),
+    ]:
         for _parent, parent_data in os_rules.items():
             if isinstance(parent_data, dict):
                 all_spawn_entries.append(parent_data)

@@ -39,6 +39,9 @@ from evidenceforge.generation.actions import (
     ProcessTerminationRequest,
 )
 from evidenceforge.generation.actions.endpoint_effects import PreparedProcessEffectActor
+from evidenceforge.generation.actions.macos_privilege import (
+    maybe_dispatch_process_privilege_elevation,
+)
 from evidenceforge.generation.actions.process_execution import ProcessExecutionReuseIntent
 from evidenceforge.generation.activity.helpers import (
     _get_os_category,
@@ -1081,7 +1084,8 @@ class ProcessExecutionService:
                 token_elevation=launch.token_elevation,
                 mandatory_label=launch.mandatory_label,
                 start_time=process_identity.started_at,
-                current_directory=self.actors._derive_current_directory(
+                current_directory=request.current_directory
+                or self.actors._derive_current_directory(
                     system=request.system,
                     username=launch.actor.username,
                     process_name=launch.actor.image,
@@ -1401,6 +1405,12 @@ class ProcessExecutionService:
             event,
             not_after=evidence.source_visible_by,
         )
+        maybe_dispatch_process_privilege_elevation(
+            self.dispatcher,
+            host=event.src_host,
+            time=event.timestamp,
+            process=event.process,
+        )
         if evidence.provisional_termination is not None:
             self.foreground._remember_foreground_process_finalizer(
                 system=request.system,
@@ -1672,7 +1682,7 @@ class ProcessTerminationService:
             ),
             process=ProcessContext(
                 pid=pid,
-                parent_pid=0,
+                parent_pid=running_proc.parent_pid if running_proc is not None else 0,
                 image=process_name,
                 command_line="",
                 username=process_username,

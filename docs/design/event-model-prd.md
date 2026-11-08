@@ -229,7 +229,7 @@ Each `event_type` string maps to which contexts must/may be populated. "required
 | `logon` | required | required | - | - | - | - | - | - | User authentication (4624, syslog auth, eCAR) |
 | `logon_failed` | required | required | - | - | - | - | - | - | Failed authentication (4625) |
 | `logoff` | required | required | - | - | - | - | - | - | Session end (4634, syslog, eCAR) |
-| `process_create` | required | - | required | - | - | - | - | - | Process creation (4688, syslog, eCAR) |
+| `process_create` | required | - | required | - | - | - | - | - | Process creation (4688, syslog, eCAR, eslogger) |
 | `process_terminate` | required | - | required | - | - | - | - | - | Process termination (4689) |
 | `system_process_create` | required | - | required | - | - | - | - | - | OS boot process tree (svchost chains, systemd) |
 | `connection` | - | - | - | required | optional | - | - | optional | Network connection (Zeek conn, eCAR FLOW, Snort) |
@@ -250,6 +250,10 @@ Each `event_type` string maps to which contexts must/may be populated. "required
 - `image_load` carries canonical DLL/module-load data shared by Sysmon Event 7 and eCAR
   MODULE/LOAD. `process` is optional (module loads can be attributed to a process or standalone).
   The unreachable `module_load` compatibility alias has been removed.
+- macOS adds eslogger-only kinds: `file_open`/`file_write`/`file_rename`/`file_unlink`,
+  `privilege_elevation` (ES `sudo`/`su`), and `btm_launch_item_add` (causal consequent of a
+  LaunchAgents/LaunchDaemons plist create). `src/evidenceforge/events/contracts.py` is the
+  authoritative kind registry.
 
 ## 4. Dispatcher Design
 

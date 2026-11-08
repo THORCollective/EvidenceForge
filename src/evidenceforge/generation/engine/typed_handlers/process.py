@@ -198,6 +198,15 @@ def handle_process(
             malicious_event["skipped_reason"] = "rdp_session_not_connected"
             return malicious_event
         time = max(time, interactive_ready_at)
+        launch_item_programs = getattr(self, "_macos_launch_item_programs", {})
+        if (
+            parent_pid is None
+            and os_category == "macos"
+            and process_name in launch_item_programs.get(system.hostname, set())
+        ):
+            # The program of a LaunchAgent/LaunchDaemon authored earlier in this
+            # run is started by launchd (launchctl bootstrap / login), not a shell.
+            parent_pid = self.activity_generator._process_parents()._macos_anchor_pid(system, time)
         if parent_pid is None:
             parent_pid = self.activity_generator._resolve_parent(
                 system,
@@ -345,6 +354,7 @@ def handle_process(
         from_storyline=True,
         suppress_command_file_effect=output_file is not None,
         lifecycle_group_id=service_lifecycle_group_id,
+        current_directory=getattr(spec, "working_directory", None) or "",
     )
     running_process = self.state_manager.get_process(system.hostname, pid)
     if running_process is not None:
@@ -638,6 +648,18 @@ def _emit_process_output_file(
                 storyline_origin=True,
             )
         )
+        # macOS BTM: a plist written under LaunchAgents/LaunchDaemons registers
+        # a launch item via causal expansion. Cheap no-op for other paths.
+        btm_hook = getattr(self.activity_generator, "_maybe_expand_file_create", None)
+        if callable(btm_hook):
+            btm_hook(
+                file_path=output_file,
+                time=file_time,
+                system=system,
+                actor=process_actor,
+                pid=pid,
+                process_image=process_name,
+            )
         malicious_event["output_file"] = output_file
 
 

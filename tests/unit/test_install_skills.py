@@ -60,6 +60,7 @@ EXPECTED_REFERENCE_FILES = {
 }
 EVIDENCE_REFERENCES = {
     "references/evidence-endpoint-linux.md",
+    "references/evidence-endpoint-macos.md",
     "references/evidence-network-ids.md",
     "references/evidence-web-email.md",
     "references/evidence-windows.md",

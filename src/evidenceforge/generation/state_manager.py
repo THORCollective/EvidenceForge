@@ -269,8 +269,15 @@ _LINUX_PID_REORDER_LANE_HEADROOM = 11
 _WINDOWS_PID_MIN = 4_000
 _WINDOWS_PID_MAX = 65_532
 _WINDOWS_PID_STEP = 4
+# XNU PID_MAX is 99999: nextpid wraps below it back to low PIDs. macOS shares
+# the Linux logical allocator (reorder lanes, reservations, sealing) but renders
+# positions in this smaller ring.
+_MACOS_PID_MIN = 100
+_MACOS_PID_MAX_EXCLUSIVE = 99_999
 _MINUTES_PER_WEEK = 7 * 24 * 60
 _ENDED_IDENTITY_RETENTION = timedelta(hours=48)
+# Max gap between an sshd process starting and its SSH session starting.
+_TRANSPORT_SESSION_SETUP_WINDOW = timedelta(minutes=2)
 # This is a hard combined capacity. Protected terminal SMB identities displace
 # the earliest ordinary retained rows until outer acknowledgement releases them.
 _MAX_RETAINED_SESSION_IDENTITIES = 500_000
@@ -4199,6 +4206,9 @@ class StateManager:
         self._thread_id_rngs: dict[str, random.Random] = {}
         self._windows_session_id_counters: dict[str, int] = {}
         self._linux_logind_session_counters: dict[str, int] = {}
+        # macOS has no systemd-logind; the ES audit-token session id (asid)
+        # stands in as the per-login-session identity, one sequence per host.
+        self._macos_audit_session_counters: dict[str, int] = {}
         self._linux_logind_session_initials: dict[str, int] = {}
         self._linux_logind_session_epochs: dict[str, datetime] = {}
         self._linux_logind_session_block_offsets: dict[str, dict[int, int]] = {}
@@ -6821,14 +6831,14 @@ class StateManager:
             patch = process._allocator_patch.pid_os
             if patch is not None:
                 host, category = patch
-                if host != identity.hostname or category not in {"linux", "windows"}:
+                if host != identity.hostname or category not in {"linux", "macos", "windows"}:
                     raise StateError("Action cohort process PID namespace patch is malformed")
                 existing = namespaces.get(host)
                 if existing is not None and existing != category:
                     raise StateError("Action cohort process PID namespace changed within a cohort")
                 namespaces[host] = category
             category = namespaces.get(identity.hostname)
-            if category not in {"linux", "windows"}:
+            if category not in {"linux", "macos", "windows"}:
                 raise StateError("Action cohort process has no exact PID namespace")
             resolved[id(process)] = category
         return resolved
@@ -8626,6 +8636,56 @@ class StateManager:
             )
             return ended[0].session_id if ended is not None else 0
 
+    def get_session_for_transport(
+        self,
+        system: str,
+        pid: int,
+        process_start: datetime | None = None,
+    ) -> ActiveSession | None:
+        """Return the active or ended SSH session an sshd process served, if any.
+
+        A session's ``transport_pid`` binding is exact but short-lived: ending
+        the transport clears it on still-active sessions, and state runs ahead
+        of rendering, so it is often gone by the time the sshd's later records
+        render, and the post-auth session sshd is never the bound transport.
+        With the sshd's start time, an SSH session matches when it began within
+        the connection-setup window of that start (the per-connection sshd
+        starts seconds before its session; the post-auth sshd seconds after).
+        An exact binding wins; otherwise the closest session wins.
+        """
+
+        if pid <= 0:
+            return None
+        started = ensure_utc(process_start) if process_start is not None else None
+
+        def offset(session: ActiveSession) -> timedelta | None:
+            if session.system != system:
+                return None
+            if session.transport_pid == pid:
+                if started is None or ensure_utc(session.start_time) >= started:
+                    return timedelta(0)
+                return None
+            if session.session_kind != "ssh":
+                return None
+            if started is None:
+                return None
+            distance = abs(ensure_utc(session.start_time) - started)
+            return distance if distance <= _TRANSPORT_SESSION_SETUP_WINDOW else None
+
+        with self._lock:
+            sessions = [
+                *self._active_sessions.find("system", system),
+                *(session for session, _end_time in self._ended_sessions.values()),
+            ]
+            ranked = [
+                (distance, session.start_time, session.logon_id, session)
+                for session in sessions
+                if (distance := offset(session)) is not None
+            ]
+            if not ranked:
+                return None
+            return min(ranked, key=lambda row: row[:3])[3]
+
     def get_or_create_session_logon_guid(
         self,
         logon_id: str,
@@ -8896,6 +8956,35 @@ class StateManager:
             self._materialization_version += 1
             return self._linux_logind_session_counters[system]
 
+    def next_macos_audit_session_id(
+        self,
+        system: str,
+        rng: random.Random,
+        event_time: datetime | None = None,
+    ) -> int:
+        """Return the next macOS ES audit-token session id (asid) for a host.
+
+        The asid is the macOS analog of the Linux ``systemd-logind`` session id
+        used by :meth:`next_linux_logind_session_id`. Real kernel-assigned asids
+        are per-boot monotonic values above the reserved low range, so this
+        returns a per-host monotonic sequence starting around 100000.
+
+        Args:
+            system: System hostname
+            rng: Random source for the per-host base/increment jitter
+            event_time: Accepted for signature symmetry with
+                ``next_linux_logind_session_id``; the sequence does not encode time.
+
+        Returns:
+            The next macOS audit session id for the host.
+        """
+        with self._lock:
+            if system not in self._macos_audit_session_counters:
+                self._macos_audit_session_counters[system] = 100000 + rng.randint(0, 900)
+            self._macos_audit_session_counters[system] += rng.randint(1, 6)
+            self._materialization_version += 1
+            return self._macos_audit_session_counters[system]
+
     def _linux_logind_session_block_offset(self, system: str, block: int) -> int:
         """Return deterministic logind session churn before a four-hour block."""
         if block <= 0:
@@ -8977,6 +9066,9 @@ class StateManager:
         if os_category == "windows":
             start = rng.randint(2000, 6000)
             counter = start - (start % 4)
+        elif os_category == "macos":
+            # launchd's first children land in the low hundreds after boot.
+            counter = rng.randint(250, 400)
         else:
             counter = rng.randint(8000, 42000)
         return counter, rng, True
@@ -9031,6 +9123,7 @@ class StateManager:
         bucket_ordinal: int | None = None,
         extra_allocations: tuple[tuple[datetime, int], ...] = (),
         extra_reserved_pids: set[int] | None = None,
+        os_category: str = "linux",
     ) -> tuple[int, int, tuple[tuple[str, datetime], int], int]:
         if (
             self._pid_allocation_watermark is not None
@@ -9151,7 +9244,7 @@ class StateManager:
         candidates = 0
         for _probe in range(probe_budget):
             candidates += 1
-            pid = self._normalize_linux_pid(logical_position)
+            pid = self._normalize_logical_pid(os_category, logical_position)
             if (
                 (allocations is None or not allocations.contains_value(logical_position))
                 and all(
@@ -9196,7 +9289,7 @@ class StateManager:
         rng_state_override: object | None = None,
         extra_used_tids: set[int] | None = None,
     ) -> tuple[int, tuple[str, int] | None, tuple[str, object] | None]:
-        if os_category == "linux":
+        if os_category in ("linux", "macos"):
             return pid, None, None
         counter = (
             self._thread_id_counters.get(
@@ -9302,7 +9395,7 @@ class StateManager:
                 pid = fixed_pid
                 logical_position = fixed_pid
                 fixed_patch = (system, fixed_pid)
-                if os_category == "linux":
+                if os_category in ("linux", "macos"):
                     linux_allocation = (system, effective_start, fixed_pid)
             elif os_category == "windows":
                 pid, logical_position, counter, candidate_delta = self._preview_windows_pid(
@@ -9333,6 +9426,7 @@ class StateManager:
                     minimum_logical_exclusive=minimum_parent,
                     prefix=prefix,
                     epoch=ensure_utc(epoch),
+                    os_category=os_category,
                 )
                 linux_allocation = (system, effective_start, logical_position)
                 allocation_delta = 1
@@ -9719,7 +9813,7 @@ class StateManager:
                 pid = fixed_pid
                 logical_position = fixed_pid
                 fixed_patch = (system, fixed_pid)
-                if os_category == "linux":
+                if os_category in ("linux", "macos"):
                     linux_allocation = (system, effective_start, fixed_pid)
             elif os_category == "windows":
                 pid, logical_position, counter, candidate_delta = self._preview_windows_pid(
@@ -9773,6 +9867,7 @@ class StateManager:
                     bucket_ordinal=bucket_ordinal,
                     extra_allocations=planned_allocations,
                     extra_reserved_pids=planned_pids,
+                    os_category=os_category,
                 )
                 linux_allocation = (system, effective_start, logical_position)
                 builder._linux_allocations.setdefault(system, []).append(
@@ -13532,6 +13627,20 @@ class StateManager:
         )
 
     @staticmethod
+    def _normalize_macos_pid(pid: int) -> int:
+        """Render an unbounded logical position in XNU's PID ring (below PID_MAX)."""
+        return _MACOS_PID_MIN + (
+            (pid - _MACOS_PID_MIN) % (_MACOS_PID_MAX_EXCLUSIVE - _MACOS_PID_MIN)
+        )
+
+    @classmethod
+    def _normalize_logical_pid(cls, os_category: str, pid: int) -> int:
+        """Render a logical allocator position in the host's non-Windows PID ring."""
+        if os_category == "macos":
+            return cls._normalize_macos_pid(pid)
+        return cls._normalize_linux_pid(pid)
+
+    @staticmethod
     def _normalize_windows_pid(pid: int) -> int:
         """Render an unbounded logical position in the modeled Windows PID ring."""
         slots = ((_WINDOWS_PID_MAX - _WINDOWS_PID_MIN) // _WINDOWS_PID_STEP) + 1
@@ -13576,6 +13685,9 @@ class StateManager:
             start = pid_rng.randint(2000, 6000)
             self._pid_counters[system] = start - (start % 4)
             self._pid_os[system] = "windows"
+        elif os_category == "macos":
+            self._pid_counters[system] = pid_rng.randint(250, 400)
+            self._pid_os[system] = "macos"
         else:
             self._pid_counters[system] = pid_rng.randint(8000, 42000)
             self._pid_os[system] = "linux"
@@ -13783,7 +13895,7 @@ class StateManager:
         )
         for _probe in range(probe_budget):
             self._pid_candidate_probe_count += 1
-            pid = self._normalize_linux_pid(logical_position)
+            pid = self._normalize_logical_pid(self._pid_os.get(system, "linux"), logical_position)
             if not allocations.contains_value(logical_position) and not self._pid_is_reserved(
                 system,
                 pid,
@@ -13923,6 +14035,7 @@ class StateManager:
         lifecycle_group_id: str = "",
         parent_lifecycle_group_id: str = "",
         concurrency_group_id: str = "",
+        os_category: str | None = None,
     ) -> int:
         """Create a new running process.
 
@@ -13933,6 +14046,8 @@ class StateManager:
             command_line: Full command line with arguments
             username: User running the process
             integrity_level: Windows integrity level (System, High, Medium, Low)
+            os_category: Host OS category used only when the host has no PID
+                namespace yet; required for macOS hosts.
 
         Returns:
             Allocated PID for the process
@@ -13947,8 +14062,12 @@ class StateManager:
             )
             if self.state.current_time is None:
                 raise StateError("Cannot create process: current_time not set")
-            os_category = self._pid_os.get(system) or (
-                "windows" if "\\" in image or image.casefold().endswith(".exe") else "linux"
+            # An explicit os_category is required to reach the macOS PID
+            # namespace: the image-path heuristic cannot tell macOS from Linux.
+            os_category = (
+                self._pid_os.get(system)
+                or os_category
+                or ("windows" if "\\" in image or image.casefold().endswith(".exe") else "linux")
             )
             plan = self.plan_process_materialization(
                 system=system,
@@ -13991,7 +14110,7 @@ class StateManager:
         """Allocate a deterministic host-native TID for an explicitly modeled thread."""
 
         os_category = self._pid_os.get(system, "windows")
-        if os_category == "linux":
+        if os_category in ("linux", "macos"):
             candidate = pid + 1 + (_stable_seed(f"linux_tid:{system}:{process_object_id}") % 1024)
             used = {
                 thread.tid
@@ -14316,6 +14435,33 @@ class StateManager:
         with self._lock:
             key = (system, pid)
             return self.state.running_processes.get(key)
+
+    def get_pidversion(self, system: str, pid: int) -> int:
+        """Return the post-exec XNU pidversion of the process occupying a PID.
+
+        macOS ES audit tokens carry ``pidversion``, drawn from one per-boot
+        counter that advances on every fork and again on exec, so values are
+        large, unique per host, and increase over time. It is derived from the
+        process's unwrapped logical PID position (a fork and an exec generation
+        per process), so it is time-ordered like the PID itself. The pre-exec
+        fork image carries this value minus one.
+
+        Args:
+            system: System hostname
+            pid: Process ID
+
+        Returns:
+            The post-exec pidversion, or 0 when no running or ended process
+            with a logical PID position is known.
+        """
+        with self._lock:
+            process = self.state.running_processes.get((system, pid))
+            if process is None:
+                process = self._ended_processes_by_key.get((system, pid))
+            if process is None or process.pid_logical_position < 0:
+                return 0
+            base = 150_000 + _stable_seed(f"macos_pidversion_base:{system}") % 750_000
+            return base + 2 * process.pid_logical_position + 1
 
     def is_process_active_at(self, system: str, pid: int, time: datetime) -> bool:
         """Return whether a live or retained process identity spans ``time``."""

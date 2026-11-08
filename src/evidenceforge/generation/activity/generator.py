@@ -400,7 +400,13 @@ from evidenceforge.utils.paths import write_exclusive_child_stream
 from evidenceforge.utils.rng import _stable_seed, stable_hex_digest, stable_uuid
 from evidenceforge.utils.time import ensure_utc
 
-from .helpers import _get_os_category, _get_rng, _parameterize_command
+from .helpers import (
+    _get_os_category,
+    _get_rng,
+    _parameterize_command,
+    ssh_receiver_command_line,
+    ssh_receiver_parent_role,
+)
 from .network import (
     _AD_SRV_QUERIES,
     _IPV6_MAP,
@@ -1379,6 +1385,11 @@ _WINDOWS_ELECTRON_CHILD_MARKERS = process_policy._WINDOWS_ELECTRON_CHILD_MARKERS
 _WINDOWS_INTERACTIVE_SESSION_LOGON_TYPES = process_policy._WINDOWS_INTERACTIVE_SESSION_LOGON_TYPES
 _WINDOWS_WORKSTATION_SESSION_LOGON_TYPES = WINDOWS_WORKSTATION_LOGON_TYPES
 _WINDOWS_REMOTE_SESSION_KINDS = frozenset({"network", "service", "rdp", "ssh"})
+# macOS local console (Aqua) logins are modeled as interactive Type 2 sessions
+# (WorldModel plan_session), the loginwindow-rooted durable desktop session that
+# owns screen lock/unlock. Remote session kinds (ssh) cannot own a local lock.
+_MACOS_WORKSTATION_SESSION_LOGON_TYPES = frozenset({2})
+_MACOS_REMOTE_SESSION_KINDS = frozenset({"network", "service", "rdp", "ssh"})
 _LINUX_LOCAL_SESSION_LOGON_TYPES = frozenset({2, 11})
 _LINUX_REMOTE_SESSION_KINDS = frozenset({"network", "service", "ssh"})
 
@@ -1389,6 +1400,27 @@ def _is_windows_workstation_session(session: ActiveSession) -> bool:
         session.logon_type in _WINDOWS_WORKSTATION_SESSION_LOGON_TYPES
         and session.session_kind not in _WINDOWS_REMOTE_SESSION_KINDS
     )
+
+
+def _is_macos_workstation_session(session: ActiveSession) -> bool:
+    """Return true when a macOS session can own local screen lock/unlock evidence."""
+    return (
+        session.logon_type in _MACOS_WORKSTATION_SESSION_LOGON_TYPES
+        and session.session_kind not in _MACOS_REMOTE_SESSION_KINDS
+    )
+
+
+def _is_lockable_workstation_session(session: ActiveSession, os_category: str) -> bool:
+    """Return true when a session can own local screen lock/unlock evidence.
+
+    Screen lock/unlock is a durable-desktop-session concept modeled for Windows
+    and macOS only (Linux interactive sessions are intentionally excluded).
+    """
+    if os_category == "windows":
+        return _is_windows_workstation_session(session)
+    if os_category == "macos":
+        return _is_macos_workstation_session(session)
+    return False
 
 
 _session_started_by = process_policy._session_started_by
@@ -2599,8 +2631,18 @@ def _dns_cache_window(value: object) -> tuple[float, float]:
     return 0.0, 0.0
 
 
-def _dns_nxdomain_companion_queries(hostname: str | None, ad_domain: str) -> list[str]:
-    """Return realistic low-volume resolver miss probes for DNS companion noise."""
+def _dns_nxdomain_companion_queries(
+    hostname: str | None, ad_domain: str, os_category: str = ""
+) -> list[str]:
+    """Return realistic low-volume resolver miss probes for DNS companion noise.
+
+    The WPAD/ISATAP probes and primary-suffix devolution of qualified names are
+    Windows resolver behavior. macOS only appends search domains to single-label
+    names, has no ISATAP, leaves WPAD off by default, and resolves ``.local`` over
+    mDNS rather than unicast DNS, so a Mac only misses on stale internal names.
+    """
+    if os_category == "macos":
+        return [f"oldserver.{ad_domain}", f"printer01.{ad_domain}"]
     suffix_queries: list[str] = []
     if (
         hostname
@@ -6585,7 +6627,9 @@ class ActivityGenerator:
             target = self._pick_database_target_placeholder(rng, command_line, system)
             if target:
                 command_line = command_line.replace("{db_server}", target)
-        return _parameterize_command(rng, command_line, username=username)
+        return _parameterize_command(
+            rng, command_line, username=username, os_category=_get_os_category(system.os)
+        )
 
     def _pick_internal_url_placeholder(self, rng: random.Random) -> str:
         """Return an internal URL in the current scenario namespace."""
@@ -6625,6 +6669,39 @@ class ActivityGenerator:
                 and session.session_kind not in {"network", "service"}
                 and _session_started_by(session, time)
                 and not self._workstation_session_locked_at(session, user, system, time)
+            )
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda session: session.start_time)
+
+    def _active_user_macos_console_session(
+        self,
+        user: User,
+        system: System,
+        time: datetime,
+        *,
+        include_locked: bool = True,
+    ) -> ActiveSession | None:
+        """Return the user's durable loginwindow (console) session on a Mac.
+
+        A macOS user logs in at loginwindow once and every app and Terminal
+        window runs in that audit session; baseline activity reuses it instead
+        of opening a session per activity burst.
+        """
+        if _get_os_category(system.os) != "macos":
+            return None
+        candidates = [
+            session
+            for session in self.state_manager.get_sessions_for_user_at(user.username, time)
+            if (
+                session.system == system.hostname
+                and _is_macos_workstation_session(session)
+                and _session_started_by(session, time)
+                and (
+                    include_locked
+                    or not self._workstation_session_locked_at(session, user, system, time)
+                )
             )
         ]
         if not candidates:
@@ -7506,7 +7583,9 @@ class ActivityGenerator:
             # GVFS, smbclient, and kernel CIFS transports below.
             return 4 if os_category == "windows" else -1
         elif service_name == "ssh" or dst_port == 22:
-            if os_category == "linux":
+            # An outbound SSH client is a user process (ssh/scp), never the
+            # destination-side sshd; POSIX hosts resolve it as a client owner.
+            if os_category in ("linux", "macos"):
                 return -1
             candidates = ["sshd"]
         elif "forward_proxy" in roles and service_name in ("http", "ssl"):
@@ -11607,6 +11686,8 @@ class ActivityGenerator:
             command_line=kwargs.get("command_line"),
             process_name=kwargs.get("process_name"),
             os_category=kwargs.get("os_category"),
+            file_path=kwargs.get("file_path"),
+            launch_program=kwargs.get("launch_program"),
             hostname=kwargs.get("hostname"),
             source_system=kwargs.get("source_system"),
             target_system=kwargs.get("target_system"),
@@ -11693,6 +11774,104 @@ class ActivityGenerator:
                 method(**ev.kwargs)
         finally:
             self._expanding_types.discard(event_type)
+
+    def _maybe_expand_file_create(
+        self,
+        *,
+        file_path: str,
+        time: datetime,
+        system: System,
+        actor: User | None = None,
+        pid: int | None = None,
+        process_image: str | None = None,
+        launch_program: str | None = None,
+    ) -> None:
+        """Hot-path-safe causal-expansion hook for file_create dispatch sites.
+
+        ``file_create`` is one of the hottest dispatch paths, so this applies a
+        cheap path-substring pre-check before building an ``ExpansionContext``.
+        The only file_create expansion rule is the macOS BTM consequent
+        (``btm_launch_item_add``) for LaunchAgents/LaunchDaemons plist drops.
+        """
+        if system is None:
+            return
+        if "LaunchAgents" not in file_path and "LaunchDaemons" not in file_path:
+            return
+        self._expand_and_emit(
+            "file_create",
+            time,
+            file_path=file_path,
+            target_system=system,
+            actor=actor,
+            source_pid=pid,
+            source_image=process_image,
+            launch_program=launch_program,
+            os_category=_get_os_category(system.os),
+        )
+
+    def _emit_btm_launch_item_add(
+        self,
+        *,
+        system: System,
+        plist_path: str,
+        time: datetime,
+        actor: User | None = None,
+        pid: int | None = None,
+        process_image: str | None = None,
+        launch_program: str | None = None,
+    ) -> None:
+        """Emit a macOS BTM ``btm_launch_item_add`` occurrence (Endpoint Security only).
+
+        Consequent of a LaunchAgents/LaunchDaemons plist create, invoked by the
+        causal expansion engine (``PlistCreateBeforeBtmLaunchItem``). It reuses
+        the triggering plist create's file/process/host facts so the BTM record
+        agrees with the file_create by construction.
+        """
+        if system is None:
+            return
+        username = actor.username if actor is not None else ""
+        proc_ctx: ProcessContext | None = None
+        running_proc = (
+            self.state_manager.get_process(system.hostname, pid)
+            if isinstance(pid, int) and pid > 0
+            else None
+        )
+        if running_proc is not None:
+            proc_ctx = ProcessContext(
+                pid=running_proc.pid,
+                parent_pid=running_proc.parent_pid,
+                image=running_proc.image,
+                command_line=running_proc.command_line,
+                username=running_proc.username,
+                logon_id=running_proc.logon_id,
+                start_time=running_proc.start_time,
+            )
+            if not username:
+                username = running_proc.username
+        elif process_image is not None:
+            proc_ctx = ProcessContext(
+                pid=pid or 0,
+                parent_pid=0,
+                image=process_image,
+                command_line=process_image,
+                username=username,
+            )
+        self.dispatcher.dispatch_builder(
+            OccurrenceBuilder(
+                timestamp=time,
+                event_type="btm_launch_item_add",
+                src_host=self._build_host_context(system),
+                auth=AuthContext(username=username) if username else None,
+                process=proc_ctx,
+                file=FileContext(
+                    path=plist_path,
+                    action="create",
+                    pid=pid or 0,
+                    launch_program=launch_program or "",
+                ),
+                storyline_origin=True,
+            )
+        )
 
     def generate_logon(
         self,
@@ -11880,11 +12059,11 @@ class ActivityGenerator:
                 session_end_plan=request.session_end_plan,
             )
             return rendered_logon_id
-        if logon_id is None and os_cat == "windows" and logon_type in (2, 11):
-            existing_interactive = self._active_user_workstation_windows_session(
-                user,
-                system,
-                time,
+        if logon_id is None and os_cat in ("windows", "macos") and logon_type in (2, 11):
+            existing_interactive = (
+                self._active_user_workstation_windows_session(user, system, time)
+                if os_cat == "windows"
+                else self._active_user_macos_console_session(user, system, time)
             )
             if existing_interactive is not None:
                 reusable = (
@@ -15554,10 +15733,30 @@ class ActivityGenerator:
                 default=None,
             )
             if child_close_frontier is not None:
-                terminate_at = max(
-                    ensure_utc(terminate_at),
-                    ensure_utc(child_close_frontier) + timedelta(microseconds=1),
-                )
+                after_child = ensure_utc(child_close_frontier) + timedelta(microseconds=1)
+                if os_category == "macos":
+                    # A parent reaps its child and exits a fraction of a
+                    # millisecond to a few ms later, not in the same microsecond.
+                    reap_at = ensure_utc(child_close_frontier) + timedelta(
+                        microseconds=150
+                        + _stable_seed(
+                            f"macos_parent_reap_gap:{session.system}:{identity.pid}:"
+                            f"{identity.started_at.isoformat()}"
+                        )
+                        % 2850
+                    )
+                    latest_allowed = min(
+                        (
+                            bound
+                            for bound in (authoritative_latest_allowed, ssh_clamp_latest_allowed)
+                            if bound is not None
+                        ),
+                        default=None,
+                    )
+                    if latest_allowed is not None and reap_at > latest_allowed:
+                        reap_at = max(after_child, latest_allowed)
+                    after_child = reap_at
+                terminate_at = max(ensure_utc(terminate_at), after_child)
 
             visible_create_delta: _FrozenActivityTimingDelta | None = None
             if os_category == "windows" and not authoritative:
@@ -16645,6 +16844,7 @@ class ActivityGenerator:
         lifecycle_group_id: str = "",
         source_visible_by: datetime | None = None,
         require_exact_parent: bool = False,
+        current_directory: str = "",
     ) -> int:
         """Generate process creation event across all applicable log formats.
 
@@ -16675,6 +16875,8 @@ class ActivityGenerator:
                 creation stays before the socket evidence they own.
             concurrency_group_id: Explicit same-shell concurrency group for true pipelines.
             lifecycle_group_id: Optional owning lifecycle for session-bootstrap helpers.
+            current_directory: Explicit working directory (e.g. a scenario-declared
+                cwd); derived from the process and its parent when empty.
 
         Returns:
             PID of the new process
@@ -16709,6 +16911,7 @@ class ActivityGenerator:
             concurrency_group_id=concurrency_group_id,
             lifecycle_group_id=lifecycle_group_id,
             source_visible_by=source_visible_by,
+            current_directory=current_directory,
         )
         bounded_request = self._preflight_bounded_process_source_deadline(request)
         if bounded_request is None:
@@ -17711,7 +17914,8 @@ class ActivityGenerator:
 
         if kind == "ssh":
             sys_pids = getattr(self, "_system_pids", {}).get(target_system.hostname, {})
-            global_sshd = int(sys_pids.get("sshd", 0) or 0)
+            target_os = _get_os_category(target_system.os)
+            global_sshd = int(sys_pids.get(ssh_receiver_parent_role(target_os), 0) or 0)
             parent_pid = (
                 global_sshd
                 if global_sshd > 0
@@ -17729,10 +17933,10 @@ class ActivityGenerator:
                 system=target_system.hostname,
                 parent_pid=parent_pid,
                 image="/usr/sbin/sshd",
-                command_line=f"sshd: {process_user} [priv]",
+                command_line=ssh_receiver_command_line(target_os, process_user),
                 username="root",
                 integrity_level="System",
-                os_category="linux",
+                os_category="macos" if target_os == "macos" else "linux",
                 logon_id="0x3e7",
                 lifecycle_group_id=stable_uuid(
                     "network-ssh-responder-process",
@@ -18008,7 +18212,8 @@ class ActivityGenerator:
                 return remembered
 
         sys_pids = getattr(self, "_system_pids", {}).get(target_system.hostname, {})
-        global_sshd = sys_pids.get("sshd")
+        target_os = _get_os_category(target_system.os)
+        global_sshd = sys_pids.get(ssh_receiver_parent_role(target_os))
         parent_pid = (
             global_sshd
             if global_sshd
@@ -18025,7 +18230,7 @@ class ActivityGenerator:
             system=target_system,
             time=time + timedelta(milliseconds=8 + (sshd_seed % 72)),
             process_name="/usr/sbin/sshd",
-            command_line=f"sshd: {process_user} [priv]",
+            command_line=ssh_receiver_command_line(target_os, process_user),
             parent_pid=parent_pid,
             username="root",
             emit_linux_syslog=False,
@@ -18440,6 +18645,116 @@ class ActivityGenerator:
         self.state_manager.set_current_time(requested_time)
         return pid, image
 
+    def ensure_macos_ssh_client_process(
+        self,
+        *,
+        user: User,
+        source_system: System,
+        target_system: System,
+        time: datetime,
+        process_image: str,
+        source_port: int,
+        required_until: datetime | None = None,
+    ) -> tuple[int, str] | None:
+        """Return the source-side SSH client process for a macOS origin host.
+
+        macOS ships the OpenSSH client at ``/usr/bin/ssh`` (and ``scp``), launched
+        from a Terminal -> login -> zsh chain built by the macOS-aware parent
+        resolver, so the client rides on a real interactive session and owns the
+        canonical TCP/22 connection the SSH bundle opens.
+        """
+        if _get_os_category(source_system.os) != "macos":
+            return None
+
+        requested_time = ensure_utc(time)
+        image = process_image or "/usr/bin/ssh"
+        exe_name = image.rsplit("/", 1)[-1].lower()
+        if exe_name not in {"ssh", "scp"}:
+            image = "/usr/bin/ssh"
+            exe_name = "ssh"
+
+        target_host = self._build_host_context(target_system).fqdn or target_system.hostname
+        command_line = _linux_ssh_client_command_line(
+            exe_name=exe_name,
+            username=user.username,
+            target_host=target_host,
+            target_ip=target_system.ip,
+            source_hostname=source_system.hostname,
+            source_port=source_port,
+            requested_time=requested_time,
+        )
+        seed = _stable_seed(
+            "macos_ssh_client_process:"
+            f"{source_system.hostname}:{user.username}:{target_system.hostname}:"
+            f"{source_port}:{requested_time.isoformat()}:{image}"
+        )
+        process_time = requested_time - timedelta(milliseconds=6500 + (seed % 11500))
+        scenario_start = getattr(self, "_scenario_start_time", None)
+        if scenario_start is not None:
+            scenario_start = ensure_utc(scenario_start)
+        if scenario_start is not None and requested_time >= scenario_start:
+            latest_with_visible_headroom = requested_time - timedelta(seconds=5)
+            if process_time < scenario_start and latest_with_visible_headroom > scenario_start:
+                process_time = min(
+                    latest_with_visible_headroom,
+                    scenario_start + timedelta(milliseconds=400 + (seed % 1800)),
+                )
+        if (
+            self._process_create_source_bound(system=source_system, canonical_time=process_time)
+            > requested_time
+        ):
+            return None
+
+        candidates = [
+            session
+            for session in self.state_manager.get_sessions_for_user_at(
+                user.username, requested_time
+            )
+            if session.system == source_system.hostname
+            and _session_active_for_activity(session, requested_time, margin_seconds=1.5)
+            and (
+                required_until is None
+                or _session_active_for_activity(session, required_until, margin_seconds=1.5)
+            )
+        ]
+        if not candidates:
+            # A bounded network owner cannot publish a fallback local session;
+            # require an already-admitted source session.
+            return None
+        session = max(candidates, key=lambda candidate: ensure_utc(candidate.start_time))
+        if process_time <= ensure_utc(session.start_time):
+            process_time = ensure_utc(session.start_time) + timedelta(milliseconds=250)
+        if process_time >= requested_time:
+            process_time = requested_time - timedelta(milliseconds=800)
+        if not _session_active_for_activity(session, process_time, margin_seconds=0.5):
+            return None
+
+        parent_pid = self._ensure_parent_chain(
+            source_system,
+            user,
+            process_time,
+            session.logon_id,
+            exe_name,
+            "macos",
+        )
+        pid = self.generate_process(
+            user=user,
+            system=source_system,
+            time=process_time,
+            logon_id=session.logon_id,
+            process_name=image,
+            command_line=command_line,
+            parent_pid=parent_pid,
+            suppress_command_file_effect=True,
+            source_visible_by=requested_time,
+        )
+        if pid <= 0:
+            return None
+        self._process_parents()._record_user_process(source_system, user, pid, image)
+        self.state_manager.update_process_activity_time(source_system.hostname, pid, requested_time)
+        self.state_manager.set_current_time(requested_time)
+        return pid, image
+
     def ensure_ssh_client_process(
         self,
         *,
@@ -18455,6 +18770,16 @@ class ActivityGenerator:
 
         if _get_os_category(source_system.os) == "linux":
             return self.ensure_linux_ssh_client_process(
+                user=user,
+                source_system=source_system,
+                target_system=target_system,
+                time=time,
+                process_image=process_image,
+                source_port=source_port,
+                required_until=required_until,
+            )
+        if _get_os_category(source_system.os) == "macos":
+            return self.ensure_macos_ssh_client_process(
                 user=user,
                 source_system=source_system,
                 target_system=target_system,
@@ -21647,7 +21972,7 @@ class ActivityGenerator:
         if "external_mail_server" in (src_system.roles or []):
             return False
         os_category = _get_os_category(src_system.os)
-        if os_category not in {"windows", "linux"}:
+        if os_category not in {"windows", "linux", "macos"}:
             return False
         agent = user_agent.lower()
         if any(marker in agent for marker in ("outlook", "thunderbird", "apple mail")):
@@ -24349,7 +24674,8 @@ class ActivityGenerator:
                     )
 
         sys_pids = getattr(self, "_system_pids", {}).get(target_system.hostname, {})
-        global_sshd = sys_pids.get("sshd")
+        target_os = _get_os_category(target_system.os)
+        global_sshd = sys_pids.get(ssh_receiver_parent_role(target_os))
         if (
             not global_sshd
             or self.state_manager.get_process(target_system.hostname, global_sshd) is None
@@ -24399,7 +24725,7 @@ class ActivityGenerator:
                 system=target_system,
                 time=sshd_time,
                 process_name="/usr/sbin/sshd",
-                command_line=f"sshd: {user.username} [priv]",
+                command_line=ssh_receiver_command_line(target_os, user.username),
                 parent_pid=global_sshd,
                 username="root",
                 emit_linux_syslog=False,
@@ -24408,13 +24734,19 @@ class ActivityGenerator:
             if session_sshd_pid <= 0:
                 return None
 
+        # macOS ships zsh as the default interactive login shell ("-zsh");
+        # Linux distros default to bash. The per-session sshd is the same.
+        if _get_os_category(target_system.os) == "macos":
+            shell_image, shell_command_line = "/bin/zsh", "-zsh"
+        else:
+            shell_image, shell_command_line = "/bin/bash", "-bash"
         bash_pid = self.generate_process(
             user=user,
             system=target_system,
             time=bash_time,
             logon_id=logon_id,
-            process_name="/bin/bash",
-            command_line="-bash",
+            process_name=shell_image,
+            command_line=shell_command_line,
             parent_pid=session_sshd_pid,
             suppress_command_file_effect=True,
             source_visible_by=source_visible_by,
@@ -24459,7 +24791,10 @@ class ActivityGenerator:
             return None
         if running.image != "/usr/sbin/sshd":
             return None
-        if running.command_line != f"sshd: {user.username} [priv]":
+        # The per-connection sshd parents the login shell: Linux's forked
+        # "sshd: user [priv]" child, or macOS's launchd-exec'd "sshd -i".
+        expected = ssh_receiver_command_line(_get_os_category(target_system.os), user.username)
+        if running.command_line != expected:
             return None
         return transport_pid
 
@@ -26827,7 +27162,11 @@ class ActivityGenerator:
         # Occasional resolver search-suffix mistakes/background discovery probes.
         # Keep this low-volume and avoid doubling an already-qualified internal name.
         if rng.random() < 0.05:
-            nxdomain_queries = _dns_nxdomain_companion_queries(hostname, ad_domain)
+            nxdomain_queries = _dns_nxdomain_companion_queries(
+                hostname,
+                ad_domain,
+                _get_os_category(src_system.os) if src_system is not None else "",
+            )
             nx_query = rng.choice(nxdomain_queries)
             nx_lead_ms = self._sample_dns_timing_milliseconds(
                 relationship_key="activity.dns.nxdomain_before_query",
@@ -27457,6 +27796,10 @@ class ActivityGenerator:
             elif is_service_account:
                 # Service accounts on workstations: network + service logons
                 logon_type = rng.choices([3, 5, 3], weights=[70, 25, 5], k=1)[0]
+            elif os_category == "macos":
+                # A Mac user's workstation logon is the loginwindow console
+                # session; there are no Windows network/cached/unlock types.
+                logon_type = 2
             else:
                 # Regular users on workstations: Type 3 dominant, no Type 5
                 logon_type = rng.choices([3, 2, 7, 11, 3], weights=[55, 20, 10, 10, 5], k=1)[0]
@@ -27467,10 +27810,14 @@ class ActivityGenerator:
                 and not is_service_account
                 and sys_type not in ("server", "domain_controller")
             ):
-                active_interactive = self._active_user_workstation_windows_session(
-                    user,
-                    system,
-                    time,
+                active_interactive = (
+                    self._active_user_macos_console_session(user, system, time)
+                    if os_category == "macos"
+                    else self._active_user_workstation_windows_session(
+                        user,
+                        system,
+                        time,
+                    )
                 )
             if active_interactive is not None and logon_type in (2, 7, 11):
                 # A baseline "logon" activity while the same user's console
@@ -27659,6 +28006,10 @@ class ActivityGenerator:
                 )
             elif os_category == "linux":
                 active_session = self._active_user_linux_process_session(user, system, time)
+            elif os_category == "macos":
+                active_session = self._active_user_macos_console_session(
+                    user, system, time, include_locked=False
+                )
             else:
                 active_session = None
 
@@ -27792,6 +28143,14 @@ class ActivityGenerator:
                         )
                 if result:
                     process_name, command_line = result
+                    if (
+                        os_category == "macos"
+                        and catalog_category != "browser"
+                        and ".app/Contents/MacOS/" in process_name
+                    ):
+                        # LaunchServices re-activates a running app bundle rather
+                        # than starting a second instance.
+                        singleton_per_session = True
 
                     singleton_key: tuple[str, str, str, str] | None = None
                     if singleton_per_session:
@@ -29190,6 +29549,31 @@ class ActivityGenerator:
             return target_host or "-"
         return netbios_domain
 
+    def generate_privilege_elevation(
+        self,
+        *,
+        system: System,
+        time: datetime,
+        process: ProcessContext,
+        from_username: str,
+        to_username: str = "root",
+        success: bool = True,
+    ) -> None:
+        """Dispatch a macOS sudo/su privilege-elevation canonical occurrence."""
+        from evidenceforge.generation.actions.macos_privilege import (
+            dispatch_privilege_elevation,
+        )
+
+        dispatch_privilege_elevation(
+            self.dispatcher,
+            host=self._build_host_context(system),
+            time=time,
+            process=process,
+            from_username=from_username,
+            to_username=to_username,
+            success=success,
+        )
+
     def generate_workstation_lock(
         self,
         user: User,
@@ -29221,7 +29605,7 @@ class ActivityGenerator:
             session is None
             or session.system != system.hostname
             or session.start_time > time
-            or not _is_windows_workstation_session(session)
+            or not _is_lockable_workstation_session(session, _get_os_category(system.os))
         ):
             return WorkstationLockResult(
                 emitted=False,
@@ -29295,7 +29679,7 @@ class ActivityGenerator:
             session is None
             or session.system != system.hostname
             or session.start_time > time
-            or not _is_windows_workstation_session(session)
+            or not _is_lockable_workstation_session(session, _get_os_category(system.os))
         ):
             return
         reauth_gap = self._workstation_unlock_reauth_gap(user, system, time, logon_id)
@@ -29321,14 +29705,17 @@ class ActivityGenerator:
             session.last_activity_time = unlock_time
         # Unlock is a re-authentication: Windows records the Type 7 4624 before
         # the workstation-unlocked audit event for the same terminal session.
-        self.generate_logon(
-            user=user,
-            system=system,
-            time=reauth_time,
-            logon_type=7,
-            source_ip="-",
-            logon_id=logon_id,
-        )
+        # macOS screen unlock has no Type 7 logon; ES lw_session_unlock alone
+        # represents it.
+        if _get_os_category(system.os) == "windows":
+            self.generate_logon(
+                user=user,
+                system=system,
+                time=reauth_time,
+                logon_type=7,
+                source_ip="-",
+                logon_id=logon_id,
+            )
         event = OccurrenceBuilder(
             timestamp=unlock_time,
             event_type="workstation_unlocked",
@@ -34073,6 +34460,7 @@ class ActivityGenerator:
                         "user_agent_pool_by_os": {
                             "windows": "browser_windows",
                             "linux": "browser_linux",
+                            "macos": "browser_macos",
                         },
                     },
                     source_os=_get_os_category(system.os),
@@ -34318,6 +34706,7 @@ class ActivityGenerator:
                         "user_agent_pool_by_os": {
                             "windows": "browser_windows",
                             "linux": "browser_linux",
+                            "macos": "browser_macos",
                         },
                     },
                     source_os=_get_os_category(system.os),

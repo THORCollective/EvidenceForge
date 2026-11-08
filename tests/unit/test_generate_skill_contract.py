@@ -24,6 +24,7 @@ FOCUSED_REFERENCES = {
     "evidence-network-ids": REFERENCE_ROOT / "evidence-network-ids.md",
     "evidence-web-email": REFERENCE_ROOT / "evidence-web-email.md",
     "evidence-endpoint-linux": REFERENCE_ROOT / "evidence-endpoint-linux.md",
+    "evidence-endpoint-macos": REFERENCE_ROOT / "evidence-endpoint-macos.md",
 }
 
 

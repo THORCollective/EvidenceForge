@@ -88,6 +88,22 @@ def test_user_agent_honors_source_os_pool():
     assert "Linux" in ua
 
 
+def test_user_agent_honors_macos_source_os_pool():
+    """macOS sources should get a Safari/Chrome-on-macOS UA via the browser_macos pool."""
+    profile = load_web_session_profiles()["visitor_classes"]["human_browser"]
+    assert profile["user_agent_pool_by_os"]["macos"] == "browser_macos"
+
+    ua = pick_web_user_agent(random.Random(1), profile, source_os="macos")
+
+    assert "Macintosh" in ua
+    assert "Windows NT" not in ua
+    assert "X11; Linux" not in ua
+
+    pools = load_web_session_profiles()["user_agent_pools"]
+    assert "browser_macos" in pools
+    assert ua in pools["browser_macos"]
+
+
 def test_profile_request_and_bounds_are_safe():
     profile = load_web_session_profiles()["visitor_classes"]["opportunistic_probe"]
     request = pick_profile_request(random.Random(3), profile)

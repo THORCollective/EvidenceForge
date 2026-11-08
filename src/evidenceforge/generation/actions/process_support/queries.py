@@ -99,8 +99,14 @@ class ProcessStateQueries:
         logon_id: str,
         os_category: str,
     ) -> bool:
-        """Return whether a parent process can source-native spawn this session's child."""
-        if os_category != "windows" or not logon_id:
+        """Return whether a parent process can source-native spawn this session's child.
+
+        Windows and macOS bind user processes to one login session (logon
+        session / audit session), so a user-session parent must share the
+        child's session; sessionless system processes (launchd, daemons) may
+        parent any session's child.
+        """
+        if os_category not in ("windows", "macos") or not logon_id:
             return True
         parent_proc = self.state_manager.get_process(hostname, parent_pid)
         if parent_proc is None or not parent_proc.logon_id:

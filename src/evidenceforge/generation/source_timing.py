@@ -457,6 +457,10 @@ def endpoint_event_render_key(
     return f"{family}.event.{phase}.render.{hostname}"
 
 
+# Endpoint OSes whose host clocks are modeled by the timing profiles.
+_ENDPOINT_CLOCK_OS = frozenset({"windows", "linux", "macos"})
+
+
 def _endpoint_format_family(format_name: str) -> str:
     """Normalize endpoint format aliases to one timing family."""
 
@@ -466,6 +470,8 @@ def _endpoint_format_family(format_name: str) -> str:
         return "sysmon"
     if format_name == "ecar":
         return "ecar"
+    if format_name == "eslogger":
+        return "eslogger"
     raise ValueError(f"unsupported endpoint timing format: {format_name!r}")
 
 
@@ -5846,7 +5852,7 @@ class SourceTimingPlanner:
     ) -> datetime:
         """Project canonical time through the engine-owned endpoint clock."""
 
-        if not hostname or os_category not in {"windows", "linux"}:
+        if not hostname or os_category not in _ENDPOINT_CLOCK_OS:
             return ensure_utc(canonical_time)
         timing = endpoint_clock_timing(self.clock_profile_name, os_category)
         spec = SourceClockSpec(
@@ -7779,7 +7785,7 @@ class SourceTimingPlanner:
     ) -> timedelta:
         """Return the active profile's deterministic clock adjustment for one host."""
 
-        if not hostname or os_category not in {"windows", "linux"}:
+        if not hostname or os_category not in _ENDPOINT_CLOCK_OS:
             return timedelta(0)
         projected = self._runtime_endpoint_clock_time(
             timestamp,
@@ -7800,7 +7806,7 @@ class SourceTimingPlanner:
         reference time, including timestamps that precede that reference.
         """
 
-        if os_category not in {"windows", "linux"}:
+        if os_category not in _ENDPOINT_CLOCK_OS:
             return timedelta(0)
         canonical_time = ensure_utc(canonical_time)
         timing = endpoint_clock_timing(self.clock_profile_name, os_category)
@@ -7830,7 +7836,7 @@ class SourceTimingPlanner:
         later after both hosts project through independent endpoint clocks.
         """
 
-        if os_category not in {"windows", "linux"}:
+        if os_category not in _ENDPOINT_CLOCK_OS:
             return timedelta(0)
         canonical_time = ensure_utc(canonical_time)
         timing = endpoint_clock_timing(self.clock_profile_name, os_category)
@@ -7867,8 +7873,8 @@ class SourceTimingPlanner:
         """
 
         canonical_time = ensure_utc(canonical_time)
-        if os_category not in {"windows", "linux"}:
-            raise ValueError("process-create source headroom requires windows or linux")
+        if os_category not in _ENDPOINT_CLOCK_OS:
+            raise ValueError("process-create source headroom requires windows, linux, or macos")
         if type(format_names) is not tuple or any(type(name) is not str for name in format_names):
             raise TypeError("process-create source formats must be an exact tuple of strings")
         families = tuple(
@@ -7879,6 +7885,8 @@ class SourceTimingPlanner:
                     or (
                         ("ecar", "windows_event_security", "windows_event_sysmon")
                         if os_category == "windows"
+                        else ("eslogger",)
+                        if os_category == "macos"
                         else ("ecar",)
                     )
                 )
@@ -7945,6 +7953,16 @@ class SourceTimingPlanner:
                 )
                 bounds.append(sysmon_render_bound + windows_gap + timedelta(microseconds=1))
 
+        if "eslogger" in families:
+            # Endpoint Security delivers process exec/fork synchronously with the
+            # kernel event; only the host clock projection shifts it.
+            eslogger_bound = clock_bound
+            if parent_floor is not None:
+                eslogger_bound = max(eslogger_bound, parent_floor + timedelta(microseconds=2_500))
+            if session_floor is not None:
+                eslogger_bound = max(eslogger_bound, session_floor + timedelta(microseconds=8_000))
+            bounds.append(eslogger_bound)
+
         latest_bound = max(bounds, default=canonical_time)
         return max(timedelta(0), latest_bound - canonical_time)
 
@@ -7969,7 +7987,7 @@ class SourceTimingPlanner:
                 host = event.src_host or event.dst_host
             hostname = getattr(host, "hostname", "") or ""
             os_category = getattr(host, "os_category", "") or ""
-            if os_category not in {"windows", "linux"}:
+            if os_category not in _ENDPOINT_CLOCK_OS:
                 return None
             return (hostname, os_category) if hostname else None
         if source_key.startswith(("source.syslog_", "source.bash_history_")):

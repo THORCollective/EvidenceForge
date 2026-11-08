@@ -166,6 +166,12 @@ _FAMILIES = (
         "Kerberos outcome, certificate, and transport realism profiles.",
     ),
     _family(
+        "activity/macos_signing.yaml",
+        "keyed-entry",
+        "config-apps-processes.md",
+        "macOS code-signing identities (signing ID, Team ID, platform flag) by binary path.",
+    ),
+    _family(
         "activity/mail_public_identities.yaml",
         "mixed",
         "config-compatibility.md",

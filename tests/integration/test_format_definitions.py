@@ -444,11 +444,12 @@ class TestLoadAllFormats:
         """Test that all format definitions load successfully."""
         formats = load_all_formats()
 
-        # Existing formats plus canonical Zeek smb_mapping and smb_files projections.
-        assert len(formats) == 25
+        # Existing formats plus canonical Zeek smb_mapping/smb_files and eslogger.
+        assert len(formats) == 26
         assert "windows_event_security" in formats
         assert "zeek_conn" in formats
         assert "ecar" in formats
+        assert "eslogger" in formats
         assert "syslog" in formats
         assert "bash_history" in formats
         assert "snort_alert" in formats

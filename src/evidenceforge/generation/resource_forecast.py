@@ -432,8 +432,11 @@ class _DiskFormatCalibration(BaseModel):
             "all",
             "windows",
             "linux",
+            "macos",
         } and not self.system_scope.startswith("role:"):
-            raise ValueError("disk format system_scope must be all, windows, linux, or role:<name>")
+            raise ValueError(
+                "disk format system_scope must be all, windows, linux, macos, or role:<name>"
+            )
         if self.system_scope == "role:":
             raise ValueError("disk format role scope requires a role name")
         return self
@@ -670,6 +673,12 @@ def _system_count_for_scope(scenario: Scenario, scope: str) -> int:
         linux_tokens = ("linux", "ubuntu", "debian", "centos", "rhel")
         return sum(
             any(token in str(system.os or "").lower() for token in linux_tokens)
+            for system in systems
+        )
+    if scope == "macos":
+        macos_tokens = ("macos", "mac os", "darwin", "osx")
+        return sum(
+            any(token in str(system.os or "").lower() for token in macos_tokens)
             for system in systems
         )
     role = scope.removeprefix("role:")

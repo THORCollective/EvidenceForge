@@ -27,7 +27,7 @@ OVERLAY_FILE_SCHEMAS: dict[str, dict] = {
         "dict_fields": {"role_traffic", "persona_traffic"},
     },
     "activity/spawn_rules.yaml": {
-        "dict_fields": {"windows", "linux"},
+        "dict_fields": {"windows", "linux", "macos"},
     },
     "activity/proxy_uri_templates.yaml": {
         "dict_fields": {"domains", "tags", "generic"},
@@ -74,7 +74,7 @@ OVERLAY_FILE_SCHEMAS: dict[str, dict] = {
         "list_fields": {"dns_hosts": "hostname", "unusual_connections": "hostname"},
     },
     "activity/command_parameter_pools.yaml": {
-        "dict_fields": {"general", "query", "linux_query"},
+        "dict_fields": {"general", "query", "linux_query", "os_overrides"},
     },
     "activity/process_access_patterns.yaml": {
         "list_fields": {"baseline_pairs": None},
@@ -111,6 +111,9 @@ OVERLAY_FILE_SCHEMAS: dict[str, dict] = {
         "dict_fields": {"network_allowlist"},
         "string_list_fields": {"markers"},
         "string_fields": {"default_marker", "canary_host"},
+    },
+    "activity/macos_signing.yaml": {
+        "list_fields": {"binaries": "binary_path"},
     },
     "activity/tls_issuers.yaml": {
         "list_fields": {"issuers": "name"},
@@ -186,6 +189,7 @@ OVERLAY_FILE_SCHEMAS: dict[str, dict] = {
             "group_policy_extension_guids",
             "file_paths_windows",
             "file_paths_linux",
+            "file_paths_macos",
             "dll_pool",
             "runmru_commands",
         },

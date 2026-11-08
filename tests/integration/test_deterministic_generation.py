@@ -312,6 +312,23 @@ def test_windows_smb_generation_is_bit_perfect_for_identical_inputs(tmp_path: Pa
     assert _snapshot_generated_files(first_dir) == _snapshot_generated_files(second_dir)
 
 
+def test_prior_generation_in_same_process_does_not_change_output(tmp_path: Path) -> None:
+    """Scenario-registered state (e.g. host reverse DNS) must not leak between runs."""
+    fixtures = Path(__file__).parent.parent / "fixtures" / "scenarios"
+    demo_path = Path(__file__).parent.parent.parent / "scenarios" / "macos-eslogger-demo"
+    demo = load_yaml(demo_path / "scenario.yaml")
+
+    GenerationEngine(Scenario(**demo), tmp_path / "clean").generate()
+    GenerationEngine(
+        Scenario(**load_yaml(fixtures / "minimal.yaml")), tmp_path / "other"
+    ).generate()
+    GenerationEngine(Scenario(**demo), tmp_path / "after").generate()
+
+    assert _snapshot_generated_files(tmp_path / "clean") == _snapshot_generated_files(
+        tmp_path / "after"
+    )
+
+
 @pytest.mark.soak
 def test_common_outputs_and_ground_truth_ignore_format_filter(tmp_path: Path) -> None:
     """Selecting fewer renderers must not change canonical planning or shared bytes."""

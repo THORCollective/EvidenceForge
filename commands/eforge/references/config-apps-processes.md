@@ -168,6 +168,13 @@ Keep Windows paths in Windows sections and Linux paths in Linux sections. Proces
 belong in `file_side_effect_profiles`; do not put package-manager state, `/proc/<pid>`, protected
 event logs, or another owner's artifacts into generic churn pools.
 
+### `macos_signing.yaml`
+
+macOS code-signing identities for eslogger, keyed by `binary_path`: `signing_id`, `team_id`
+(null for Apple platform and ad-hoc code), and `is_platform_binary`. Anything on the sealed system
+volume is a platform binary; unlisted code is ad-hoc signed with no Team ID. Overlay entries
+replace packaged entries with the same `binary_path`.
+
 ## Installed software identity
 
 `installed_software_products` is source-native inventory metadata, not an executable release or an

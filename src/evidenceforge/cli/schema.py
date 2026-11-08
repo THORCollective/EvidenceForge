@@ -230,6 +230,11 @@ _EVENT_EXAMPLES: dict[str, dict[str, Any]] = {
     },
     "email_read": {"type": "email_read", "protocol": "owa", "duration": 45.0},
     "raw": {"type": "raw", "target_format": "syslog"},
+    "file": {
+        "type": "file",
+        "path": "/Users/analyst/Library/LaunchAgents/com.example.agent.plist",
+        "action": "create",
+    },
 }
 
 

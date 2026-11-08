@@ -28,7 +28,7 @@ from evidenceforge.utils.rng for backward compatibility.
 
 from evidenceforge.utils.rng import _get_rng, _thread_local  # noqa: F401
 
-from .command_parameter_pools import command_parameter_pools
+from .command_parameter_pools import command_parameter_os_overrides, command_parameter_pools
 
 
 def _get_os_category(os_string: str) -> str:
@@ -40,7 +40,7 @@ def _get_os_category(os_string: str) -> str:
         os_string: OS name/version (e.g., "Windows 10", "Linux Ubuntu 20.04")
 
     Returns:
-        OS category: "windows", "linux", or "unknown"
+        OS category: "windows", "linux", "macos", or "unknown"
     """
     os_lower = os_string.lower()
     if "windows" in os_lower:
@@ -53,8 +53,31 @@ def _get_os_category(os_string: str) -> str:
         or "rhel" in os_lower
     ):
         return "linux"
+    elif "macos" in os_lower or "mac os" in os_lower or "darwin" in os_lower or "osx" in os_lower:
+        return "macos"
     else:
         return "unknown"
+
+
+def ssh_receiver_parent_role(os_category: str) -> str:
+    """Return the system-process role that spawns a per-connection sshd.
+
+    Linux runs a persistent ``sshd -D`` listener that forks each connection.
+    macOS Remote Login is a launchd socket (``com.openssh.sshd``, inetd style):
+    launchd starts ``/usr/sbin/sshd -i`` per connection and no listener runs.
+    """
+    return "launchd" if os_category == "macos" else "sshd"
+
+
+def ssh_receiver_command_line(os_category: str, username: str) -> str:
+    """Return the per-connection sshd command line for a target OS.
+
+    On Linux the forked listener child is observed by its proctitle. On macOS the
+    connection's sshd is exec'd by launchd, so exec telemetry carries its argv.
+    """
+    if os_category == "macos":
+        return "/usr/sbin/sshd -i"
+    return f"sshd: {username} [priv]"
 
 
 # General parameterization pools for command-line diversification.
@@ -220,7 +243,7 @@ _QUERY_PARAMS_LINUX = {
 }
 
 
-def _parameterize_command(rng, command_line: str, username: str = "") -> str:
+def _parameterize_command(rng, command_line: str, username: str = "", os_category: str = "") -> str:
     """Replace {placeholders} in command lines with random realistic values.
 
     Runs multiple passes since expanding one placeholder (e.g., {sql_query})
@@ -228,7 +251,8 @@ def _parameterize_command(rng, command_line: str, username: str = "") -> str:
 
     When username is provided, {username} is substituted first for per-user
     path customization. Per-user affinity is achieved by the caller seeding
-    the rng appropriately.
+    the rng appropriately. When os_category is provided, that OS's override
+    pools (e.g. macOS project paths) replace the Windows-shaped defaults.
     """
     # Substitute {username} first (literal, not random)
     if username and "{username}" in command_line:
@@ -237,6 +261,8 @@ def _parameterize_command(rng, command_line: str, username: str = "") -> str:
     all_params = {**_GENERAL_PARAMS, **_QUERY_PARAMS, **_QUERY_PARAMS_LINUX}
     for section_values in command_parameter_pools().values():
         all_params.update(section_values)
+    if os_category:
+        all_params.update(command_parameter_os_overrides(os_category))
     for _pass in range(3):  # Max 3 passes to resolve nested placeholders
         changed = False
         for key, values in all_params.items():

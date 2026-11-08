@@ -58,6 +58,13 @@ relationships:
     position: before
     min_ms: 40
     max_ms: 350
+  macos.btm_after_plist_create:
+    # BTM (btmd) observes a launch-item plist registration shortly after the
+    # file lands on disk. Consequent of a LaunchAgents/LaunchDaemons file_create.
+    class: source_latency
+    position: after
+    min_ms: 50
+    max_ms: 1200
   process.remote_thread_lsass_access:
     class: source_latency
     position: before
@@ -365,6 +372,13 @@ endpoint_clock:
         host_drift_ppm:
           min: 0
           max: 0
+      macos:
+        host_offset_ms:
+          min: 0
+          max: 0
+        host_drift_ppm:
+          min: 0
+          max: 0
     enterprise_standard:
       windows:
         host_offset_ms:
@@ -380,6 +394,13 @@ endpoint_clock:
         host_drift_ppm:
           min: -8
           max: 8
+      macos:
+        host_offset_ms:
+          min: -900
+          max: 1500
+        host_drift_ppm:
+          min: -8
+          max: 8
     messy_collection:
       windows:
         host_offset_ms:
@@ -389,6 +410,13 @@ endpoint_clock:
           min: -35
           max: 35
       linux:
+        host_offset_ms:
+          min: -4200
+          max: 6200
+        host_drift_ppm:
+          min: -30
+          max: 30
+      macos:
         host_offset_ms:
           min: -4200
           max: 6200

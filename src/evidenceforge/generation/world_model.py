@@ -435,7 +435,9 @@ class WorldModel:
         if os_category == "windows":
             capabilities.add(HostCapability.RDP_CLIENT)
             capabilities.add(HostCapability.SMB_CLIENT)
-        if os_category == "linux" and (
+        # macOS Remote Login is off by default, so like Linux it needs a
+        # server role or an explicit ssh service to accept inbound SSH.
+        if os_category in ("linux", "macos") and (
             system.type in ("server", "domain_controller")
             or normalized_services.intersection(_SSH_RECEIVER_SERVICES)
         ):
@@ -499,6 +501,14 @@ class WorldModel:
                 "ldap-client",
             ]
             if host.is_server:
+                services.append("smb-server")
+            return services
+        if host.os_category == "macos":
+            # macOS has no generic Linux-style syslog daemon; it relies on
+            # DNS/NTP clients plus its own unified logging (log(1)/OSLog) and
+            # directory-services client for domain-joined lookups.
+            services = ["dns-client", "ntp-client", "unified-logging", "opendirectoryd"]
+            if host.supports(HostCapability.SMB_SERVER):
                 services.append("smb-server")
             return services
         if host.supports(HostCapability.SMB_SERVER):
@@ -1203,15 +1213,22 @@ class WorldPlanner:
             session_end_plan=session_end_plan,
         ).session
 
-    def _find_windows_interactive_session(
+    def _find_reusable_interactive_session(
         self,
         username: str,
         target_system: System,
         at_time: datetime,
     ) -> ActiveSession | None:
-        """Return a durable same-user Windows interactive session, if one exists."""
+        """Return a durable same-user interactive session, if one exists.
+
+        Windows and macOS both model a single long-lived desktop logon
+        (winlogon-rooted / loginwindow-rooted, respectively) that persists
+        across many activities rather than being re-established each time.
+        Linux is intentionally excluded — its interactive sessions are not
+        modeled with the same durable-desktop-session semantics here.
+        """
         host = self.world_model.hosts.get(target_system.hostname)
-        if host is None or host.os_category != "windows":
+        if host is None or host.os_category not in ("windows", "macos"):
             return None
 
         cutoff = at_time.replace(tzinfo=UTC) if at_time.tzinfo is None else at_time.astimezone(UTC)
@@ -1339,7 +1356,7 @@ class WorldPlanner:
                 reconnect_logon_id = existing_rdp.logon_id
 
         if allow_existing and session_kind in (None, "interactive"):
-            existing_interactive = self._find_windows_interactive_session(
+            existing_interactive = self._find_reusable_interactive_session(
                 user.username,
                 target_system,
                 time,
@@ -1424,8 +1441,9 @@ class WorldPlanner:
                 # process evidence. Give that source-native sequence room before
                 # the first user-visible command tied to the session.
                 logon_time = time - timedelta(seconds=rng.uniform(6.0, 12.0))
-            elif (
-                plan.session_kind == "interactive" and _get_os_category(target_system.os) == "linux"
+            elif plan.session_kind == "interactive" and _get_os_category(target_system.os) in (
+                "linux",
+                "macos",
             ):
                 logon_time = time - timedelta(seconds=rng.uniform(7.0, 15.0))
             else:

@@ -57,6 +57,7 @@ from evidenceforge.generation.emitters import (
     BashHistoryEmitter,
     CiscoAsaEmitter,
     EcarEmitter,
+    ESLoggerEmitter,
     ProxyEmitter,
     SnortEmitter,
     SyslogEmitter,
@@ -264,6 +265,7 @@ def _build_emitter_classes() -> dict:
         "zeek_packet_filter": ZeekPacketFilterEmitter,
         "zeek_reporter": ZeekReporterEmitter,
         "ecar": EcarEmitter,
+        "eslogger": ESLoggerEmitter,
         "syslog": SyslogEmitter,
         "bash_history": BashHistoryEmitter,
         "snort_alert": SnortEmitter,
@@ -298,6 +300,7 @@ _HOST_FORMATS = {
     "windows_event_security",
     "windows_event_sysmon",
     "ecar",
+    "eslogger",
     "syslog",
     "bash_history",
     "web_access",
@@ -392,6 +395,17 @@ class EmitterSetupMixin:
             self.emitters[format_name] = emitter
             emitter.configure_output_target(self.output_target)
             logger.info(f"Initialized {format_name} emitter (threaded)")
+
+        # Give the eslogger emitter each Mac's local account layout (uid 501 = assigned user)
+        if "eslogger" in self.emitters:
+            self.emitters["eslogger"].configure_local_accounts(
+                {
+                    system.hostname: system.assigned_user
+                    for system in self.scenario.environment.systems
+                    if system.assigned_user
+                },
+                [user.username for user in self.scenario.environment.users],
+            )
 
         # Configure ASA emitters with network topology for interface resolution
         if "cisco_asa" in self.emitters:
@@ -1111,6 +1125,132 @@ class EmitterSetupMixin:
             aliases=tuple(aliases),
         )
 
+    def _build_macos_boot_host_spec(
+        self,
+        system: System,
+        boot_time: datetime | None,
+    ) -> _BootHostSpec:
+        """Resolve the exact macOS boot forest without allocating State identity."""
+
+        hostname = system.hostname
+        boot_rng = random.Random(_stable_seed(f"macos_boot_sequence:{hostname}"))
+        boot_elapsed = 0.0
+        processes: list[_BootProcessSpec] = []
+
+        def process_time() -> datetime | None:
+            nonlocal boot_elapsed
+            if boot_time is None:
+                return None
+            boot_elapsed += boot_rng.uniform(0.05, 1.9)
+            return boot_time + timedelta(seconds=boot_elapsed)
+
+        def add(
+            alias: str,
+            parent_alias: str,
+            image: str,
+            command_line: str,
+            username: str,
+        ) -> None:
+            processes.append(
+                _BootProcessSpec(
+                    alias=alias,
+                    parent_alias=parent_alias,
+                    fixed_pid=None,
+                    image=image,
+                    command_line=command_line,
+                    username=username,
+                    integrity_level="System",
+                    os_category="macos",
+                    logon_id="",
+                    start_time=process_time(),
+                )
+            )
+
+        # launchd is macOS's PID 1: the only process the kernel spawns
+        # directly and the ancestor of every system daemon and Aqua session job.
+        processes.append(
+            _BootProcessSpec(
+                alias="launchd",
+                parent_alias=None,
+                fixed_pid=1,
+                image="/sbin/launchd",
+                command_line="/sbin/launchd",
+                username="root",
+                integrity_level="System",
+                os_category="macos",
+                logon_id="",
+                start_time=boot_time,
+            )
+        )
+        add(
+            "windowserver",
+            "launchd",
+            "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer",
+            "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon",
+            "_windowserver",
+        )
+        # macOS's session root (the analog of Windows' winlogon); WorldModel
+        # treats interactive sessions as loginwindow-rooted.
+        loginwindow = "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow"
+        add("loginwindow", "launchd", loginwindow, loginwindow, "root")
+        add("cfprefsd", "launchd", "/usr/sbin/cfprefsd", "/usr/sbin/cfprefsd daemon", "root")
+        add(
+            "user_event_agent",
+            "launchd",
+            "/usr/libexec/UserEventAgent",
+            "/usr/libexec/UserEventAgent (System)",
+            "root",
+        )
+        # Unified logging (logd) plus its BSD syslog compatibility shim.
+        add("logd", "launchd", "/usr/libexec/logd", "/usr/libexec/logd", "root")
+        add("syslogd", "launchd", "/usr/sbin/syslogd", "/usr/sbin/syslogd", "root")
+        add("trustd", "launchd", "/usr/libexec/trustd", "/usr/libexec/trustd --agent", "_trustd")
+        add(
+            "opendirectoryd",
+            "launchd",
+            "/usr/libexec/opendirectoryd",
+            "/usr/libexec/opendirectoryd",
+            "root",
+        )
+        add("notifyd", "launchd", "/usr/libexec/notifyd", "/usr/libexec/notifyd", "root")
+        add(
+            "mdnsresponder",
+            "launchd",
+            "/usr/sbin/mDNSResponder",
+            "/usr/sbin/mDNSResponder",
+            "_mdnsresponder",
+        )
+        # Background Task Management reports ES btm_launch_item_add events.
+        btm_path = (
+            "/System/Library/PrivateFrameworks/BackgroundTaskManagement.framework/"
+            "Versions/A/Resources/backgroundtaskmanagementd"
+        )
+        add("backgroundtaskmanagementd", "launchd", btm_path, btm_path, "root")
+        # Spotlight: mds is the metadata server; mdworker_shared its indexer.
+        metadata_support = (
+            "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/"
+            "Metadata.framework/Versions/A/Support/"
+        )
+        add("mds", "launchd", f"{metadata_support}mds", f"{metadata_support}mds", "root")
+        add(
+            "mdworker",
+            "mds",
+            f"{metadata_support}mdworker_shared",
+            f"{metadata_support}mdworker_shared -s mdworker",
+            "_spotlight",
+        )
+        # No sshd here: Remote Login is a launchd socket, so launchd starts
+        # `sshd -i` per connection (see ssh_receiver_parent_role) and no
+        # listener or root login shell runs between connections.
+        return _BootHostSpec(
+            hostname=hostname,
+            os_category="macos",
+            boot_time=boot_time,
+            machine_id="",
+            processes=tuple(processes),
+            aliases=(),
+        )
+
     def _build_boot_fleet_spec(self, original_time: datetime | None) -> BootFleetSpec:
         """Resolve every boot input once into the exact symbolic fleet forest."""
 
@@ -1126,8 +1266,11 @@ class EmitterSetupMixin:
                 if start_time is not None and boot_uptime is not None
                 else original_time
             )
-            if _get_os_category(system.os) == "windows":
+            os_category = _get_os_category(system.os)
+            if os_category == "windows":
                 hosts.append(self._build_windows_boot_host_spec(system, boot_time))
+            elif os_category == "macos":
+                hosts.append(self._build_macos_boot_host_spec(system, boot_time))
             else:
                 hosts.append(self._build_linux_boot_host_spec(system, boot_time))
         return BootFleetSpec(
@@ -1623,13 +1766,16 @@ class EmitterSetupMixin:
                         )
                         if boot_time is not None:
                             self.state_manager.set_current_time(boot_time)
-                        if _get_os_category(system.os) == "windows":
+                        os_category = _get_os_category(system.os)
+                        if os_category == "windows":
                             self._seed_windows_process_tree(
                                 system,
                                 pids,
                                 _batch_builder=None,
                                 _boot_base=boot_time,
                             )
+                        elif os_category == "macos":
+                            self._seed_macos_process_tree(system, pids)
                         else:
                             self._seed_linux_process_tree(
                                 system,
@@ -2281,6 +2427,43 @@ class EmitterSetupMixin:
                 if boot_base is not None and sm.state.current_time != boot_base:
                     sm.set_current_time(boot_base)
         pids.update(boot_pids)
+
+    def _seed_macos_process_tree(self, system: System, pids: dict[str, int]) -> None:
+        """Seed a macOS boot tree directly into State; fixture-only compatibility path.
+
+        Engine-owned generation plans the same forest through
+        ``_build_macos_boot_host_spec`` and the lifecycle materialization batch.
+        """
+        sm = self.state_manager
+        boot_base = sm.state.current_time
+        host_spec = self._build_macos_boot_host_spec(system, boot_base)
+        for member in host_spec.processes:
+            if member.start_time is not None:
+                sm.set_current_time(member.start_time)
+            if member.parent_alias is None:
+                assert member.fixed_pid is not None
+                sm.register_process(
+                    system=host_spec.hostname,
+                    pid=member.fixed_pid,
+                    parent_pid=0,
+                    image=member.image,
+                    command_line=member.command_line,
+                    username=member.username,
+                    integrity_level=member.integrity_level,
+                    os_category=member.os_category,
+                )
+                pids[member.alias] = member.fixed_pid
+                continue
+            pids[member.alias] = sm.create_process(
+                host_spec.hostname,
+                pids[member.parent_alias],
+                member.image,
+                member.command_line,
+                member.username,
+                member.integrity_level,
+            )
+        if boot_base is not None:
+            sm.set_current_time(boot_base)
 
     def _get_system_exposure(self, system) -> str:
         """Get the network exposure for a system based on its segment.

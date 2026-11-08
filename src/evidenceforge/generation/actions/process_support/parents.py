@@ -33,6 +33,7 @@ from evidenceforge.utils.rng import _stable_seed
 from evidenceforge.utils.time import ensure_utc
 
 from . import policy
+from .actors import derive_macos_current_directory
 from .capabilities import (
     CreateWindowsSessionShellLifecycleCapability,
     EnsureLinuxSessionShellCapability,
@@ -53,6 +54,17 @@ from .reuse import ProcessReusePolicy
 from .sources import ProcessSourceTiming
 
 logger = logging.getLogger(__name__)
+
+
+def _is_other_users_macos_shell(
+    os_category: str, process_exe: str, process_username: str, username: str
+) -> bool:
+    """Return whether a macOS shell belongs to another account and cannot parent this user."""
+    return (
+        os_category == "macos"
+        and process_exe in {"zsh", "bash", "sh"}
+        and process_username != username
+    )
 
 
 @dataclass(frozen=True)
@@ -136,6 +148,34 @@ class ProcessParentResolver:
     def _linux_anchor_pid(self, system: System, time: datetime) -> int:
         """Forward to the shared linux parent owner."""
         return self.linux._linux_anchor_pid(system, time)
+
+    def _macos_anchor_pid(self, system: System, time: datetime) -> int:
+        """Return macOS launchd (PID 1) for parent-chain fallbacks.
+
+        launchd is PID 1 by kernel convention and the ancestor of every
+        user-space process. Production seeds it at boot; paths that build macOS
+        ancestry without a seeded tree register it at its fixed PID.
+        """
+        sys_pids = policy.system_process_roles(self._system_pids).setdefault(system.hostname, {})
+        pid = sys_pids.get("launchd")
+        if pid and self.queries._is_pid_active_at(system, pid, time):
+            return pid
+        if self.state_manager.get_process(system.hostname, 1) is not None:
+            sys_pids.setdefault("launchd", 1)
+            return 1
+        self.state_manager.register_process(
+            system=system.hostname,
+            pid=1,
+            parent_pid=0,
+            image="/sbin/launchd",
+            command_line="/sbin/launchd",
+            username="root",
+            integrity_level="System",
+            os_category="macos",
+            start_time=time - timedelta(minutes=5),
+        )
+        sys_pids["launchd"] = 1
+        return 1
 
     def _materialize_visible_linux_shell_parent_for_child(
         self,
@@ -230,6 +270,29 @@ class ProcessParentResolver:
             ):
                 return parent_pid
             return self.windows._windows_system_parent_fallback(system, time)
+
+        if os_category == "macos":
+            # A macOS child may outlive its parent (it is reparented to launchd),
+            # so any parent alive at the child's start is valid -- including an
+            # explicit storyline parent whose exit was already generated.
+            if self.queries._is_valid_process_parent_at(
+                system=system, parent_pid=parent_pid, time=time
+            ):
+                return parent_pid
+            if user_context:
+                resolved = self._resolve_parent(
+                    system,
+                    self.identity.user_for_username(process_username),
+                    time,
+                    logon_id,
+                    process_name,
+                    command_line,
+                )
+                if self.queries._is_valid_process_parent_at(
+                    system=system, parent_pid=resolved, time=time
+                ):
+                    return resolved
+            return self._macos_anchor_pid(system, time)
 
         if user_context:
             repair_user = self.identity.user_for_username(process_username)
@@ -467,6 +530,29 @@ class ProcessParentResolver:
                 logon_id=logon_id,
             ):
                 return parent_pid
+            if (
+                os_category == "macos"
+                and self.queries._is_valid_process_parent_at(
+                    system=system,
+                    parent_pid=parent_pid,
+                    time=time,
+                )
+                and self.queries._parent_process_matches_logon(
+                    hostname=system.hostname,
+                    parent_pid=parent_pid,
+                    logon_id=logon_id,
+                    os_category=os_category,
+                )
+            ):
+                return parent_pid
+
+        if os_category == "macos":
+            # Never borrow a Linux role (bash/sshd/systemd): a macOS user
+            # process belongs to its session shell, else to launchd.
+            session_shell = self.queries._active_session_shell_pid(system, user, time, logon_id)
+            if session_shell is not None:
+                return session_shell
+            return self._macos_anchor_pid(system, time)
 
         system_pids = policy.system_process_roles(self._system_pids).get(system.hostname, {})
         if os_category == "windows":
@@ -538,6 +624,7 @@ class ProcessParentResolver:
         """
         from evidenceforge.generation.activity.spawn_rules import (
             get_reverse_index_linux,
+            get_reverse_index_macos,
             get_reverse_index_windows,
         )
 
@@ -621,6 +708,8 @@ class ProcessParentResolver:
         # Look up valid parents from spawn rules
         if os_cat == "windows":
             reverse = get_reverse_index_windows()
+        elif os_cat == "macos":
+            reverse = get_reverse_index_macos()
         else:
             reverse = get_reverse_index_linux()
 
@@ -631,6 +720,22 @@ class ProcessParentResolver:
             )
             if selected is not None:
                 return selected
+        if (
+            os_cat == "macos"
+            and active_session is not None
+            and active_session.session_kind == "ssh"
+            and (
+                not possible_parents
+                or any(parent in {"bash", "sh", "zsh"} for parent in possible_parents)
+            )
+        ):
+            # A command typed in an SSH session runs under that session's login
+            # shell (sshd -i -> -zsh), not a newly built Terminal -> login chain.
+            ssh_shell_pid = self.queries._active_session_shell_pid(
+                system, user, time, active_session.logon_id
+            )
+            if ssh_shell_pid is not None:
+                return ssh_shell_pid
 
         if not possible_parents:
             # No rules for this exe — fall back to legacy logic
@@ -691,6 +796,8 @@ class ProcessParentResolver:
                     if "\\" in proc.image
                     else proc.image.rsplit("/", 1)[-1].lower()
                 )
+                if _is_other_users_macos_shell(os_cat, proc_exe, proc.username, user.username):
+                    continue
                 if proc_exe in possible_parents:
                     alive_parents.append((pid, proc.image))
 
@@ -726,6 +833,7 @@ class ProcessParentResolver:
         from evidenceforge.generation.activity.spawn_rules import (
             get_parent_config,
             get_reverse_index_linux,
+            get_reverse_index_macos,
             get_reverse_index_windows,
         )
 
@@ -734,6 +842,8 @@ class ProcessParentResolver:
 
         if os_cat == "windows":
             reverse = get_reverse_index_windows()
+        elif os_cat == "macos":
+            reverse = get_reverse_index_macos()
         else:
             reverse = get_reverse_index_linux()
 
@@ -788,6 +898,14 @@ class ProcessParentResolver:
             if shell_parents:
                 possible_parents = shell_parents
 
+        if os_cat == "macos":
+            # zsh has been the macOS default login shell since 10.15, and an
+            # interactive login shell is started by Terminal's login(1).
+            if "zsh" in possible_parents:
+                possible_parents = ["zsh"]
+            elif child_exe_lower in {"zsh", "bash", "sh"} and "login" in possible_parents:
+                possible_parents = ["login"]
+
         # Prefer shells for CLI tools on Windows, sshd→bash for Linux
         chosen_parent = rng.choice(possible_parents)
         if os_cat == "windows" and chosen_parent.lower() == "explorer.exe":
@@ -813,18 +931,31 @@ class ProcessParentResolver:
                     if "\\" in proc.image
                     else proc.image.rsplit("/", 1)[-1].lower()
                 )
-                if proc_exe == chosen_parent:
+                if _is_other_users_macos_shell(os_cat, proc_exe, proc.username, user.username):
+                    continue
+                if proc_exe == chosen_parent.lower():
                     return pid
-
-        # Not a seeded process — need to create it, but first ensure ITS parent
-        grandparent_pid = self._ensure_parent_chain(
-            system, user, time, logon_id, chosen_parent, os_cat, depth=depth + 1
-        )
 
         # Get command template for the parent we're creating
         config = get_parent_config(os_cat, chosen_parent)
+        macos_parent_time: datetime | None = None
+        if os_cat == "macos":
+            # Anchor each ancestor to its own child's start so the chain nests
+            # strictly in time (grandparent < parent < child).
+            macos_delay = config.get("spawn_delay", [0.5, 3.0])
+            macos_parent_time = time - timedelta(
+                seconds=rng.uniform(macos_delay[0], macos_delay[1])
+            )
+            grandparent_pid = self._ensure_parent_chain(
+                system, user, macos_parent_time, logon_id, chosen_parent, os_cat, depth=depth + 1
+            )
+        else:
+            # Not a seeded process — need to create it, but first ensure ITS parent
+            grandparent_pid = self._ensure_parent_chain(
+                system, user, time, logon_id, chosen_parent, os_cat, depth=depth + 1
+            )
         cmd_templates = config.get("command_templates", [chosen_parent])
-        cmd_line = rng.choice(cmd_templates)
+        cmd_line = rng.choice(cmd_templates).replace("{username}", user.username)
 
         # Derive image path from command_templates (which have correct full paths)
         # rather than blindly prefixing C:\Windows\System32\
@@ -865,9 +996,12 @@ class ProcessParentResolver:
             )
 
         # Timing: parent is created before child
-        spawn_delay = config.get("spawn_delay", [0.5, 3.0])
-        delay_sec = rng.uniform(spawn_delay[0], spawn_delay[1])
-        parent_time = time - timedelta(seconds=delay_sec * (depth + 1))
+        if macos_parent_time is not None:
+            parent_time = macos_parent_time
+        else:
+            spawn_delay = config.get("spawn_delay", [0.5, 3.0])
+            delay_sec = rng.uniform(spawn_delay[0], spawn_delay[1])
+            parent_time = time - timedelta(seconds=delay_sec * (depth + 1))
         session = self.state_manager.get_session(logon_id)
         if session is not None and parent_time <= session.start_time:
             parent_time = session.start_time + timedelta(milliseconds=10 * (4 - depth))
@@ -954,6 +1088,20 @@ class ProcessParentResolver:
                     token_elevation="%%1938",
                     mandatory_label="S-1-16-8192",
                     start_time=process_identity.started_at,
+                    current_directory=(
+                        derive_macos_current_directory(
+                            hostname=system.hostname,
+                            username=user.username,
+                            process_name=image,
+                            command_line=cmd_line,
+                            parent_image=self.queries._lookup_process_name(
+                                system.hostname, grandparent_pid, "macos"
+                            )
+                            or "",
+                        )
+                        if os_cat == "macos"
+                        else ""
+                    ),
                 ),
                 identity_plan=EventIdentityPlan(
                     subject=process_identity,
@@ -1077,6 +1225,28 @@ class ProcessParentResolver:
                 alive_history=alive_history,
                 rng=rng,
             )
+        if os_cat == "macos":
+            # App bundles are started by LaunchServices, so launchd (PID 1) is
+            # their parent -- never a shell or sshd, even for malware the user
+            # double-clicked.
+            if ".app/Contents/MacOS/" in process_name:
+                return self._macos_anchor_pid(system, effective_time)
+            # CLI tools come from the user's own shell. There is no persistent
+            # root shell to borrow: a user process with no live shell of its
+            # own falls back to launchd, not to sshd.
+            session_shell_pid = self.queries._active_session_shell_pid(
+                system, user, effective_time, logon_id
+            )
+            if session_shell_pid is not None:
+                return session_shell_pid
+            shells = [
+                pid
+                for pid, name in alive_history
+                if name.rsplit("/", 1)[-1].lower() in {"zsh", "bash", "sh"}
+            ]
+            if shells:
+                return shells[-1]
+            return self._macos_anchor_pid(system, effective_time)
         return self.linux.select_from_history(
             system,
             user,
@@ -1142,6 +1312,8 @@ class ProcessParentResolver:
             ):
                 return session_explorer
             return self.windows._windows_system_parent_fallback(system, time)
+        if os_cat == "macos":
+            return self._macos_anchor_pid(system, time)
 
         for role in ("bash", "sshd"):
             candidate = sys_pids.get(role)

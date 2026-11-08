@@ -429,6 +429,90 @@ def test_boot_epoch_and_explicit_thread_allocation_fence_prepared_process_plan()
         assert earlier_id < later_id
         assert later_id - earlier_id < 600
 
+    def test_macos_audit_session_ids_are_monotonic_and_asid_ranged(self):
+        """macOS ES audit session ids (asid) should be a per-host monotonic sequence."""
+        import random
+
+        sm = StateManager()
+        start = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+        rng = random.Random(11)
+
+        first = sm.next_macos_audit_session_id("mac01", rng, start)
+        second = sm.next_macos_audit_session_id("mac01", rng, start + timedelta(minutes=5))
+        third = sm.next_macos_audit_session_id("mac01", rng, start + timedelta(minutes=6))
+
+        # Seeded near 100000 (well above the reserved low range), never a small
+        # logind-style number.
+        assert first >= 100000
+        # Strictly increasing per host.
+        assert first < second < third
+
+    def _ssh_session_at(self, sm, start, *, transport_pid=None):
+        sm.set_current_time(start)
+        return sm.create_session(
+            username="alice",
+            system="mac01",
+            logon_type=10,
+            source_ip="10.0.0.10",
+            start_time=start,
+            session_kind="ssh",
+            session_id=100031,
+            transport_pid=transport_pid,
+        )
+
+    def test_get_session_for_transport_exact_binding_wins(self):
+        # Arrange
+        sm = StateManager()
+        start = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+        self._ssh_session_at(sm, start - timedelta(seconds=30))
+        bound = self._ssh_session_at(sm, start, transport_pid=812)
+
+        # Act
+        session = sm.get_session_for_transport("mac01", 812, start - timedelta(seconds=3))
+
+        # Assert
+        assert session is not None and session.logon_id == bound
+
+    def test_get_session_for_transport_ended_session_within_setup_window(self):
+        # Arrange
+        sm = StateManager()
+        start = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+        logon_id = self._ssh_session_at(sm, start)
+        sm.end_session(logon_id, start + timedelta(minutes=9))
+
+        # Act
+        session = sm.get_session_for_transport("mac01", 812, start - timedelta(seconds=5))
+
+        # Assert
+        assert session is not None and session.logon_id == logon_id
+
+    def test_get_session_for_transport_outside_window_or_other_host_is_none(self):
+        # Arrange
+        sm = StateManager()
+        start = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+        self._ssh_session_at(sm, start)
+
+        # Act / Assert
+        assert sm.get_session_for_transport("mac01", 812, start + timedelta(hours=1)) is None
+        assert sm.get_session_for_transport("mac02", 812, start) is None
+        assert sm.get_session_for_transport("mac01", 0, start) is None
+
+    def test_macos_audit_session_ids_are_per_host(self):
+        """Each host keeps its own macOS audit-session sequence."""
+        import random
+
+        sm = StateManager()
+        start = datetime(2024, 1, 15, 10, 0, 0, tzinfo=UTC)
+
+        mac01_first = sm.next_macos_audit_session_id("mac01", random.Random(3), start)
+        mac02_first = sm.next_macos_audit_session_id("mac02", random.Random(3), start)
+
+        assert mac01_first >= 100000
+        assert mac02_first >= 100000
+        # Independent counters advance separately per host.
+        mac01_second = sm.next_macos_audit_session_id("mac01", random.Random(99), start)
+        assert mac01_second > mac01_first
+
     def test_linux_logind_session_ids_do_not_encode_elapsed_seconds(self):
         """Logind session IDs should look like allocator counters, not uptime seconds."""
         import random
@@ -3262,6 +3346,216 @@ class TestProcessManagement:
 
         procs = sm.list_running_processes()
         assert len(procs) == 2
+
+
+class TestMacOSProcessAllocation:
+    """Tests for macOS PID allocation and pidversion tracking."""
+
+    def test_initialize_pid_allocator_macos_starts_in_boot_daemon_range(self):
+        """launchd's first children on a real Mac land in the low hundreds."""
+        sm = StateManager()
+
+        sm._initialize_pid_allocator("mac01", "macos")
+        sm._initialize_pid_allocator("linux01", "linux")
+
+        assert sm._pid_os["mac01"] == "macos"
+        assert sm._pid_os["linux01"] == "linux"
+        assert 250 <= sm._pid_counters["mac01"] <= 400
+        assert 8_000 <= sm._pid_counters["linux01"] < 42_000
+
+    def test_create_process_macos_long_uptime_host_stays_below_pid_max(self):
+        """A macOS host booted weeks earlier must still get PIDs below 99999."""
+        sm = StateManager()
+        boot = datetime(2024, 5, 21, 14, 0, 0, tzinfo=UTC)
+        sm.set_current_time(boot)
+        root = sm.create_process(
+            system="mac01",
+            parent_pid=0,
+            image="/sbin/launchd",
+            command_line="/sbin/launchd",
+            username="root",
+            integrity_level="System",
+            os_category="macos",
+        )
+        sm.register_boot_time("mac01", boot)
+
+        pids: list[int] = []
+        for hour in range(0, 72):
+            sm.set_current_time(datetime(2024, 6, 11, 0, 0, 0, tzinfo=UTC) + timedelta(hours=hour))
+            pids.append(
+                sm.create_process(
+                    system="mac01",
+                    parent_pid=root,
+                    image="/bin/zsh",
+                    command_line="-zsh",
+                    username="alice",
+                    integrity_level="Medium",
+                    os_category="macos",
+                )
+            )
+
+        assert all(100 <= pid <= 99_998 for pid in pids)
+        assert len(set(pids)) == len(pids)
+
+    def test_initialize_pid_allocator_macos_is_idempotent(self):
+        """Repeated allocation on the same macOS system should stay consistent."""
+        sm = StateManager()
+
+        sm._initialize_pid_allocator("mac01", "macos")
+        first_counter = sm._pid_counters["mac01"]
+
+        # A later call for an already-initialized system must be a no-op,
+        # even if (incorrectly) passed a different os_category.
+        sm._initialize_pid_allocator("mac01", "linux")
+
+        assert sm._pid_counters["mac01"] == first_counter
+        assert sm._pid_os["mac01"] == "macos"
+
+    def test_create_process_macos_joins_generic_non_windows_increment_path(self):
+        """macOS process creation should never fall into the Windows-shaped branch."""
+        sm = StateManager()
+        sm.set_current_time(datetime(2024, 1, 15, 8, 0, 0, tzinfo=UTC))
+
+        first_pid = sm.create_process(
+            system="mac01",
+            parent_pid=0,
+            image="/sbin/launchd",
+            command_line="/sbin/launchd",
+            username="root",
+            integrity_level="System",
+            os_category="macos",
+        )
+        second_pid = sm.create_process(
+            system="mac01",
+            parent_pid=0,
+            image="/usr/sbin/syslogd",
+            command_line="/usr/sbin/syslogd",
+            username="root",
+            integrity_level="System",
+            os_category="macos",
+        )
+
+        assert sm._pid_os["mac01"] == "macos"
+        # macOS PIDs stay small and are never multiples of 4 by construction
+        # (that would indicate the Windows-shaped allocation branch was used).
+        assert 200 <= first_pid < 100_000
+        assert 200 <= second_pid < 100_000
+        assert first_pid != second_pid
+
+    def test_create_process_explicit_os_category_avoids_backslash_heuristic_bug(self):
+        """Passing os_category=macos must not be misclassified as Linux via path-sniffing."""
+        sm = StateManager()
+        sm.set_current_time(datetime(2024, 1, 15, 8, 0, 0, tzinfo=UTC))
+
+        # macOS paths use forward slashes, same as Linux — the old heuristic
+        # ("\\" in image => windows, else => linux) would silently misclassify
+        # this as Linux without an explicit os_category.
+        sm.create_process(
+            system="mac01",
+            parent_pid=0,
+            image="/usr/sbin/launchd",
+            command_line="/sbin/launchd",
+            username="root",
+            integrity_level="System",
+            os_category="macos",
+        )
+
+        assert sm._pid_os["mac01"] == "macos"
+
+    def test_create_process_without_os_category_falls_back_to_heuristic(self):
+        """Omitting os_category should preserve the documented backslash-path fallback."""
+        sm = StateManager()
+        sm.set_current_time(datetime(2024, 1, 15, 8, 0, 0, tzinfo=UTC))
+
+        sm.create_process(
+            system="unknown01",
+            parent_pid=0,
+            image="/usr/bin/bash",
+            command_line="bash",
+            username="root",
+            integrity_level="Medium",
+        )
+
+        # No explicit os_category and no backslash in the path => Linux fallback.
+        assert sm._pid_os["unknown01"] == "linux"
+
+    def test_pidversion_increases_with_process_creation_time(self):
+        """pidversion follows XNU's per-boot counter: large and time-ordered."""
+        sm = StateManager()
+        base = datetime(2024, 6, 11, 9, 0, 0, tzinfo=UTC)
+        sm.set_current_time(base)
+        root = sm.create_process(
+            system="mac01",
+            parent_pid=0,
+            image="/sbin/launchd",
+            command_line="/sbin/launchd",
+            username="root",
+            integrity_level="System",
+            os_category="macos",
+        )
+        versions: list[int] = []
+        # Build events out of time order, as the generator can.
+        for minutes in (30, 5, 60, 15):
+            sm.set_current_time(base + timedelta(minutes=minutes))
+            pid = sm.create_process(
+                system="mac01",
+                parent_pid=root,
+                image="/bin/zsh",
+                command_line="-zsh",
+                username="alice",
+                integrity_level="Medium",
+                os_category="macos",
+            )
+            versions.append(sm.get_pidversion("mac01", pid))
+
+        by_time = [versions[1], versions[3], versions[0], versions[2]]
+        assert by_time == sorted(by_time)
+        assert len(set(versions)) == len(versions)
+        assert min(versions) > 100_000
+
+    def test_macos_pids_increase_with_time_regardless_of_build_order(self):
+        sm = StateManager()
+        base = datetime(2024, 6, 11, 9, 0, 0, tzinfo=UTC)
+        sm.set_current_time(base)
+        root = sm.create_process(
+            system="mac01",
+            parent_pid=0,
+            image="/sbin/launchd",
+            command_line="/sbin/launchd",
+            username="root",
+            integrity_level="System",
+            os_category="macos",
+        )
+        pids: dict[int, int] = {}
+        for minutes in (40, 10, 25):
+            sm.set_current_time(base + timedelta(minutes=minutes))
+            pids[minutes] = sm.create_process(
+                system="mac01",
+                parent_pid=root,
+                image="/bin/zsh",
+                command_line="-zsh",
+                username="alice",
+                integrity_level="Medium",
+                os_category="macos",
+            )
+        assert pids[10] < pids[25] < pids[40]
+
+    def test_create_process_assigns_nonzero_pidversion(self):
+        """A process created through create_process reports a realistic pidversion."""
+        sm = StateManager()
+        sm.set_current_time(datetime(2024, 1, 15, 8, 0, 0, tzinfo=UTC))
+
+        pid = sm.create_process(
+            system="mac01",
+            parent_pid=0,
+            image="/sbin/launchd",
+            command_line="/sbin/launchd",
+            username="root",
+            integrity_level="System",
+            os_category="macos",
+        )
+
+        assert sm.get_pidversion("mac01", pid) > 100_000
 
 
 def _final_connection_transaction(

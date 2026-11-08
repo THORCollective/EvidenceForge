@@ -32,6 +32,7 @@ from evidenceforge.models.scenario import Scenario, System
 # OS detection patterns (mirrors generation/activity.py)
 _WINDOWS_PATTERNS = ["windows"]
 _LINUX_PATTERNS = ["linux", "ubuntu", "centos", "debian", "rhel"]
+_MACOS_PATTERNS = ["macos", "mac os", "darwin", "osx"]
 
 # Web server service patterns
 _WEB_SERVICE_PATTERNS = ["http", "iis", "nginx", "apache", "web"]
@@ -44,6 +45,8 @@ def _get_os_category(os_string: str) -> str:
         return "windows"
     if any(p in os_lower for p in _LINUX_PATTERNS):
         return "linux"
+    if any(p in os_lower for p in _MACOS_PATTERNS):
+        return "macos"
     return "unknown"
 
 
@@ -103,6 +106,8 @@ class VisibilityModel:
             elif os_cat == "linux":
                 formats.add("syslog")
                 formats.add("bash_history")
+            elif os_cat == "macos":
+                formats.add("eslogger")
 
             # eCAR is optional on any OS
             if "ecar" in enabled_formats:
@@ -160,7 +165,7 @@ class VisibilityModel:
 
         Groups:
           - host_local: formats installed on the host (windows_event_security,
-            syslog, bash_history, ecar)
+            syslog, bash_history, ecar, eslogger)
           - network: sensor-based network formats (zeek_*, snort, web_access,
             proxy_access)
 
@@ -182,6 +187,7 @@ class VisibilityModel:
             "syslog",
             "bash_history",
             "ecar",
+            "eslogger",
         }
         host_local = host_formats & host_local_formats
         transport_types = {

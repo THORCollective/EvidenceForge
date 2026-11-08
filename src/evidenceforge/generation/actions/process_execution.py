@@ -274,6 +274,9 @@ class ProcessExecutionRequest:
     require_exact_parent: bool = field(default=False, kw_only=True)
     requested_endpoint_effects: tuple[PreparedEndpointEffect, ...] = ()
     source: str = "activity_generator"
+    # Explicit working directory; derived when empty. Keyword-only so appending it
+    # cannot reinterpret positional callers.
+    current_directory: str = field(default="", kw_only=True)
     effect_plan: ExecutionEffectPlan | None = field(default=None, compare=False, repr=False)
     prepared_effects: ProcessExecutionPreparedEffects | None = field(
         default=None,

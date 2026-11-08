@@ -319,6 +319,7 @@ def _sensor(
 
 _WINDOWS = frozenset({"windows"})
 _LINUX = frozenset({"linux"})
+_MACOS = frozenset({"macos"})
 _ENDPOINT_PLATFORMS = frozenset({"windows", "linux"})
 
 DEFAULT_SOURCE_CATALOG = SourceCatalog(
@@ -387,6 +388,19 @@ DEFAULT_SOURCE_CATALOG = SourceCatalog(
             "bash_history",
             CollectionCapability.PROCESS | CollectionCapability.COHERENT_ACTOR,
             _LINUX,
+        ),
+        _host(
+            "eslogger",
+            "eslogger",
+            # macOS Endpoint Security has no network-connect events by design;
+            # network evidence for macOS hosts comes from sensors (Zeek).
+            CollectionCapability.PROCESS
+            | CollectionCapability.AUTHENTICATION
+            | CollectionCapability.SESSION
+            | CollectionCapability.FILE
+            | CollectionCapability.SSH
+            | _ENDPOINT_ACTOR,
+            _MACOS,
         ),
         _host(
             "proxy_access",

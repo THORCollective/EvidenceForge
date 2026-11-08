@@ -126,6 +126,7 @@ systems and sensors.
 | eCAR | Simulated EDR/XDR telemetry for processes, files, flows, registry, modules, threads, user sessions, and services |
 | Linux syslog | Authentication, session, service, package, scheduler, maintenance, firewall, Samba, and other role-aware system activity |
 | Bash history | Per-user timestamped command history |
+| macOS Endpoint Security (eslogger) | `eslogger`-style ESF NDJSON: process fork/exec/exit with full argv and code-signing identity, file create/open/write/rename/unlink, openssh_login/logout, lw_session lock/unlock, sudo/su, and BTM launch-item persistence |
 | Snort/Suricata alerts | Fast-format IDS alerts with sensor-aware filtering and correlation to network evidence |
 | Cisco ASA | Connection, teardown, deny, NAT, and threat-detection syslog from modeled firewall control points |
 | Web access | Apache/Nginx combined text or Splunk-compatible JSON, depending on the output target |

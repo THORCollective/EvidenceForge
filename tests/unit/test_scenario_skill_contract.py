@@ -80,6 +80,7 @@ EVENT_REFERENCE_BY_TYPE = {
             "workstation_lock",
             "workstation_unlock",
             "raw",
+            "file",
         )
     },
     **{

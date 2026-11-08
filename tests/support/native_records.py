@@ -44,3 +44,24 @@ def render_record(tmp_path: Path, case: dict) -> str:
         return raw
     finally:
         emitter.close()
+
+
+def json_field_slot(obj: dict, format_name: str, field: str) -> tuple[dict, str]:
+    """Return the container and key that hold one validation field in a native JSON record.
+
+    eCAR nests most fields under ``properties``; eslogger records are nested ES
+    messages whose validation fields are dotted paths (``process.audit_token.pid``).
+    """
+    if format_name == "eslogger":
+        container = obj
+        *parents, leaf = field.split(".")
+        for part in parents:
+            child = container.get(part)
+            if not isinstance(child, dict):
+                child = {}
+                container[part] = child
+            container = child
+        return container, leaf
+    if format_name == "ecar" and field not in obj:
+        return obj.setdefault("properties", {}), field
+    return obj, field

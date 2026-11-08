@@ -334,7 +334,14 @@ class ProcessPreflightPlanner:
             "psexesvc.exe",
             "healthmonitorsvc.exe",
         }
-        if request.ensure_file_event and not bundle_owned_service_payload:
+        # A macOS process cannot write its own executable after exec: the image
+        # was dropped earlier by a downloader/installer outside this process, so
+        # there is no process-owned image create to guarantee.
+        if (
+            request.ensure_file_event
+            and not bundle_owned_service_payload
+            and os_category != "macos"
+        ):
             lower_path = process_name.lower()
             windows_path = lower_path.replace("/", "\\")
             is_system_binary = (

@@ -15,7 +15,8 @@ explicit credentials · workstation state · raw escape hatch
 ## `process`
 
 Fields: `type`, required `process_name`, optional `command_line`, `process_ref`, `parent_ref`,
-`supplementary`, `technique`, and `description`. `command_line` defaults to the process name at
+`working_directory`, `supplementary`, `technique`, and `description`. `working_directory` sets the
+process cwd (Sysmon `CurrentDirectory`, eslogger `exec.cwd`) and is derived when omitted. `command_line` defaults to the process name at
 generation time. Use unique `process_ref` values only when later children need exact lineage;
 `parent_ref` names an earlier durable reference. `supplementary` is `auto` (default) or `none`.
 
@@ -25,6 +26,26 @@ generation time. Use unique `process_ref` values only when later children need e
   command_line: curl -fsS https://updates.example/status
   process_ref: status-check
   supplementary: auto
+```
+
+## `file`
+
+Fields: `type`, required `path`, optional `action` (`create` default, `modify`, `delete`, `read`,
+`open`, `write`, `rename`, `unlink`), `pid`, `process_ref`, `technique`, and `description`. The
+actor is `pid`, else the named earlier `process_ref`, else the most recent storyline process on
+the system; always give file events a resolvable actor. `path` is literal (no `~` expansion).
+`open`/`write`/`rename`/`unlink` render only on macOS (eslogger). A `create` under
+`LaunchAgents`/`LaunchDaemons` automatically adds the macOS `btm_launch_item_add` event; never
+author BTM events directly. For such a plist, optional `launch_program` names the program the
+plist runs (the BTM `executable_path`; defaults to the writer). A later `process` event that
+starts exactly that program on the same Mac is parented by launchd, as `launchctl` would start it.
+
+```yaml
+- type: file
+  path: /Users/riley.chen/Library/LaunchAgents/com.apple.WindowServer.plist
+  action: create
+  launch_program: /Users/Shared/.ws/WindowServerHelper
+  process_ref: persistence-helper
 ```
 
 ## `logon`

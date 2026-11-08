@@ -455,3 +455,193 @@ linux:
     lifetime: long
     children:
       - runc
+
+macos:
+  # On macOS, launchd (PID 1) launches the per-user GUI session agents and --
+  # via LaunchServices -- every app bundle, so apps opened from the Dock,
+  # Finder or Spotlight all report ppid 1. Terminal starts login(1), which
+  # starts the user's login shell (zsh by default since macOS 10.15).
+  launchd:
+    command_templates:
+      - "/sbin/launchd"
+    lifetime: long
+    spawn_delay: [0.01, 0.5]
+    children:
+      - loginwindow
+      - sshd
+      - syslogd
+      - UserEventAgent
+      - cfprefsd
+      - mds
+      - mdworker
+      - WindowServer
+      - opendirectoryd
+      - coreaudiod
+      - bluetoothd
+      - locationd
+      - launchservicesd
+      - Dock
+      - SystemUIServer
+      - Finder
+      - Terminal
+      - Safari
+      - Google Chrome
+      - firefox
+      - Electron
+
+  loginwindow:
+    command_templates:
+      - "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow"
+    lifetime: long
+    children: []
+
+  Dock:
+    command_templates:
+      - "/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock"
+    lifetime: long
+    children: []
+
+  Terminal:
+    command_templates:
+      - "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
+    lifetime: long
+    children:
+      - login
+
+  login:
+    command_templates:
+      - "/usr/bin/login -pf {username}"
+    lifetime: long
+    spawn_delay: [0.05, 0.4]
+    children:
+      - zsh
+      - bash
+
+  Safari:
+    command_templates:
+      - "/Applications/Safari.app/Contents/MacOS/Safari"
+    lifetime: long
+    children:
+      - Safari
+
+  Google Chrome:
+    command_templates:
+      - "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    lifetime: long
+    children:
+      - Google Chrome
+
+  sshd:
+    command_templates:
+      - "/usr/sbin/sshd -i"
+    lifetime: short
+    children:
+      - zsh
+      - bash
+      - sftp-server
+
+  zsh:
+    command_templates:
+      - "-zsh"
+      - "/bin/zsh"
+    lifetime: long
+    children:
+      - vim
+      - nano
+      - code
+      - git
+      - make
+      - npm
+      - node
+      - python3
+      - pip3
+      - docker
+      - kubectl
+      - curl
+      - ssh
+      - scp
+      - rsync
+      - osascript
+      - security
+      - codesign
+      - plutil
+      - defaults
+      - launchctl
+      - sw_vers
+      - log
+      - ls
+      - cat
+      - grep
+      - find
+      - ps
+      - top
+      - df
+      - id
+      - whoami
+      - hostname
+      - w
+      - uptime
+      - chmod
+      - chown
+      - ln
+      - mv
+      - cp
+      - rm
+      - mkdir
+      - sed
+      - awk
+      - sort
+      - wc
+      - tar
+      - unzip
+      - sudo
+      - zsh
+      - bash
+      - sh
+
+  bash:
+    command_templates:
+      - "-bash"
+      - "/bin/bash"
+    lifetime: long
+    children:
+      - vim
+      - nano
+      - code
+      - git
+      - make
+      - npm
+      - node
+      - python3
+      - pip3
+      - docker
+      - kubectl
+      - curl
+      - ssh
+      - scp
+      - rsync
+      - osascript
+      - security
+      - codesign
+      - plutil
+      - defaults
+      - launchctl
+      - ls
+      - cat
+      - grep
+      - find
+      - ps
+      - top
+      - whoami
+      - id
+      - hostname
+      - chmod
+      - chown
+      - mv
+      - cp
+      - rm
+      - mkdir
+      - sudo
+      - bash
+      - zsh
+      - sh

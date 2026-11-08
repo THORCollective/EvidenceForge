@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from evidenceforge.models.scenario import EventSpec
 
-from . import administration, authentication, content, network, periodic, process
+from . import administration, authentication, content, file, network, periodic, process
 from .context import TypedEventContext
 
 if TYPE_CHECKING:
@@ -33,6 +33,7 @@ _HANDLERS = {
     "scheduled_task_created": administration.handle_scheduled_task_created,
     "log_cleared": administration.handle_log_cleared,
     "create_remote_thread": process.handle_create_remote_thread,
+    "file": file.handle_file,
     "process_access": process.handle_process_access,
     "dhcp_lease": network.handle_dhcp_lease,
     "port_scan": network.handle_port_scan,

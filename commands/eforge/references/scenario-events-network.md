@@ -27,7 +27,8 @@ Periodic events share `start_time`, exactly one of `interval` or `rate`, exactly
 Fields: `type`, required `dst_ip`, `dst_port`, `hostname`, `service`, `source_ip`, `method`, `uri`,
 `status_code`, `user_agent`, `referrer`, `request_body_len`, `request_multipart`,
 `response_body_len`, `response_multipart`, `orig_bytes`, `resp_bytes`, `conn_state`, `ids_alerts`,
-`technique`, and `description`. `dst_port` defaults to `443`. A `hostname` is a bare FQDN without
+`process_ref`, `technique`, and `description`. `dst_port` defaults to `443`. `process_ref` names an
+earlier process that owns the connection; for uploads it keeps that process as the uploader. A `hostname` is a bare FQDN without
 scheme, port, or path. HTTP fields apply when `service: http`; read the HTTP reference for body,
 file, multipart, and proxy semantics.
 

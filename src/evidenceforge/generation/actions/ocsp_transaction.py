@@ -26,6 +26,7 @@ from evidenceforge.events.cryptography import (
 )
 from evidenceforge.generation.actions.tls_certificate import TlsCertificatePlanner
 from evidenceforge.generation.activity.dns_registry import resolve_domain_ip
+from evidenceforge.generation.activity.helpers import _get_os_category
 from evidenceforge.generation.activity.proxy_user_agents import pick_proxy_user_agent
 from evidenceforge.generation.activity.tls_realism import ocsp_config, pick_ocsp_responder
 from evidenceforge.generation.cryptographic_material import CryptographicMaterialRegistry
@@ -425,6 +426,18 @@ class OcspTransactionActionBundle:
         if source_system is None:
             return None
         source_os = str(getattr(source_system, "os", "") or "")
+        # macOS centralizes certificate trust evaluation (including OCSP
+        # revocation checks) in trustd, so the OCSP fetch belongs to trustd
+        # rather than the application that opened the TLS connection.
+        initiating_pid = tls_network.initiating_pid
+        if _get_os_category(source_os) == "macos":
+            trustd_pid = (
+                getattr(self._executor, "_system_pids", {})
+                .get(source_system.hostname, {})
+                .get("trustd")
+            )
+            if trustd_pid:
+                initiating_pid = trustd_pid
         user_agent = pick_proxy_user_agent(
             random.Random(
                 _stable_seed(f"ocsp_user_agent:{plan.responder}:{tls_network.src_ip}:{source_os}")
@@ -487,7 +500,7 @@ class OcspTransactionActionBundle:
             orig_bytes=max(320, len(plan.request_der) + 220),
             resp_bytes=plan.response_size,
             emit_dns=True,
-            pid=tls_network.initiating_pid,
+            pid=initiating_pid,
             source_system=source_system,
             conn_state="SF",
             http=http,

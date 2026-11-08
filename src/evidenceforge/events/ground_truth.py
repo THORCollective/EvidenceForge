@@ -123,6 +123,12 @@ class LogoffAttributes(GroundTruthAttributesBase):
     """Logoff event attributes."""
 
 
+class FileAttributes(GroundTruthAttributesBase):
+    """File operation event attributes (macOS eslogger file events; may drive BTM)."""
+
+    path: str | None = None
+
+
 class HttpUploadAttributes(BaseModel):
     """Resolved local and wire metadata for an authored HTTP upload."""
 
@@ -373,6 +379,11 @@ class LogoffGroundTruthEvent(GroundTruthEventBase):
     attributes: LogoffAttributes = Field(default_factory=LogoffAttributes)
 
 
+class FileGroundTruthEvent(GroundTruthEventBase):
+    kind: Literal["file"]
+    attributes: FileAttributes = Field(default_factory=FileAttributes)
+
+
 class ConnectionGroundTruthEvent(GroundTruthEventBase):
     kind: Literal["connection"]
     attributes: ConnectionAttributes = Field(default_factory=ConnectionAttributes)
@@ -565,6 +576,7 @@ GroundTruthEvent = Annotated[
     | LogonGroundTruthEvent
     | FailedLogonGroundTruthEvent
     | LogoffGroundTruthEvent
+    | FileGroundTruthEvent
     | ConnectionGroundTruthEvent
     | SshSessionGroundTruthEvent
     | SmbActivityGroundTruthEvent

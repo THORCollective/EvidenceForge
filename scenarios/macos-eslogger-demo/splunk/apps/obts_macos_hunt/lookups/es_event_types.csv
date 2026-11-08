@@ -1,0 +1,17 @@
+event_type,es_event
+9,exec
+10,open
+11,fork
+12,close
+13,create
+15,exit
+25,rename
+32,unlink
+33,write
+116,lw_session_lock
+117,lw_session_unlock
+120,openssh_login
+121,openssh_logout
+124,btm_launch_item_add
+128,su
+131,sudo

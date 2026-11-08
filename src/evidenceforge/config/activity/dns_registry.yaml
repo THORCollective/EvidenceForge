@@ -23,12 +23,13 @@ valid_tags:
   background: "OS-level background HTTPS (updates, telemetry, CRL)"
   windows:    "Windows-specific background traffic"
   linux:      "Linux-specific background traffic"
+  macos:      "macOS-specific background traffic"
   internal:   "Internal infrastructure (DB servers, etc.)"
   storage:    "Cloud storage (potential exfiltration targets)"
   outlook:    "Microsoft Outlook/Exchange Online endpoints"
   teams:      "Microsoft Teams endpoints"
   onedrive:   "Microsoft OneDrive/SharePoint endpoints"
-  os_tags: [windows, linux]  # Tags that trigger OS-aware domain filtering in pick_domain_and_ip()
+  os_tags: [windows, linux, macos]  # Tags that trigger OS-aware domain filtering in pick_domain_and_ip()
   dev:        "Developer tool API endpoints"
   social:     "Social media sites"
 
@@ -190,6 +191,31 @@ domains:
   - domain: login.microsoftonline.com
     ips: ["40.126.28.17", "40.126.28.19", "20.190.159.64"]
     tags: [saas, background, outlook, teams, onedrive]
+  # === Apple (macOS background services) ===
+  - domain: swscan.apple.com
+    ips: ["17.253.17.203", "17.253.17.204"]
+    tags: [background, macos]
+  - domain: gdmf.apple.com
+    ips: ["17.32.194.98", "17.32.194.99"]
+    tags: [background, macos]
+  - domain: mesu.apple.com
+    ips: ["17.253.37.201", "17.253.37.207"]
+    tags: [background, macos]
+  - domain: configuration.apple.com
+    ips: ["17.253.17.201", "17.253.17.209"]
+    tags: [background, macos]
+  - domain: xp.apple.com
+    ips: ["17.33.200.30", "17.33.201.30"]
+    tags: [background, macos]
+  - domain: gateway.icloud.com
+    ips: ["17.248.177.66", "17.248.177.67"]
+    tags: [background, macos]
+  - domain: api.apple-cloudkit.com
+    ips: ["17.248.187.21", "17.248.187.22"]
+    tags: [background, macos]
+  - domain: gsp-ssl.ls.apple.com
+    ips: ["17.253.17.207", "17.253.17.208"]
+    tags: [background, macos]
   - domain: packages.microsoft.com
     ips: ["13.107.246.52", "13.107.246.53"]
     tags: [background, linux]

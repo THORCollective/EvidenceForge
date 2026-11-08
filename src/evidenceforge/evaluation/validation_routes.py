@@ -23,6 +23,7 @@ _NATIVE_SOURCES = (
     "bash_history",
     "cisco_asa",
     "ecar",
+    "eslogger",
     "proxy_access",
     "snort_alert",
     "syslog",

@@ -58,6 +58,8 @@ class ExpansionContext:
     command_line: str | None = None
     process_name: str | None = None
     os_category: str | None = None
+    file_path: str | None = None
+    launch_program: str | None = None
     source_system: Any = None
     target_system: Any = None
     actor: Any = None

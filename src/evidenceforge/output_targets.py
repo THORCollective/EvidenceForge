@@ -111,6 +111,12 @@ FORMAT_TARGET_POLICIES: dict[str, TargetFormatPolicy] = {
         "json",
         notes="Target-invariant EvidenceForge JSON.",
     ),
+    "eslogger": TargetFormatPolicy(
+        "eslogger",
+        "ndjson",
+        "ndjson",
+        notes="Target-invariant macOS Endpoint Security NDJSON.",
+    ),
     "syslog": TargetFormatPolicy(
         "syslog",
         default_variant="rfc5424_flat",

@@ -24,7 +24,7 @@
 
 from random import Random
 
-from evidenceforge.generation.activity.helpers import _parameterize_command
+from evidenceforge.generation.activity.helpers import _get_os_category, _parameterize_command
 
 
 def test_parameterize_command_replaces_linux_query_placeholders() -> None:
@@ -48,3 +48,32 @@ def test_parameterize_command_uses_c_source_for_gcc() -> None:
 
     assert "{c_source_file}" not in cmd
     assert cmd.endswith(".c")
+
+
+def test_get_os_category_recognizes_windows() -> None:
+    """Windows OS strings should classify as 'windows'."""
+    assert _get_os_category("Windows 10") == "windows"
+    assert _get_os_category("Windows Server 2019") == "windows"
+
+
+def test_get_os_category_recognizes_linux() -> None:
+    """Linux and common distro OS strings should classify as 'linux'."""
+    assert _get_os_category("Linux Ubuntu 20.04") == "linux"
+    assert _get_os_category("CentOS 8") == "linux"
+    assert _get_os_category("Debian 11") == "linux"
+    assert _get_os_category("RHEL 9") == "linux"
+
+
+def test_get_os_category_recognizes_macos() -> None:
+    """macOS OS strings (macos/mac os/darwin/osx substrings) should classify as 'macos'."""
+    assert _get_os_category("macOS 14.5") == "macos"
+    assert _get_os_category("Darwin") == "macos"
+    assert _get_os_category("macOS Sonoma") == "macos"
+    assert _get_os_category("OSX") == "macos"
+    assert _get_os_category("Mac OS X 10.15") == "macos"
+
+
+def test_get_os_category_unknown_fallback() -> None:
+    """Unrecognized OS strings should classify as 'unknown'."""
+    assert _get_os_category("AmigaOS") == "unknown"
+    assert _get_os_category("") == "unknown"

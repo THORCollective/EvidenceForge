@@ -865,6 +865,7 @@ LogEmitter (ABC)
 │   ├── ZeekSslEmitter               # ssl.log
 │   └── ... (10 more Zeek types)
 ├── EcarEmitter                      # eCAR NDJSON (MITRE CAR model, objectID/actorID graph via EventIdentityPlan)
+├── ESLoggerEmitter                  # macOS Endpoint Security (eslogger) NDJSON; macOS-only, per-host routing
 ├── SyslogEmitter                    # Linux syslog (default RFC5424 or sof-elk RFC3164/year)
 ├── BashHistoryEmitter               # Per-user bash history
 ├── SnortEmitter                     # Snort IDS alerts
@@ -1131,6 +1132,7 @@ at slightly different times while keeping each sensor stream internally causal.
 | `KerberosBeforeLogon` | Kerberos-auth Windows logon (not on DC) | TGT (4768) + TGS (4769) | `auth.kerberos_before_logon` timing profile; elevated-session 4672 remains tied to the target-host 4624 |
 | `ProcessAccessAfterRemoteThread` | CreateRemoteThread targeting lsass | ProcessAccess (Sysmon 10) before the remote thread | `process.remote_thread_lsass_access` timing profile |
 | `SupplementaryAuditEvents` | Process creation with admin commands | 4720/4726/4728/4697/4698/1102 | `windows.audit_from_admin_command` timing profile |
+| `PlistCreateBeforeBtmLaunchItem` | macOS `file_create` under `LaunchAgents`/`LaunchDaemons` | `btm_launch_item_add` (eslogger) after the plist create | `macos.btm_after_plist_create` timing profile |
 
 **Adding a new rule:** Create a new `ExpansionRule` subclass in `rules.py`, implement `matches()` and `expand()`, and add it to `default_rules()` in `registry.py`. The engine auto-creates with defaults — no wiring needed in ActivityGenerator or GenerationEngine.
 

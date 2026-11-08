@@ -907,6 +907,7 @@ class ProcessEventSpec(_EventSpecBase):
     command_line: str | None = None  # defaults to process_name at generation time
     process_ref: str | None = None  # Optional durable ref for explicit parent/child lineage
     parent_ref: str | None = None  # Optional process_ref to use as this process parent
+    working_directory: str | None = None  # Optional cwd (ES exec.cwd / Sysmon CurrentDirectory)
     supplementary: Literal["auto", "none"] = "auto"
 
 
@@ -953,6 +954,27 @@ class LogoffEventSpec(_EventSpecBase):
     type: Literal["logoff"] = "logoff"
 
 
+class FileEventSpec(_EventSpecBase):
+    """File operation event (generates ES file events on macOS; may drive causal expansion, e.g. BTM)."""
+
+    type: Literal["file"] = "file"
+    path: str
+    action: Literal["create", "modify", "delete", "read", "open", "write", "rename", "unlink"] = (
+        "create"
+    )
+    pid: int | None = (
+        None  # Optional explicit actor PID override; default resolves from session/process context
+    )
+    process_ref: str | None = None  # Optional earlier process_ref that performs this file action
+    launch_program: str | None = Field(
+        default=None,
+        description=(
+            "For a macOS LaunchAgents/LaunchDaemons plist create: the program the plist "
+            "launches (ES btm_launch_item_add executable_path). Defaults to the writer."
+        ),
+    )
+
+
 class ConnectionEventSpec(_IdsAttachableEventSpec):
     """Network connection event (generates Zeek conn, eCAR FLOW, optionally web_access/zeek_http)."""
 
@@ -980,6 +1002,7 @@ class ConnectionEventSpec(_IdsAttachableEventSpec):
     orig_bytes: int | None = None  # Originator payload bytes (large for exfil)
     resp_bytes: int | None = None  # Responder payload bytes (large for downloads)
     conn_state: str | None = None  # Connection outcome (default: SF for storyline)
+    process_ref: str | None = None  # Optional earlier process_ref that owns this connection
 
     @field_validator("hostname")
     @classmethod
@@ -2163,6 +2186,7 @@ EventSpec = Annotated[
     | LogonEventSpec
     | FailedLogonEventSpec
     | LogoffEventSpec
+    | FileEventSpec
     | ConnectionEventSpec
     | SmbActivityEventSpec
     | SshSessionEventSpec

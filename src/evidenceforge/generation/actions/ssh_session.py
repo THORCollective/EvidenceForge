@@ -74,7 +74,12 @@ from evidenceforge.generation.actions.network_connection import (
     DeferredSshTimingIntent,
     NetworkConnectionIdentityCapture,
 )
-from evidenceforge.generation.activity.helpers import _get_os_category, _get_rng
+from evidenceforge.generation.activity.helpers import (
+    _get_os_category,
+    _get_rng,
+    ssh_receiver_command_line,
+    ssh_receiver_parent_role,
+)
 from evidenceforge.generation.activity.timing_profiles import (
     SshAuthenticationTimingPlan,
     get_timing_window,
@@ -337,7 +342,9 @@ def _ssh_action_deadline_runtime_headrooms(
     if (
         type(source_os_categories) is not tuple
         or not source_os_categories
-        or any(os_category not in {"linux", "windows"} for os_category in source_os_categories)
+        or any(
+            os_category not in {"linux", "windows", "macos"} for os_category in source_os_categories
+        )
     ):
         raise ValueError("SSH deadline source OS categories must be a non-empty exact tuple")
     headrooms = (
@@ -777,7 +784,11 @@ class _SshTransportState:
 
 @dataclass(frozen=True, slots=True)
 class _SshLinuxAuthState:
-    """Source-native Linux SSH authentication lifecycle timestamps."""
+    """Source-native SSH authentication lifecycle timestamps.
+
+    On macOS destinations ``logind_session_id`` holds the ES audit-token
+    session id (asid); macOS has no systemd-logind.
+    """
 
     sshd_pid: int
     logind_session_id: int
@@ -956,7 +967,11 @@ class _SshCloseHostFacts:
         )
         if any(type(value) is not str or len(value) > 4_096 for value in values):
             raise ValueError("Exact SSH close host contains malformed or oversized text")
-        if not host.hostname or not host.ip or host.os_category not in {"linux", "windows"}:
+        if (
+            not host.hostname
+            or not host.ip
+            or host.os_category not in {"linux", "windows", "macos"}
+        ):
             raise ValueError("Exact SSH close host has incomplete canonical identity")
         return cls(
             hostname=host.hostname,
@@ -2778,6 +2793,11 @@ class SshSessionExecutor(Protocol):
         ...
 
 
+# Destination OSes whose sshd auth lifecycle is planned by the bundle. macOS
+# shares the timing plan but renders ES openssh events instead of syslog.
+_SSH_AUTH_PLANNED_OS = frozenset({"linux", "macos"})
+
+
 @dataclass(frozen=True, slots=True)
 class SshSessionActionBundle:
     """Action bundle for a single SSH session lifecycle."""
@@ -2916,8 +2936,12 @@ class SshSessionActionBundle:
         planning_event = self._build_session_event(state)
         auth_state = self._plan_linux_auth(state, planning_event, auth_plan)
         event = self._build_session_event(state, auth_state)
+        # macOS sshd authentication surfaces as ES openssh_login/openssh_logout
+        # (eslogger), not sshd/PAM/logind syslog.
+        emits_auth_syslog = state.dst_host.os_category == "linux"
         if auth_state is not None:
-            self._dispatch_linux_connection_message(state, event, auth_state)
+            if emits_auth_syslog:
+                self._dispatch_linux_connection_message(state, event, auth_state)
             if auth_plan is None:
                 raise StateError("SSH auth state lost its frozen timing plan")
             self._mark_edr_login_readiness(
@@ -2930,7 +2954,8 @@ class SshSessionActionBundle:
         if self.request.emit_session_close:
             self._terminate_source_ssh_client_process(state)
         if auth_state is not None:
-            self._dispatch_linux_auth_messages(state, event, auth_state)
+            if emits_auth_syslog:
+                self._dispatch_linux_auth_messages(state, event, auth_state)
             if self.request.bundle_owns_close:
                 if self.request.defer_session_close:
                     self.executor._defer_ssh_session_close(self, state, event, auth_state)
@@ -3217,11 +3242,17 @@ class SshSessionActionBundle:
         return runtime
 
     def _deferred_receiver_parent(self, receiver_start: datetime) -> tuple[int, str]:
-        """Resolve the live canonical global sshd parent, when one exists."""
+        """Resolve the live canonical parent of the per-connection sshd, when one exists.
+
+        Linux forks connections from the global ``sshd -D`` listener; macOS launchd
+        socket-activates ``sshd -i`` per connection.
+        """
 
         hostname = self.request.target_system.hostname
+        role = ssh_receiver_parent_role(_get_os_category(self.request.target_system.os))
+        expected_image = "/sbin/launchd" if role == "launchd" else "/usr/sbin/sshd"
         sys_pids = getattr(self.executor, "_system_pids", {}).get(hostname, {})
-        parent_pid = sys_pids.get("sshd")
+        parent_pid = sys_pids.get(role)
         if type(parent_pid) is not int or parent_pid <= 0:
             return 0, ""
         running = self.executor.state_manager.get_process(hostname, parent_pid)
@@ -3232,7 +3263,7 @@ class SshSessionActionBundle:
             or identity.object_id != running.ecar_object_id
             or identity.started_at != ensure_utc(running.start_time)
             or identity.started_at > ensure_utc(receiver_start)
-            or identity.image != "/usr/sbin/sshd"
+            or identity.image != expected_image
             or identity.principal.casefold() != "root"
         ):
             return 0, ""
@@ -3752,15 +3783,16 @@ class SshSessionActionBundle:
             rng=logind_rng,
             event_time=logind_time,
         )
+        target_os = _get_os_category(request.target_system.os)
         receiver_parent_pid, receiver_parent_group = self._deferred_receiver_parent(receiver_start)
         receiver_plan = batch_builder.plan_process(
             system=request.target_system.hostname,
             parent_pid=receiver_parent_pid,
             image="/usr/sbin/sshd",
-            command_line=f"sshd: {request.user.username} [priv]",
+            command_line=ssh_receiver_command_line(target_os, request.user.username),
             username="root",
             integrity_level="System",
-            os_category="linux",
+            os_category="macos" if target_os == "macos" else "linux",
             logon_id=session_plan.identity.logon_id,
             lifecycle_group_id=stable_uuid(
                 "ssh-deferred-receiver-lifecycle",
@@ -4120,7 +4152,9 @@ class SshSessionActionBundle:
                 process_image=source_process_image or "/usr/bin/ssh",
                 source_port=state.source_port,
                 required_until=(
-                    state.close_time if _get_os_category(source_system.os) == "linux" else None
+                    state.close_time
+                    if _get_os_category(source_system.os) in ("linux", "macos")
+                    else None
                 ),
             )
             if client is not None:
@@ -4890,7 +4924,11 @@ class SshSessionActionBundle:
 
         request = self.request
         executor = self.executor
-        if plan is None or not event.dst_host or event.dst_host.os_category != "linux":
+        if (
+            plan is None
+            or not event.dst_host
+            or event.dst_host.os_category not in _SSH_AUTH_PLANNED_OS
+        ):
             return None
 
         if state.logon_id:
@@ -4936,11 +4974,20 @@ class SshSessionActionBundle:
                 event,
                 resolved_times["logind"] + timedelta(milliseconds=1),
             )
-        logind_session_id = executor.state_manager.next_linux_logind_session_id(
-            request.target_system.hostname,
-            state.rng,
-            resolved_times["logind"],
-        )
+        if event.dst_host.os_category == "macos":
+            # macOS has no systemd-logind; the ES audit-token session id (asid)
+            # is the session identity carried in the same AuthContext slot.
+            logind_session_id = executor.state_manager.next_macos_audit_session_id(
+                request.target_system.hostname,
+                state.rng,
+                resolved_times["logind"],
+            )
+        else:
+            logind_session_id = executor.state_manager.next_linux_logind_session_id(
+                request.target_system.hostname,
+                state.rng,
+                resolved_times["logind"],
+            )
         if state.logon_id:
             executor.state_manager.update_session_metadata(
                 state.logon_id,
@@ -4960,7 +5007,7 @@ class SshSessionActionBundle:
         """Freeze compatibility EDR readiness before transport planning mutates state."""
 
         request = self.request
-        if _get_os_category(request.target_system.os) != "linux":
+        if _get_os_category(request.target_system.os) not in _SSH_AUTH_PLANNED_OS:
             return None
         timing_runtime = getattr(self.executor, "timing_runtime", None)
         if type(timing_runtime) is not TimingRuntime:
@@ -5018,7 +5065,7 @@ class SshSessionActionBundle:
         """Resolve Linux SSH responder identity before opening canonical transport."""
 
         request = self.request
-        if state.dst_host.os_category != "linux":
+        if state.dst_host.os_category not in _SSH_AUTH_PLANNED_OS:
             return None
 
         timing_runtime = getattr(self.executor, "timing_runtime", None)
@@ -5613,7 +5660,7 @@ class SshSessionActionBundle:
         logind_complete = bool(
             continuation is not None
             and continuation.recover_projection("logind-remove", self.executor.dispatcher)
-        )
+        ) or (continuation is None and state.dst_host.os_category != "linux")
         if not logind_complete:
             try:
                 self._dispatch_linux_logind_removed(
@@ -5679,19 +5726,23 @@ class SshSessionActionBundle:
                 ),
                 logon_type=10,
             ),
-            syslog=SyslogContext(
-                app_name="sshd",
-                pid=(
-                    continuation.plan.auth_state.sshd_pid
-                    if continuation is not None
-                    else auth_state.sshd_pid
-                ),
-                facility=10,
-                severity=6,
-                message=(
-                    "pam_unix(sshd:session): session closed for user "
-                    f"{continuation.plan.username if continuation is not None else request.user.username}"
-                ),
+            syslog=(
+                SyslogContext(
+                    app_name="sshd",
+                    pid=(
+                        continuation.plan.auth_state.sshd_pid
+                        if continuation is not None
+                        else auth_state.sshd_pid
+                    ),
+                    facility=10,
+                    severity=6,
+                    message=(
+                        "pam_unix(sshd:session): session closed for user "
+                        f"{continuation.plan.username if continuation is not None else request.user.username}"
+                    ),
+                )
+                if continuation is not None or state.dst_host.os_category == "linux"
+                else None
             ),
         )
         if continuation is None:

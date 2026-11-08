@@ -11,11 +11,13 @@
   observation_profile: complete (explicit default — preserves training-friendly complete source
   coverage; use non-default profiles only when specifically testing collection gaps).
 
-  Systems (mix of Windows and Linux, ~20+ total):
+  Systems (mix of Windows, Linux, and macOS, ~20+ total):
   - One workstation per user, distributed across departments: dev, IT,
   security, finance, data analytics, executive, PM, HR, sales, legal, marketing, front desk
   - Most workstations are Windows 10/11, but at least 3 users have Linux desktops (Ubuntu 22.04,
   type: workstation): typically developers and data analysts who prefer Linux for their daily work
+  - At least 1 user has a macOS desktop (os: "macOS 14.4", type: workstation) — e.g. a designer or
+  marketing user — to exercise the `eslogger` (Endpoint Security) log format
   - 2 Windows servers: DC-01 (domain controller, Server 2022), FILE-SRV-01 (file server, Server 2019)
   - 5 Linux servers: WEB-EXT-01 (Ubuntu, web server in DMZ with roles: [web_server],
   public_hostnames: ["ehr-portal.meridianhcs.com"]), PROXY-01 (Ubuntu,
@@ -82,8 +84,8 @@
   - Service account (svc_backup) authenticating from an unusual host (not its normal server) —
     legitimate scheduled task migration, but looks like lateral movement.
 
-  All 9 log format groups: windows, zeek, ecar, syslog, bash_history, snort_alert, cisco_asa,
-   web_access, proxy_access.
+  All 10 log format groups: windows, zeek, ecar, eslogger, syslog, bash_history, snort_alert,
+   cisco_asa, web_access, proxy_access.
   (Note: "windows" expands to windows_event_security + windows_event_sysmon; "zeek" expands to
    zeek_conn, zeek_dns, zeek_http, zeek_ssl, zeek_files, zeek_dhcp, zeek_ntp, zeek_weird,
    zeek_x509, zeek_ocsp, zeek_pe, zeek_packet_filter, zeek_reporter — 22 individual formats total.)
@@ -191,11 +193,15 @@
   29. Logoff (+13h30m): Attacker logs off from compromised systems (logoff events).
 
   Key requirements:
-  - Exercise all 29 storyline event types: process, logon, failed_logon, logoff, connection,
+  - Exercise all 30 storyline event types: process, logon, failed_logon, logoff, connection,
   ssh_session, rdp_session, account_created, account_deleted, group_member_added, service_installed,
-  scheduled_task_created, log_cleared, create_remote_thread, process_access, dhcp_lease, port_scan,
-  beacon, dns_query, web_scan, credential_spray, dga_queries, dns_tunnel, explicit_credentials,
-  workstation_lock, workstation_unlock, spillage, adversarial_payload, raw
+  scheduled_task_created, log_cleared, create_remote_thread, process_access, file, dhcp_lease,
+  port_scan, beacon, dns_query, web_scan, credential_spray, dga_queries, dns_tunnel,
+  explicit_credentials, workstation_lock, workstation_unlock, spillage, adversarial_payload, raw
+  - NOTE: `file` renders as Sysmon 11/eCAR file events on Windows/Linux and as macOS eslogger file
+  events on macOS (create/open/write/rename/unlink); a create under LaunchAgents/LaunchDaemons on
+  the macOS host also auto-generates btm_launch_item_add via causal expansion — do not declare it
+  manually
   - NOTE: spillage emits a synthetic, provably-fake credential into a semantic surface
   (shell_history/process_command_line/syslog_message, or http_request_url/http_referrer which
   require a roles:[web_server] host). Full machine-readable labels live in

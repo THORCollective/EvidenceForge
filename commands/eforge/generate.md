@@ -150,5 +150,6 @@ Read only the smallest relevant reference when exact paths, fields, joins, or li
 - `/eforge:references:evidence-network-ids` for Zeek, IDS, and Cisco ASA.
 - `/eforge:references:evidence-web-email` for HTTP/files, web, proxy, email, and SMTP.
 - `/eforge:references:evidence-endpoint-linux` for eCAR, Linux syslog, and bash history.
+- `/eforge:references:evidence-endpoint-macos` for macOS Endpoint Security (eslogger).
 
 Read `/eforge:references:record-validation` for validation policy and compatibility.

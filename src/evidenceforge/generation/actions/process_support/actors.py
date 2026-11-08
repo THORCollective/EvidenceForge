@@ -58,6 +58,51 @@ from .scheduling import ProcessLaunchScheduler
 logger = logging.getLogger(__name__)
 
 
+_MACOS_DEV_TOOLS = frozenset(
+    {"git", "node", "npm", "npx", "make", "python3", "cargo", "go", "docker"}
+)
+_MACOS_DEV_REPOS = ("webapp", "api-service", "design-system", "infra", "data-tools")
+
+
+def derive_macos_current_directory(
+    *,
+    hostname: str,
+    username: str,
+    process_name: str,
+    command_line: str,
+    parent_image: str,
+) -> str:
+    """Derive a macOS process working directory (ES ``exec.cwd``).
+
+    LaunchServices starts app bundles (and launchd starts daemons) with a
+    working directory of ``/``; root's home is ``/var/root``; interactive users
+    live under ``/Users``. Shell-launched developer tools run from a project
+    checkout, and npm lifecycle scripts run from their package directory.
+    """
+    account = username.split("\\")[-1]
+    parent_exe = parent_image.rsplit("/", 1)[-1]
+    if ".app/Contents/MacOS/" in process_name or parent_exe == "launchd":
+        return "/"
+    if account == "root":
+        # Daemon-spawned root helpers (e.g. sshd's privsep child) inherit "/";
+        # only root's interactive shells run from its home.
+        return "/var/root" if parent_exe in {"zsh", "bash", "sh", "sudo", "su"} else "/"
+    if not account or account.startswith("_") or account in _SYSTEM_ACCOUNTS:
+        return "/"
+    for token in command_line.split():
+        head, marker, tail = token.partition("/node_modules/")
+        if marker and head.startswith("/Users/"):
+            parts = tail.split("/")
+            depth = 2 if parts[0].startswith("@") and len(parts) > 1 else 1
+            return f"{head}{marker}{'/'.join(parts[:depth])}"
+    if process_name.rsplit("/", 1)[-1] in _MACOS_DEV_TOOLS:
+        repo = _MACOS_DEV_REPOS[
+            _stable_seed(f"macos_repo:{hostname}:{account}") % len(_MACOS_DEV_REPOS)
+        ]
+        return f"/Users/{account}/dev/{repo}"
+    return f"/Users/{account}"
+
+
 @dataclass(frozen=True)
 class ProcessActorResolver:
     """Ephemeral operations; injected maps and managers remain on their existing owners."""
@@ -365,6 +410,24 @@ class ProcessActorResolver:
         )
         return shell_ready
 
+    def _derive_macos_current_directory(
+        self,
+        system: System,
+        username: str,
+        process_name: str,
+        command_line: str,
+        parent_pid: int,
+    ) -> str:
+        """Derive a macOS process working directory (ES ``exec.cwd``)."""
+        return derive_macos_current_directory(
+            hostname=system.hostname,
+            username=username,
+            process_name=process_name,
+            command_line=command_line,
+            parent_image=self.queries._lookup_process_name(system.hostname, parent_pid, "macos")
+            or "",
+        )
+
     def _derive_current_directory(
         self,
         system: System,
@@ -375,6 +438,10 @@ class ProcessActorResolver:
         logon_type: int = 2,
     ) -> str:
         """Derive a source-native process working directory for Sysmon Event 1."""
+        if _get_os_category(system.os) == "macos":
+            return self._derive_macos_current_directory(
+                system, username, process_name, command_line, parent_pid
+            )
         if _get_os_category(system.os) != "windows":
             account = username.split("\\")[-1]
             return (

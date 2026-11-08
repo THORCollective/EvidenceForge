@@ -186,6 +186,19 @@ def handle_connection(
     elif source_ip == system.ip:
         src_sys = system
     story_pid, story_image = self._last_storyline_process_for_system(src_sys)
+    explicit_owner = (
+        self._storyline_process_ref_for_parent(
+            actor=actor,
+            system=src_sys,
+            parent_ref=getattr(spec, "process_ref", None),
+        )
+        if src_sys is not None
+        else None
+    )
+    if explicit_owner is not None and self.state_manager.get_process(
+        src_sys.hostname, explicit_owner[0]
+    ):
+        story_pid, story_image = explicit_owner
     story_proc = (
         self.state_manager.get_process(src_sys.hostname, story_pid)
         if story_pid > 0 and src_sys is not None
@@ -287,15 +300,21 @@ def handle_connection(
     s_conn_state = spec.conn_state or "SF"
     story_command = story_command or story_image or ""
     if _is_exfil_connection_spec(spec):
-        story_pid, story_image, story_command = self._ensure_storyline_upload_process_for_exfil(
-            actor=actor,
-            system=src_sys,
-            time=time,
-            spec=spec,
-            current_pid=story_pid,
-            current_image=story_image,
-            rng=rng,
-        )
+        if explicit_owner is not None and story_pid == explicit_owner[0]:
+            # The author named the uploading process (e.g. native malware doing
+            # its own HTTP); don't substitute a browser or curl uploader for it.
+            owner = self.state_manager.get_process(src_sys.hostname, story_pid)
+            story_command = owner.command_line if owner is not None else story_command
+        else:
+            story_pid, story_image, story_command = self._ensure_storyline_upload_process_for_exfil(
+                actor=actor,
+                system=src_sys,
+                time=time,
+                spec=spec,
+                current_pid=story_pid,
+                current_image=story_image,
+                rng=rng,
+            )
         if http_ctx is not None:
             upload_user_agent = self._storyline_http_user_agent_for_process(
                 system=src_sys,

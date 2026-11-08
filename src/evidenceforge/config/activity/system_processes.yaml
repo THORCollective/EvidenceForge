@@ -1538,3 +1538,92 @@ system_binaries:
     - exe: "pip3"
       path: "/usr/bin/pip3"
       release_policy: host_build
+
+  macos:
+    # --- Core OS boot / session processes ---
+    - exe: "launchd"
+      path: "/sbin/launchd"
+      release_policy: host_build
+    - exe: "loginwindow"
+      path: "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow"
+      release_policy: host_build
+    - exe: "Dock"
+      path: "/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock"
+      release_policy: host_build
+    - exe: "SystemUIServer"
+      path: "/System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer"
+      release_policy: host_build
+    - exe: "Finder"
+      path: "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"
+      release_policy: host_build
+    - exe: "Terminal"
+      path: "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
+      release_policy: host_build
+    - exe: "WindowServer"
+      path: "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer"
+      release_policy: host_build
+    # --- System daemons ---
+    - exe: "syslogd"
+      path: "/usr/sbin/syslogd"
+      release_policy: host_build
+    - exe: "UserEventAgent"
+      path: "/usr/libexec/UserEventAgent"
+      release_policy: host_build
+    - exe: "cfprefsd"
+      path: "/usr/sbin/cfprefsd"
+      release_policy: host_build
+    - exe: "mds"
+      path: "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds"
+      release_policy: host_build
+    - exe: "mdworker"
+      path: "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mdworker_shared"
+      release_policy: host_build
+    - exe: "opendirectoryd"
+      path: "/usr/libexec/opendirectoryd"
+      release_policy: host_build
+    - exe: "coreaudiod"
+      path: "/usr/sbin/coreaudiod"
+      release_policy: host_build
+    - exe: "bluetoothd"
+      path: "/usr/sbin/bluetoothd"
+      release_policy: host_build
+    - exe: "locationd"
+      path: "/usr/libexec/locationd"
+      release_policy: host_build
+    - exe: "launchservicesd"
+      path: "/System/Library/CoreServices/launchservicesd"
+      release_policy: host_build
+    - exe: "sshd"
+      path: "/usr/sbin/sshd"
+      release_policy: host_build
+    - exe: "login"
+      path: "/usr/bin/login"
+      release_policy: host_build
+    # --- CLI / admin tools ---
+    - exe: "osascript"
+      path: "/usr/bin/osascript"
+      release_policy: host_build
+    - exe: "security"
+      path: "/usr/bin/security"
+      release_policy: host_build
+    - exe: "codesign"
+      path: "/usr/bin/codesign"
+      release_policy: host_build
+    - exe: "plutil"
+      path: "/usr/bin/plutil"
+      release_policy: host_build
+    - exe: "defaults"
+      path: "/usr/bin/defaults"
+      release_policy: host_build
+    - exe: "launchctl"
+      path: "/bin/launchctl"
+      release_policy: host_build
+    - exe: "sw_vers"
+      path: "/usr/bin/sw_vers"
+      release_policy: host_build
+    - exe: "log"
+      path: "/usr/bin/log"
+      release_policy: host_build
+    - exe: "sudo"
+      path: "/usr/bin/sudo"
+      release_policy: host_build

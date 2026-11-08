@@ -565,5 +565,221 @@
       ],
       "TTLs": []
     }
+  },
+  {
+    "rule": "eslogger.record-1",
+    "pass": {
+      "schema_version": 1,
+      "time": "2024-01-15T10:00:00.000000001Z",
+      "mach_time": 1,
+      "seq_num": 1,
+      "global_seq_num": 1,
+      "event_type": 1,
+      "version": 1,
+      "thread.thread_id": 1,
+      "process.audit_token.pid": 1
+    },
+    "fail": {
+      "time": "2024-01-15T10:00:00.000000001Z",
+      "mach_time": 1,
+      "seq_num": 1,
+      "global_seq_num": 1,
+      "event_type": 1,
+      "version": 1,
+      "thread.thread_id": 1,
+      "process.audit_token.pid": 1
+    }
+  },
+  {
+    "rule": "eslogger.record-2",
+    "pass": {
+      "event_type": 9,
+      "event.exec.args": [
+        "x"
+      ]
+    },
+    "fail": {
+      "event_type": 9
+    }
+  },
+  {
+    "rule": "eslogger.record-3",
+    "pass": {
+      "event_type": 9,
+      "event.exec.target.signing_id": "x",
+      "event.exec.target.cdhash": "x",
+      "event.exec.target.is_platform_binary": true,
+      "event.exec.target.audit_token.pid": 1
+    },
+    "fail": {
+      "event_type": 9,
+      "event.exec.target.cdhash": "x",
+      "event.exec.target.is_platform_binary": true,
+      "event.exec.target.audit_token.pid": 1
+    }
+  },
+  {
+    "rule": "eslogger.record-4",
+    "pass": {
+      "event_type": 11,
+      "event.fork.child.audit_token.pid": 1,
+      "event.fork.child.audit_token.pidversion": 1
+    },
+    "fail": {
+      "event_type": 11,
+      "event.fork.child.audit_token.pidversion": 1
+    }
+  },
+  {
+    "rule": "eslogger.record-5",
+    "pass": {
+      "event_type": 15,
+      "process.audit_token.pid": 1,
+      "process.audit_token.pidversion": 1
+    },
+    "fail": {
+      "event_type": 15,
+      "process.audit_token.pidversion": 1
+    }
+  },
+  {
+    "rule": "eslogger.record-6",
+    "pass": {
+      "event_type": 13,
+      "event.create.destination.existing_file.path": "x"
+    },
+    "fail": {
+      "event_type": 13
+    }
+  },
+  {
+    "rule": "eslogger.record-7",
+    "pass": {
+      "event_type": 10,
+      "event.open.file.path": "x"
+    },
+    "fail": {
+      "event_type": 10
+    }
+  },
+  {
+    "rule": "eslogger.record-8",
+    "pass": {
+      "event_type": 33,
+      "event.write.target.path": "x"
+    },
+    "fail": {
+      "event_type": 33
+    }
+  },
+  {
+    "rule": "eslogger.record-9",
+    "pass": {
+      "event_type": 25,
+      "event.rename.source.path": "x"
+    },
+    "fail": {
+      "event_type": 25
+    }
+  },
+  {
+    "rule": "eslogger.record-10",
+    "pass": {
+      "event_type": 32,
+      "event.unlink.target.path": "x"
+    },
+    "fail": {
+      "event_type": 32
+    }
+  },
+  {
+    "rule": "eslogger.record-11",
+    "pass": {
+      "event_type": 124,
+      "event.btm_launch_item_add.item.item_url": "x",
+      "event.btm_launch_item_add.item.item_type": 1,
+      "event.btm_launch_item_add.executable_path": "x"
+    },
+    "fail": {
+      "event_type": 124,
+      "event.btm_launch_item_add.item.item_type": 1,
+      "event.btm_launch_item_add.executable_path": "x"
+    }
+  },
+  {
+    "rule": "eslogger.record-12",
+    "pass": {
+      "event_type": 120,
+      "event.openssh_login.username": "x",
+      "event.openssh_login.source_address": "x"
+    },
+    "fail": {
+      "event_type": 120,
+      "event.openssh_login.source_address": "x"
+    }
+  },
+  {
+    "rule": "eslogger.record-13",
+    "pass": {
+      "event_type": 121,
+      "event.openssh_logout.username": "x",
+      "event.openssh_logout.source_address": "x"
+    },
+    "fail": {
+      "event_type": 121,
+      "event.openssh_logout.source_address": "x"
+    }
+  },
+  {
+    "rule": "eslogger.record-14",
+    "pass": {
+      "event_type": 116,
+      "event.lw_session_lock.username": "x",
+      "event.lw_session_lock.graphical_session_id": 1
+    },
+    "fail": {
+      "event_type": 116,
+      "event.lw_session_lock.graphical_session_id": 1
+    }
+  },
+  {
+    "rule": "eslogger.record-15",
+    "pass": {
+      "event_type": 117,
+      "event.lw_session_unlock.username": "x",
+      "event.lw_session_unlock.graphical_session_id": 1
+    },
+    "fail": {
+      "event_type": 117,
+      "event.lw_session_unlock.graphical_session_id": 1
+    }
+  },
+  {
+    "rule": "eslogger.record-16",
+    "pass": {
+      "event_type": 131,
+      "event.sudo.from_username": "x",
+      "event.sudo.to_username": "x",
+      "event.sudo.success": true
+    },
+    "fail": {
+      "event_type": 131,
+      "event.sudo.to_username": "x",
+      "event.sudo.success": true
+    }
+  },
+  {
+    "rule": "eslogger.record-17",
+    "pass": {
+      "event_type": 128,
+      "event.su.from_username": "x",
+      "event.su.to_username": "x",
+      "event.su.success": true
+    },
+    "fail": {
+      "event_type": 128,
+      "event.su.to_username": "x",
+      "event.su.success": true
+    }
   }
 ]
