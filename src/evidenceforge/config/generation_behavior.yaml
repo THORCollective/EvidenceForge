@@ -1,7 +1,7 @@
 schema_version: "1.0"
-current_revision: 161
+current_revision: 163
 history_start_revision: 1
-behavior_surface_sha256: 19a73c25c55b3f283605600613fadcc7f156090cf355145b0447a69149b0601c
+behavior_surface_sha256: c58a955085f1df4d4f4934a7a791dc3de71ecdd66d9c030ddde42b5dce1a96eb
 changes:
   - revision: 1
     id: initial-generation-behavior-contract
@@ -1624,3 +1624,19 @@ changes:
     formats:
       - eslogger
     summary: One asid per macOS login (SSH and console, incl. user agents and lw_session events); service-LogonID daemons in the system session; disjoint fallback asid band.
+  - revision: 162
+    id: macos-ssh-session-process-tree
+    impact: localized
+    domains:
+      - macos-endpoint-telemetry
+      - ssh-session-lifecycle
+    formats:
+      - eslogger
+    summary: Parent a macOS SSH login shell to the per-connection sshd -i, and run commands typed in a macOS SSH session under that session's shell.
+  - revision: 163
+    id: red-herring-step-exit-release
+    impact: localized
+    domains:
+      - storyline-process-lifecycle
+    formats: []
+    summary: When only unreferenced process events remain in a red-herring step, release its finished processes at their own planned exits instead of together after the last event.

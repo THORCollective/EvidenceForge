@@ -3321,6 +3321,57 @@ class StorylineMixin:
             }
         )
 
+    def _release_unreferenced_step_terminations(
+        self,
+        *,
+        step_pending_start: int,
+        later_specs: list[Any],
+        actor: User,
+        system: System,
+        release_time: datetime,
+    ) -> None:
+        """Release a red-herring step's finished commands at their own planned exits.
+
+        Holding every process of a step until its last event made unrelated
+        commands (``sw_vers``, ``diskutil``) exit together, minutes late. Only
+        processes a later event in the same step references (``process_ref`` /
+        ``parent_ref``) still need to outlive that event; they are reconsidered
+        after each later event. Network, file and other non-process events can
+        attach to an earlier process implicitly, so while any remains in the
+        step nothing is released early.
+        """
+        pending = getattr(self, "_pending_story_process_terminations", [])
+        if len(pending) <= step_pending_start:
+            return
+        if any(getattr(spec, "type", None) != "process" for spec in later_specs):
+            return
+        refs = getattr(self, "_storyline_process_refs", {})
+        referenced_pids = set()
+        for spec in later_specs:
+            for ref in (getattr(spec, "process_ref", None), getattr(spec, "parent_ref", None)):
+                bound = refs.get((system.hostname, actor.username, ref)) if ref else None
+                if bound is not None:
+                    referenced_pids.add(bound[0])
+        earlier = pending[:step_pending_start]
+        step_items = pending[step_pending_start:]
+        releasable: list[dict[str, Any]] = []
+        held: list[dict[str, Any]] = []
+        for item in step_items:
+            if item.get("release_storyline_index") is None and not (
+                item["system"] == system.hostname and item["pid"] in referenced_pids
+            ):
+                releasable.append(item)
+            else:
+                held.append(item)
+        if not releasable:
+            return
+        self._pending_story_process_terminations = releasable
+        try:
+            self._flush_story_process_terminations(release_time=release_time)
+        finally:
+            still_pending = self._pending_story_process_terminations
+            self._pending_story_process_terminations = earlier + still_pending + held
+
     def _flush_story_process_terminations(
         self,
         *,
@@ -4092,6 +4143,7 @@ class StorylineMixin:
         previous_cluster = getattr(self.dispatcher, "storyline_cluster_id", None)
         self.dispatcher.storyline_cluster_id = f"red_herring:{rh_event.id}"
         cumulative_rdp_shift = timedelta(0)
+        step_pending_start = len(getattr(self, "_pending_story_process_terminations", []))
         try:
             for i, spec in enumerate(rh_event.events):
                 intent = self.authored_intent_ledger.intent_at(
@@ -4146,6 +4198,13 @@ class StorylineMixin:
                         result["intent_id"] = intent.intent_id
                         result["explanation"] = rh_event.explanation
                         self.red_herring_events.append(result)
+                    self._release_unreferenced_step_terminations(
+                        step_pending_start=step_pending_start,
+                        later_specs=rh_event.events[i + 1 :],
+                        actor=actor,
+                        system=system,
+                        release_time=event_t,
+                    )
                 finally:
                     self.dispatcher.authored_intent_id = previous_intent_id
             self._flush_story_process_terminations(

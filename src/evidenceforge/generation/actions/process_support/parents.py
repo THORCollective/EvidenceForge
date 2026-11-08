@@ -720,6 +720,22 @@ class ProcessParentResolver:
             )
             if selected is not None:
                 return selected
+        if (
+            os_cat == "macos"
+            and active_session is not None
+            and active_session.session_kind == "ssh"
+            and (
+                not possible_parents
+                or any(parent in {"bash", "sh", "zsh"} for parent in possible_parents)
+            )
+        ):
+            # A command typed in an SSH session runs under that session's login
+            # shell (sshd -i -> -zsh), not a newly built Terminal -> login chain.
+            ssh_shell_pid = self.queries._active_session_shell_pid(
+                system, user, time, active_session.logon_id
+            )
+            if ssh_shell_pid is not None:
+                return ssh_shell_pid
 
         if not possible_parents:
             # No rules for this exe — fall back to legacy logic

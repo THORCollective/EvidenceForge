@@ -415,3 +415,39 @@ def test_authored_egress_resolves_after_its_process_starts(
         assert lookups, f"no DNS lookup for {name}"
         first = datetime.fromtimestamp(lookups[0], tz=UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")
         assert first > exec_time[:26], f"{name} resolved at {first} before {host} exec {exec_time}"
+
+
+def test_ssh_session_commands_run_under_the_session_shell(
+    es_files: dict[str, list[dict]],
+) -> None:
+    """launchd -> sshd -i -> -zsh -> command, every record in the login's asid."""
+    found_command = False
+    for host, records in es_files.items():
+        logins = [r for r in records if _name(r) == "openssh_login"]
+        for login in logins:
+            sshd_pid = login["process"]["audit_token"]["pid"]
+            asid = login["process"]["audit_token"]["asid"]
+            shells = {
+                r["event"]["exec"]["target"]["audit_token"]["pid"]
+                for r in _execs(records)
+                if r["event"]["exec"]["target"]["ppid"] == sshd_pid
+                and r["event"]["exec"]["target"]["executable"]["path"] == "/bin/zsh"
+            }
+            assert shells, f"{host}: SSH login {sshd_pid} has no -zsh child of its sshd"
+            for r in _execs(records):
+                target = r["event"]["exec"]["target"]
+                if target["ppid"] in shells:
+                    found_command = True
+                    assert target["audit_token"]["asid"] == asid, (
+                        f"{host}: {target['executable']['path']} in SSH session has asid "
+                        f"{target['audit_token']['asid']}, login has {asid}"
+                    )
+            for r in records:
+                if _name(r) == "exec" and r["process"]["audit_token"]["pid"] == sshd_pid:
+                    continue  # the pre-exec launchd image predates the session
+                if r["process"]["audit_token"]["pid"] in shells | {sshd_pid}:
+                    assert r["process"]["audit_token"]["asid"] == asid, (
+                        f"{host}: {_name(r)} of SSH session process "
+                        f"{r['process']['audit_token']['pid']} left asid {asid}"
+                    )
+    assert found_command, "expected the admin SSH session to run commands under its shell"

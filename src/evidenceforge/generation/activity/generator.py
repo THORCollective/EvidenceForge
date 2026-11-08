@@ -24791,7 +24791,10 @@ class ActivityGenerator:
             return None
         if running.image != "/usr/sbin/sshd":
             return None
-        if running.command_line != f"sshd: {user.username} [priv]":
+        # The per-connection sshd parents the login shell: Linux's forked
+        # "sshd: user [priv]" child, or macOS's launchd-exec'd "sshd -i".
+        expected = ssh_receiver_command_line(_get_os_category(target_system.os), user.username)
+        if running.command_line != expected:
             return None
         return transport_pid
 
