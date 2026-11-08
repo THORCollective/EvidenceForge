@@ -31,8 +31,8 @@ eforge generate scenarios/macos-eslogger-demo/scenario.yaml -o ./output
 | Host | User | Persona | Role in the demo |
 |---|---|---|---|
 | `MAC-DESIGN-01` | dana.reyes | marketing | Hunt 1 — AMOS / Atomic Stealer; Chrome keychain red herring |
-| `MAC-DEV-01` | sam.okafor | developer | Hunt 2 — DPRK BeaverTail; SSH target |
-| `MAC-IT-01` | riley.chen | sysadmin | Hunt 3 — CloudMensis persistence; SSH source |
+| `MAC-DEV-01` | sam.okafor | developer | Hunt 2 — DPRK BeaverTail; target of the admin SSH red herring |
+| `MAC-IT-01` | riley.chen | sysadmin | Hunt 3 — CloudMensis persistence; source of the admin SSH red herring |
 | `MAC-DEV-02` | jordan.lee | developer | Homebrew and node-gyp red herrings |
 | `MAC-SALES-01` | priya.nair | sales | Chrome keychain red herring |
 | `MAC-PM-01` | alex.kim | project_manager | Population only |
@@ -100,13 +100,6 @@ The `btm_launch_item_add` event is the modern (macOS 13+) persistence signal.
 The scenario author writes **only** the plist `create`; EvidenceForge's causal
 expansion emits the BTM event because the file lands under `LaunchAgents`.
 
-### Supporting: legitimate SSH (`MAC-DEV-01`)
-
-The IT admin (`riley.chen`, from `MAC-IT-01`) SSHes into the developer
-workstation for maintenance and logs off — a complete `openssh_login` →
-`openssh_logout` pair on `MAC-DEV-01` (same audit-session id), included so the
-ESF SSH lifecycle is observable end-to-end alongside the malicious beats.
-
 ## Red herrings (benign lookalikes)
 
 Each `red_herrings` entry matches a naive version of a hunt query. They are
@@ -117,6 +110,7 @@ listed with explanations in the "Red Herrings" section of `GROUND_TRUTH.md`.
 | `brew services start postgresql@16` on `MAC-DEV-02`: ad-hoc signed Homebrew Ruby writes `homebrew.mxcl.postgresql@16.plist` (BTM follows) and launchd starts the ad-hoc `postgres` bottle | AMOS 1 (ad-hoc via launchd), CloudMensis 1–3 | Install location (`/opt/homebrew`), plist name is not a `com.apple.*` masquerade, writer launched from the developer's shell |
 | Chrome reads `login.keychain-db` on `MAC-DESIGN-01` and `MAC-SALES-01` | AMOS 3 (non-Apple keychain read) | Developer ID with a known Team ID (`EQHXZ8M8AV`); the AMOS dropper has none |
 | `npm install bcrypt` on `MAC-DEV-02`: `sh -c "node-gyp rebuild"` → `node` downloads headers from `nodejs.org` | BeaverTail 1–2 (node → `sh -c` → node) | Destination: `nodejs.org` vs a fresh lookalike domain |
+| IT admin `riley.chen` SSHes from `MAC-IT-01` to `MAC-DEV-01`, runs `softwareupdate --list`, `sw_vers`, `diskutil info /` and `log show`, then logs off | SSH 1–2 (a user's interactive SSH into another workstation) | Every command in the session (same `asid` as the `openssh_login`, under `sshd -i` → `-zsh`) is read-only maintenance: no file writes, persistence or outbound connections |
 
 The Splunk kit's `AMOS 1b`, `AMOS 3b` and `BeaverTail 3b` saved searches are the
 refined versions.
