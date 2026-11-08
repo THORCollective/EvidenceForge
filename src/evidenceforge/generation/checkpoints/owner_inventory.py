@@ -966,6 +966,7 @@ GENERATION_ENGINE_CHECKPOINT_FIELDS = _fields(
         "_linux_rsyslog_health",
         "_linux_timezone_mutation_hosts",
         "_machine_ids",
+        "_macos_launch_item_programs",
         "_ntp_schedule_state",
         "_package_maintenance_windows",
         "_pending_unlocks",

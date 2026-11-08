@@ -520,6 +520,7 @@ class TestGenerationEngine:
         ]
         engine.malicious_events = [{"event": "process", "time": moment}]
         engine.red_herring_events = [{"event": "dns", "time": moment}]
+        engine._macos_launch_item_programs = {"TEST-01": {"updater", "helperd"}}
 
         seal = GenerationEngineParticipant(engine).prepare_checkpoint(0)
         assert not seal.segments
@@ -552,6 +553,7 @@ class TestGenerationEngine:
             == engine._pending_story_process_terminations
         )
         assert restored._storyline_executed == engine._storyline_executed
+        assert restored._macos_launch_item_programs == {"TEST-01": {"updater", "helperd"}}
         assert restored._storyline_file_available_at == engine._storyline_file_available_at
         assert restored._storyline_file_source_overrides == engine._storyline_file_source_overrides
         assert restored.malicious_events == engine.malicious_events
