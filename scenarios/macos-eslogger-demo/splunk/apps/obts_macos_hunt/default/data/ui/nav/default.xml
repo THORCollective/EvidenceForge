@@ -1,0 +1,6 @@
+<nav search_view="search">
+  <view name="obts_stage" default="true" />
+  <view name="search" />
+  <a href="/manager/obts_macos_hunt/saved/searches?app=obts_macos_hunt&amp;count=50">Hunt searches</a>
+  <view name="dashboards" />
+</nav>

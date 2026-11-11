@@ -22,7 +22,8 @@ docker compose -p obts-splunk up -d
 python3 run_hunts.py                      # or: --only AMOS, --csv-dir results/
 ```
 
-Splunk Web is at http://127.0.0.1:8000 (Free license, so no login). The searches are under
+Splunk Web is at http://127.0.0.1:8000 (Free license, so no login). The `OBTS macOS Hunt` app
+opens on the stage dashboard, one tab per hunt. The searches are under
 **Settings → Searches, reports, and alerts**, app `OBTS macOS Hunt`; set the time picker to
 *All time* (data is dated 2024-06-11). Tear down with `docker compose -p obts-splunk down -v`.
 
@@ -36,6 +37,8 @@ Splunk Web is at http://127.0.0.1:8000 (Free license, so no login). The searches
 | `lookups/mac_hosts.csv` | host → `host_short`, `host_ip`, `owner`. **This is the ES↔Zeek join key**: ES has no IP or hostname field. Update it if the scenario's IPs change. |
 | `savedsearches.conf` | `OBTS 00/01` orientation, `AMOS 1-5`, `BeaverTail 1-3`, `CloudMensis 1-3`, `SSH 1-2`, and the refinements `AMOS 1b`/`3b` and `BeaverTail 3b` (naive query first, then the refined one, which makes a good stage sequence). |
 | `server.conf` | `allowRemoteLogin = always` (Free license otherwise blocks REST, which `run_hunts.py` uses). |
+| `data/ui/views/obts_stage.xml` | **Stage dashboard** (Dashboard Studio, the app's home page). One tab per hunt: Overview (`OBTS 00/01`), AMOS (the AMOS 5 chain, then each naive search above its refined one, then the Zeek pivot), BeaverTail, CloudMensis and the SSH red herring. Every panel runs a saved search over all time, so there is no time picker to set; times are shown as time of day (all data is 2024-06-11). Light theme for projectors. |
+| `data/ui/nav/default.xml` | App nav: stage dashboard, Search, Hunt searches, Dashboards. |
 
 Flat fields (raw nested names still work, e.g. `'event.exec.target.executable.path'`):
 
