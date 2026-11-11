@@ -3480,7 +3480,7 @@ class TestMacOSProcessAllocation:
         assert sm._pid_os["unknown01"] == "linux"
 
     def test_pidversion_increases_with_process_creation_time(self):
-        """pidversion follows XNU's per-boot counter: large and time-ordered."""
+        """pidversion follows XNU's per-boot counter: time-ordered and never below the PID."""
         sm = StateManager()
         base = datetime(2024, 6, 11, 9, 0, 0, tzinfo=UTC)
         sm.set_current_time(base)
@@ -3494,6 +3494,7 @@ class TestMacOSProcessAllocation:
             os_category="macos",
         )
         versions: list[int] = []
+        pids: list[int] = []
         # Build events out of time order, as the generator can.
         for minutes in (30, 5, 60, 15):
             sm.set_current_time(base + timedelta(minutes=minutes))
@@ -3507,11 +3508,14 @@ class TestMacOSProcessAllocation:
                 os_category="macos",
             )
             versions.append(sm.get_pidversion("mac01", pid))
+            pids.append(pid)
 
         by_time = [versions[1], versions[3], versions[0], versions[2]]
         assert by_time == sorted(by_time)
         assert len(set(versions)) == len(versions)
-        assert min(versions) > 100_000
+        # The counter advances on every fork and exec since boot, so it is at
+        # least the (unwrapped) PID.
+        assert all(version >= pid for version, pid in zip(versions, pids, strict=True))
 
     def test_macos_pids_increase_with_time_regardless_of_build_order(self):
         sm = StateManager()
@@ -3541,7 +3545,7 @@ class TestMacOSProcessAllocation:
         assert pids[10] < pids[25] < pids[40]
 
     def test_create_process_assigns_nonzero_pidversion(self):
-        """A process created through create_process reports a realistic pidversion."""
+        """A process created through create_process reports a real, nonzero pidversion."""
         sm = StateManager()
         sm.set_current_time(datetime(2024, 1, 15, 8, 0, 0, tzinfo=UTC))
 
@@ -3555,7 +3559,7 @@ class TestMacOSProcessAllocation:
             os_category="macos",
         )
 
-        assert sm.get_pidversion("mac01", pid) > 100_000
+        assert sm.get_pidversion("mac01", pid) >= pid > 0
 
 
 def _final_connection_transaction(

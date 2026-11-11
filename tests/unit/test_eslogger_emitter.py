@@ -166,6 +166,52 @@ class TestProcessLifecycle:
         assert exec_event["cwd"]["path_truncated"] is False
         assert exec_event["cwd"]["stat"]["st_mode"] & 0o170000 == 0o040000  # a directory
 
+    def test_launchd_job_exec_has_minimal_env_and_std_fds(self, emitter, mac_host, ts):
+        proc = ProcessContext(1500, 1, "/usr/libexec/trustd", "/usr/libexec/trustd", "root")
+        event = OccurrenceBuilder(
+            timestamp=ts, event_type="process_create", src_host=mac_host, process=proc
+        )
+        exec_event = _rows(emitter, event)[1]["event"]["exec"]
+        assert exec_event["env"] == [
+            "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+            "XPC_FLAGS=0x0",
+            "XPC_SERVICE_NAME=0",
+        ]
+        assert exec_event["fds"] == [
+            {"fd": 0, "fdtype": 1},
+            {"fd": 1, "fdtype": 1},
+            {"fd": 2, "fdtype": 1},
+        ]
+        assert exec_event["last_fd"] == 2
+
+    def test_user_exec_env_has_home_and_per_user_tmpdir(self, emitter, mac_host, ts):
+        proc = ProcessContext(1500, 1, "/usr/bin/osascript", "osascript", "alice")
+        event = OccurrenceBuilder(
+            timestamp=ts, event_type="process_create", src_host=mac_host, process=proc
+        )
+        exec_event = _rows(emitter, event)[1]["event"]["exec"]
+        env = dict(item.split("=", 1) for item in exec_event["env"])
+        assert env["HOME"] == "/Users/alice"
+        assert env["USER"] == "alice"
+        tmpdir = env["TMPDIR"]
+        assert tmpdir.startswith("/var/folders/") and tmpdir.endswith("0000gn/T/")
+        assert len(tmpdir.split("/")[3]) == 2 and len(tmpdir.split("/")[4]) == 28
+        assert exec_event["last_fd"] == exec_event["fds"][-1]["fd"]
+
+    def test_app_bundle_path_with_spaces_is_one_argv0(self, emitter):
+        image = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        assert emitter._argv(image, image) == [image]
+        assert emitter._argv(f"{image} --single-argument https://x.test", image) == [
+            image,
+            "--single-argument",
+            "https://x.test",
+        ]
+        assert emitter._argv('osascript -e "x y"', "/usr/bin/osascript") == [
+            "osascript",
+            "-e",
+            "x y",
+        ]
+
     def test_exec_subject_is_pre_exec_image_of_the_parent_binary(self, emitter, mac_host, ts):
         """es_event_exec_t: message process = image before exec, target = image after."""
         proc = ProcessContext(
@@ -507,6 +553,15 @@ class TestLocalAccountUids:
     def test_without_account_layout_uids_stay_in_user_band(self, emitter):
         uid = emitter._macos_ids("alice", "MAC-01")["uid"]
         assert 501 <= uid <= 600
+
+    def test_service_accounts_use_apple_assigned_ids(self, emitter):
+        # Read from `dscl . -read /Users/<name> UniqueID PrimaryGroupID` on macOS.
+        assert emitter._macos_ids("_spotlight", "MAC-01") == {"uid": 89, "gid": 89}
+        assert emitter._macos_ids("_trustd", "MAC-01") == {"uid": 282, "gid": 282}
+        assert emitter._macos_ids("_mdnsresponder", "MAC-01") == {"uid": 65, "gid": 65}
+        assert emitter._macos_ids("nobody", "MAC-01")["uid"] == 4294967294
+        # Accounts without a known id still land in the service band.
+        assert 200 <= emitter._macos_ids("_madeupd", "MAC-01")["uid"] < 400
 
     def test_create_reports_existing_file_destination(self, emitter, mac_host, ts):
         path = "/Users/alice/Library/LaunchAgents/com.example.plist"

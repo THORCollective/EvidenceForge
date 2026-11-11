@@ -14440,8 +14440,8 @@ class StateManager:
         """Return the post-exec XNU pidversion of the process occupying a PID.
 
         macOS ES audit tokens carry ``pidversion``, drawn from one per-boot
-        counter that advances on every fork and again on exec, so values are
-        large, unique per host, and increase over time. It is derived from the
+        counter that advances on every fork and again on exec, so launchd is 1
+        and later values are unique per host and increase over time. It is derived from the
         process's unwrapped logical PID position (a fork and an exec generation
         per process), so it is time-ordered like the PID itself. The pre-exec
         fork image carries this value minus one.
@@ -14460,8 +14460,10 @@ class StateManager:
                 process = self._ended_processes_by_key.get((system, pid))
             if process is None or process.pid_logical_position < 0:
                 return 0
-            base = 150_000 + _stable_seed(f"macos_pidversion_base:{system}") % 750_000
-            return base + 2 * process.pid_logical_position + 1
+            # The per-boot counter starts at boot: launchd (logical position 1)
+            # is pidversion 1, and each later process advances it by a fork and
+            # an exec generation.
+            return max(1, 2 * process.pid_logical_position - 1)
 
     def is_process_active_at(self, system: str, pid: int, time: datetime) -> bool:
         """Return whether a live or retained process identity spans ``time``."""

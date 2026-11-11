@@ -1,7 +1,7 @@
 schema_version: "1.0"
-current_revision: 163
+current_revision: 164
 history_start_revision: 1
-behavior_surface_sha256: c58a955085f1df4d4f4934a7a791dc3de71ecdd66d9c030ddde42b5dce1a96eb
+behavior_surface_sha256: 730785660685e33d3f0b992f23354628ace9ac293e541ad6669a6ce543ddd31e
 changes:
   - revision: 1
     id: initial-generation-behavior-contract
@@ -1640,3 +1640,11 @@ changes:
       - storyline-process-lifecycle
     formats: []
     summary: When only unreferenced process events remain in a red-herring step, release its finished processes at their own planned exits instead of together after the last event.
+  - revision: 164
+    id: macos-eslogger-identity-and-exec-context
+    impact: localized
+    domains:
+      - macos-endpoint-telemetry
+    formats:
+      - eslogger
+    summary: Start macOS pidversion at 1 for launchd, use Apple's fixed uids for service accounts such as _spotlight (89) and _trustd (282), and add env and fds to exec records and keep spaced app paths as one argv[0].
