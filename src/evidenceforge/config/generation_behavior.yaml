@@ -1,7 +1,7 @@
 schema_version: "1.0"
-current_revision: 164
+current_revision: 165
 history_start_revision: 1
-behavior_surface_sha256: 730785660685e33d3f0b992f23354628ace9ac293e541ad6669a6ce543ddd31e
+behavior_surface_sha256: f2ce53c0c1ecff0fcac1b8eea10049d441a0c029ba4a6929172c3dc1e1c2fd8a
 changes:
   - revision: 1
     id: initial-generation-behavior-contract
@@ -1648,3 +1648,11 @@ changes:
     formats:
       - eslogger
     summary: Start macOS pidversion at 1 for launchd, use Apple's fixed uids for service accounts such as _spotlight (89) and _trustd (282), and add env and fds to exec records and keep spaced app paths as one argv[0].
+  - revision: 165
+    id: macos-eslogger-recurring-key-layouts
+    impact: localized
+    domains:
+      - macos-endpoint-telemetry
+    formats:
+      - eslogger
+    summary: Order eslogger JSON keys from a few recurring per-event-type layouts (three envelope, two nested, weighted to one dominant) instead of a fresh shuffle per record, matching a reference macOS 27 capture.

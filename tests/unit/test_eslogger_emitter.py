@@ -842,6 +842,18 @@ class TestEsloggerSerialization:
         orders = {tuple(json.loads(line)) for line in first}
         assert len(orders) > 1
 
+    def test_key_order_recurs_in_a_few_layouts_not_per_record(self):
+        """A real collector reuses a few layouts per event type (a reference
+        capture showed three envelope orders and two nested orders in 88
+        records), rather than a fresh order for every message."""
+        lines = self._publish([self._record(i) for i in range(200)])
+        envelopes = [tuple(json.loads(line)) for line in lines]
+        nested = {tuple(json.loads(line)["process"]["executable"]) for line in lines}
+        counts = sorted((envelopes.count(order) for order in set(envelopes)), reverse=True)
+        assert 2 <= len(counts) <= 3
+        assert counts[0] > len(lines) // 2
+        assert 1 <= len(nested) <= 2
+
 
 def test_application_install_stamp_is_whole_seconds_at_another_time_of_day():
     """An /Applications file was unpacked from an archive: birth == mtime in whole

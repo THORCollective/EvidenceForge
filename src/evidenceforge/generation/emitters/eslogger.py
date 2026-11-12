@@ -45,7 +45,6 @@ macOS network egress is correlated via the host's existing Zeek conn/dns logs
 
 import json
 import logging
-import random
 import re
 import shlex
 from collections.abc import Callable
@@ -209,31 +208,63 @@ def _eslogger_sort_key(line: str) -> tuple[str, str]:
     return (match.group(1) if match else "", _SEQ_FIELDS_RE.sub("", line, count=1))
 
 
-def _eslogger_key_order(value: Any, rng: random.Random) -> Any:
-    """Return ``value`` with every object's keys in a shuffled order.
+# Foundation's JSON writer emits dictionary members in hash-table order. On a
+# real collector that order is not reshuffled per message: a few layouts recur
+# (a reference macOS 27 capture of 88 records showed three envelope orders and
+# two audit-token/stat orders). So each event type gets a small, fixed set of
+# envelope layouts and nested-object layouts, weighted toward one dominant
+# layout, and every record picks one of each.
+_ES_ENVELOPE_LAYOUT_WEIGHTS = (70, 22, 8)
+_ES_NESTED_LAYOUT_WEIGHTS = (80, 20)
 
-    ``eslogger`` serializes ES messages through Foundation dictionaries, so key
-    order differs from object to object and record to record.  Arrays (argv,
+
+def _es_pick_layout(weights: tuple[int, ...], token: str) -> int:
+    """Pick a layout index for ``token`` from integer ``weights``."""
+    roll = _stable_seed(token) % sum(weights)
+    for index, weight in enumerate(weights):
+        if roll < weight:
+            return index
+        roll -= weight
+    return len(weights) - 1
+
+
+def _eslogger_key_order(value: Any, layout: str) -> Any:
+    """Return ``value`` with each object's keys in ``layout``'s fixed order.
+
+    A key's rank depends only on the layout and the key name, so every object of
+    the same shape in the same layout comes out in the same order. Arrays (argv,
     env) keep their order: that order is data.
     """
     if isinstance(value, dict):
-        items = list(value.items())
-        rng.shuffle(items)
-        return {key: _eslogger_key_order(item, rng) for key, item in items}
+        return {
+            key: _eslogger_key_order(value[key], layout)
+            for key in sorted(value, key=lambda key: (_stable_seed(f"{layout}:{key}"), key))
+        }
     if isinstance(value, list):
-        return [_eslogger_key_order(item, rng) for item in value]
+        return [_eslogger_key_order(item, layout) for item in value]
     return value
 
 
 def _eslogger_serialize(record: dict[str, Any]) -> str:
     """Serialize one ES record the way ``eslogger --format json`` writes it.
 
-    Keys come out in a per-record shuffled (seeded, reproducible) order, and
-    every ``/`` is escaped as ``\\/`` -- so a raw-text grep for ``/usr/bin``
-    finds nothing in a real capture, and none here either.
+    Keys follow one of a few recurring per-event-type layouts (reproducible,
+    see ``_ES_ENVELOPE_LAYOUT_WEIGHTS``), and every ``/`` is escaped as ``\\/``
+    -- so a raw-text grep for ``/usr/bin`` finds nothing in a real capture, and
+    none here either.
     """
-    seed = _stable_seed(f"es_key_order:{record.get('global_seq_num', 0)}:{record.get('time', '')}")
-    ordered = _eslogger_key_order(record, random.Random(seed))
+    event_type = record.get("event_type", "")
+    token = f"{record.get('global_seq_num', 0)}:{record.get('time', '')}"
+    envelope = _es_pick_layout(_ES_ENVELOPE_LAYOUT_WEIGHTS, f"es_envelope_layout:{token}")
+    nested = _es_pick_layout(_ES_NESTED_LAYOUT_WEIGHTS, f"es_nested_layout:{token}")
+    nested_layout = f"es_nested:{event_type}:{nested}"
+    ordered = {
+        key: _eslogger_key_order(record[key], nested_layout)
+        for key in sorted(
+            record,
+            key=lambda key: (_stable_seed(f"es_envelope:{event_type}:{envelope}:{key}"), key),
+        )
+    }
     return json.dumps(ordered, separators=(",", ":")).replace("/", "\\/")
 
 
