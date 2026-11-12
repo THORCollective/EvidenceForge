@@ -45,7 +45,6 @@ macOS network egress is correlated via the host's existing Zeek conn/dns logs
 
 import json
 import logging
-import random
 import re
 import shlex
 from collections.abc import Callable
@@ -209,31 +208,63 @@ def _eslogger_sort_key(line: str) -> tuple[str, str]:
     return (match.group(1) if match else "", _SEQ_FIELDS_RE.sub("", line, count=1))
 
 
-def _eslogger_key_order(value: Any, rng: random.Random) -> Any:
-    """Return ``value`` with every object's keys in a shuffled order.
+# Foundation's JSON writer emits dictionary members in hash-table order. On a
+# real collector that order is not reshuffled per message: a few layouts recur
+# (a reference macOS 27 capture of 88 records showed three envelope orders and
+# two audit-token/stat orders). So each event type gets a small, fixed set of
+# envelope layouts and nested-object layouts, weighted toward one dominant
+# layout, and every record picks one of each.
+_ES_ENVELOPE_LAYOUT_WEIGHTS = (70, 22, 8)
+_ES_NESTED_LAYOUT_WEIGHTS = (80, 20)
 
-    ``eslogger`` serializes ES messages through Foundation dictionaries, so key
-    order differs from object to object and record to record.  Arrays (argv,
+
+def _es_pick_layout(weights: tuple[int, ...], token: str) -> int:
+    """Pick a layout index for ``token`` from integer ``weights``."""
+    roll = _stable_seed(token) % sum(weights)
+    for index, weight in enumerate(weights):
+        if roll < weight:
+            return index
+        roll -= weight
+    return len(weights) - 1
+
+
+def _eslogger_key_order(value: Any, layout: str) -> Any:
+    """Return ``value`` with each object's keys in ``layout``'s fixed order.
+
+    A key's rank depends only on the layout and the key name, so every object of
+    the same shape in the same layout comes out in the same order. Arrays (argv,
     env) keep their order: that order is data.
     """
     if isinstance(value, dict):
-        items = list(value.items())
-        rng.shuffle(items)
-        return {key: _eslogger_key_order(item, rng) for key, item in items}
+        return {
+            key: _eslogger_key_order(value[key], layout)
+            for key in sorted(value, key=lambda key: (_stable_seed(f"{layout}:{key}"), key))
+        }
     if isinstance(value, list):
-        return [_eslogger_key_order(item, rng) for item in value]
+        return [_eslogger_key_order(item, layout) for item in value]
     return value
 
 
 def _eslogger_serialize(record: dict[str, Any]) -> str:
     """Serialize one ES record the way ``eslogger --format json`` writes it.
 
-    Keys come out in a per-record shuffled (seeded, reproducible) order, and
-    every ``/`` is escaped as ``\\/`` -- so a raw-text grep for ``/usr/bin``
-    finds nothing in a real capture, and none here either.
+    Keys follow one of a few recurring per-event-type layouts (reproducible,
+    see ``_ES_ENVELOPE_LAYOUT_WEIGHTS``), and every ``/`` is escaped as ``\\/``
+    -- so a raw-text grep for ``/usr/bin`` finds nothing in a real capture, and
+    none here either.
     """
-    seed = _stable_seed(f"es_key_order:{record.get('global_seq_num', 0)}:{record.get('time', '')}")
-    ordered = _eslogger_key_order(record, random.Random(seed))
+    event_type = record.get("event_type", "")
+    token = f"{record.get('global_seq_num', 0)}:{record.get('time', '')}"
+    envelope = _es_pick_layout(_ES_ENVELOPE_LAYOUT_WEIGHTS, f"es_envelope_layout:{token}")
+    nested = _es_pick_layout(_ES_NESTED_LAYOUT_WEIGHTS, f"es_nested_layout:{token}")
+    nested_layout = f"es_nested:{event_type}:{nested}"
+    ordered = {
+        key: _eslogger_key_order(record[key], nested_layout)
+        for key in sorted(
+            record,
+            key=lambda key: (_stable_seed(f"es_envelope:{event_type}:{envelope}:{key}"), key),
+        )
+    }
     return json.dumps(ordered, separators=(",", ":")).replace("/", "\\/")
 
 
@@ -284,6 +315,29 @@ def _nest_dotted_fields(fields: dict[str, Any]) -> dict[str, Any]:
             node = child
         node[leaf] = value
     return record
+
+
+# Apple-assigned uid (== primary gid) for macOS service accounts, read from
+# `dscl . -read /Users/<name> UniqueID PrimaryGroupID` on macOS 26.
+_SHELL_NAMES = frozenset({"zsh", "bash", "sh", "dash", "ksh", "tcsh", "csh", "fish"})
+
+_MACOS_SERVICE_ACCOUNT_IDS: dict[str, int] = {
+    "daemon": 1,
+    "nobody": 4294967294,  # -2 as the unsigned uid_t ES reports
+    "_networkd": 24,
+    "_mdnsresponder": 65,
+    "_windowserver": 88,
+    "_spotlight": 89,
+    "_softwareupdate": 200,
+    "_coreaudiod": 202,
+    "_locationd": 205,
+    "_usbmuxd": 213,
+    "_nsurlsessiond": 242,
+    "_analyticsd": 263,
+    "_timed": 266,
+    "_trustd": 282,
+    "_mds_stores": 308,
+}
 
 
 class ESLoggerEmitter(HostMultiplexEmitter):
@@ -527,6 +581,9 @@ class ESLoggerEmitter(HostMultiplexEmitter):
             ),
         )
         platform = bool(target_obj["is_platform_binary"])
+        cwd = proc.current_directory or self._default_cwd(proc.username)
+        from_shell = parent_image.rsplit("/", 1)[-1] in _SHELL_NAMES
+        fds = self._exec_fds(host.hostname, proc.pid, start_time, from_shell)
         # es_process_t.start_time is the fork; the exec message follows it once
         # the child has set up and called execve (tens to hundreds of µs).
         exec_gap_us = (
@@ -545,15 +602,19 @@ class ESLoggerEmitter(HostMultiplexEmitter):
                     "dyld_exec_path": proc.image,
                     "script": None,
                     "cwd": self._es_file(
-                        proc.current_directory or self._default_cwd(proc.username),
+                        cwd,
                         host,
                         start_time,
                         kind="dir",
                     ),
-                    "last_fd": 2 + _stable_seed(f"es_last_fd:{host.hostname}:{proc.pid}") % 6,
+                    "last_fd": fds[-1]["fd"],
                     "image_cputype": _CPU_TYPE_ARM64,
                     "image_cpusubtype": _CPU_SUBTYPE_ARM64E_PTRAUTH if platform else 0,
                     "args": self._argv(proc.command_line, proc.image),
+                    "env": self._exec_env(
+                        host.hostname, proc.username, cwd, from_shell, proc.image
+                    ),
+                    "fds": fds,
                 },
             ),
         )
@@ -1225,8 +1286,10 @@ class ESLoggerEmitter(HostMultiplexEmitter):
     def _macos_ids(self, username: str, hostname: str = "") -> dict[str, int]:
         """Return a deterministic macOS uid/gid for a username on a host.
 
-        macOS reserves 0 for root, the 200-399 band for system service accounts
-        (``_``-prefixed), and 501+ for regular users (gid 20 == ``staff``).  uids
+        macOS reserves 0 for root, fixed Apple-assigned ids for system service
+        accounts (``_spotlight`` is 89, ``_trustd`` 282; unknown ``_`` accounts
+        fall back to the 200-399 band), and 501+ for regular users (gid 20 ==
+        ``staff``).  uids
         are local to each Mac: the host's assigned user is the first account
         (501) and any other scenario user with a local account on that Mac gets
         502, 503, ... in a stable (sorted-username) order.  Without account
@@ -1235,6 +1298,9 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         """
         if username == "root":
             return {"uid": 0, "gid": 0}
+        known = _MACOS_SERVICE_ACCOUNT_IDS.get(username)
+        if known is not None:
+            return {"uid": known, "gid": known}
         if username.startswith("_"):
             uid = 200 + (_stable_seed(f"macos_service_uid:{username}") % 200)
             return {"uid": uid, "gid": uid}
@@ -1446,6 +1512,64 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         return _ES_ADDRESS_TYPE_IPV6 if source_ip and ":" in source_ip else _ES_ADDRESS_TYPE_IPV4
 
     @staticmethod
+    def _exec_fds(hostname: str, pid: int, at: datetime, from_shell: bool) -> list[dict]:
+        """Return the es_fd_t list a new image inherits across execve.
+
+        launchd closes everything but stdin/stdout/stderr before it spawns a
+        job; a command run from a shell may also inherit a few open vnodes.
+        fdtype 1 is PROX_FDTYPE_VNODE (ttys, /dev/null and regular files).
+        """
+        last_fd = 2
+        if from_shell:
+            seed = _stable_seed(f"es_exec_fds:{hostname}:{pid}:{at.isoformat()}")
+            last_fd = 2 + (seed % 4 if seed % 3 == 0 else 0)
+        return [{"fd": fd, "fdtype": 1} for fd in range(last_fd + 1)]
+
+    @staticmethod
+    def _exec_env(
+        hostname: str, username: str, cwd: str, from_shell: bool, image: str
+    ) -> list[str]:
+        """Return a plausible execve environment (es_exec_env) for a new image."""
+        env = ["PATH=/usr/bin:/bin:/usr/sbin:/sbin", "XPC_FLAGS=0x0", "XPC_SERVICE_NAME=0"]
+        if username == "root" and not from_shell:
+            return env
+        if not username or (username.startswith("_") and not from_shell):
+            return env
+        home = ESLoggerEmitter._default_cwd(username)
+        # Per-user confstr(_CS_DARWIN_USER_TEMP_DIR): /var/folders/xx/<28>/T/;
+        # staff users' directory names end in 0000gn.
+        alphabet = "0123456789abcdefghijklmnopqrstuvwxyz_"
+        chars = [
+            alphabet[_stable_seed(f"es_tmpdir:{hostname}:{username}:{i}") % len(alphabet)]
+            for i in range(24)
+        ]
+        suffix = "0000gn" if not username.startswith("_") and username != "root" else "0000gp"
+        tmpdir = f"/var/folders/{''.join(chars[:2])}/{''.join(chars[2:24])}{suffix}/T/"
+        env += [
+            f"HOME={home}",
+            f"USER={username}",
+            f"LOGNAME={username}",
+            "SHELL=/bin/zsh",
+            f"TMPDIR={tmpdir}",
+        ]
+        if from_shell:
+            env = [
+                "PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:"
+                "/usr/sbin:/sbin",
+                *env[1:],
+                "TERM=xterm-256color",
+                "TERM_PROGRAM=Apple_Terminal",
+                "TERM_PROGRAM_VERSION=455.1",
+                "LANG=en_US.UTF-8",
+                "SHLVL=1",
+                f"PWD={cwd}",
+                f"OLDPWD={home}",
+                "__CFBundleIdentifier=com.apple.Terminal",
+                f"_={image}",
+            ]
+        return env
+
+    @staticmethod
     def _default_cwd(username: str) -> str:
         """Return a plausible working directory when none is tracked."""
         if username == "root":
@@ -1459,6 +1583,15 @@ class ESLoggerEmitter(HostMultiplexEmitter):
         """Split a command line into an argv list (macOS/posix shell semantics)."""
         if not command_line:
             return [image] if image else []
+        if image and " " in image and command_line.startswith(image):
+            # An unquoted app-bundle path such as ".../Google Chrome" is one
+            # argv[0], not two words.
+            rest = command_line[len(image) :]
+            if not rest or rest[0].isspace():
+                try:
+                    return [image, *shlex.split(rest, posix=True)]
+                except ValueError:
+                    return [image, *rest.split()]
         try:
             argv = shlex.split(command_line, posix=True)
         except ValueError:
